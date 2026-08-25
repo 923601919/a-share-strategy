@@ -13,6 +13,7 @@ export default function HomePage() {
   const [error, setError] = useState("");
   const [data, setData] = useState<ScanResult | null>(null);
   const [msg, setMsg] = useState("");
+  const [addingCode, setAddingCode] = useState("");
 
   async function onScan() {
     setLoading(true);
@@ -35,16 +36,24 @@ export default function HomePage() {
   }
 
   async function onAdd(item: ScanItem) {
+    setError("");
+    setMsg("");
+    setAddingCode(item.code);
     try {
       await addWatch({
         code: item.code,
         name: item.name,
         source: "fenshi",
-        note: item.reasons.slice(0, 2).join("；"),
+        note: (item.reasons || []).slice(0, 2).join("；"),
+        entry_price: item.price,
+        entry_pct: item.pct,
+        entry_score: item.score,
       });
-      setMsg(`已加入自选：${item.name}(${item.code})`);
+      setMsg(`已加入自选：${item.name}(${item.code})，可到「自选跟踪」查看`);
     } catch (e: any) {
-      setError(e?.message || String(e));
+      setError(`加入自选失败：${e?.message || String(e)}`);
+    } finally {
+      setAddingCode("");
     }
   }
 
@@ -53,7 +62,7 @@ export default function HomePage() {
       <section className="panel">
         <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>进攻型分时扫描</h1>
         <p className="muted" style={{ marginTop: 0 }}>
-          板块强度 + 分时站上均价/放量上攻 + 异动红线过滤。扫描可能需要数十秒。
+          强势板块成分内选股 + 回踩均价放量再攻。默认筛选：当前涨幅 &lt; 6%。
         </p>
         <div className="row">
           <label>
@@ -66,7 +75,7 @@ export default function HomePage() {
             />
           </label>
           <label>
-            最小涨幅%
+            涨幅下限%
             <input
               type="number"
               step="0.1"
@@ -75,7 +84,7 @@ export default function HomePage() {
             />
           </label>
           <label>
-            最大涨幅%
+            当前涨幅&lt;%
             <input
               type="number"
               step="0.1"
@@ -88,7 +97,7 @@ export default function HomePage() {
             <select value={session} onChange={(e) => setSession(e.target.value)}>
               <option value="auto">自动</option>
               <option value="morning">上午重点</option>
-              <option value="afternoon">午安重点</option>
+              <option value="afternoon">午后重点</option>
               <option value="any">不限</option>
             </select>
           </label>
@@ -104,7 +113,7 @@ export default function HomePage() {
             {loading ? "扫描中…" : "立即扫描"}
           </button>
         </div>
-        {msg ? <p className="muted">{msg}</p> : null}
+        {msg ? <p className="good">{msg}</p> : null}
         {error ? <p className="err">{error}</p> : null}
       </section>
 
@@ -113,14 +122,24 @@ export default function HomePage() {
           <section className="panel">
             <div className="muted">{data.session_note}</div>
             <div className="muted" style={{ marginTop: 6 }}>
-              数据源 spot={data.data_source?.spot ?? "?"} · 分时有效{" "}
-              {data.data_source?.fenshi_ok ?? 0}/{data.data_source?.candidates ?? "?"} · 命中{" "}
-              {data.count} 只
+              数据源 spot={data.data_source?.spot ?? "?"} · 候选池{" "}
+              {data.data_source?.universe_size ?? "?"} · 回踩再攻{" "}
+              {data.data_source?.reattack_ok ?? 0}/{data.data_source?.candidates ?? "?"} · 命中{" "}
+              {data.count} 只 · 涨幅&lt;{String(data.params?.max_pct ?? maxPct)}%
             </div>
-            <h3 style={{ marginBottom: 8 }}>热门概念（参考）</h3>
+            <h3 style={{ marginBottom: 8 }}>强势板块（候选池来源）</h3>
             <div className="chips">
-              {(data.hot_boards || []).slice(0, 12).map((b) => (
-                <div className="chip" key={b.name}>
+              {(data.universe_sectors || data.hot_boards || []).slice(0, 12).map((b) => (
+                <div className="chip" key={`${b.name}-${b.type ?? ""}`}>
+                  {b.name} {b.pct?.toFixed?.(2) ?? b.pct}%
+                  {b.type ? ` (${b.type})` : ""}
+                </div>
+              ))}
+            </div>
+            <h3 style={{ marginTop: 12, marginBottom: 8 }}>同花顺行业参考</h3>
+            <div className="chips">
+              {(data.hot_boards || []).slice(0, 8).map((b) => (
+                <div className="chip" key={`ref-${b.name}`}>
                   {b.name} {b.pct?.toFixed?.(2) ?? b.pct}%
                 </div>
               ))}
@@ -128,6 +147,8 @@ export default function HomePage() {
           </section>
 
           <section className="panel">
+            {msg ? <p className="good">{msg}</p> : null}
+            {error ? <p className="err">{error}</p> : null}
             <table>
               <thead>
                 <tr>
@@ -176,8 +197,12 @@ export default function HomePage() {
                     </td>
                     <td className="muted">{(it.reasons || []).join("；")}</td>
                     <td>
-                      <button className="secondary" onClick={() => onAdd(it)}>
-                        自选
+                      <button
+                        className="secondary"
+                        disabled={addingCode === it.code}
+                        onClick={() => onAdd(it)}
+                      >
+                        {addingCode === it.code ? "加入中…" : "自选"}
                       </button>
                     </td>
                   </tr>

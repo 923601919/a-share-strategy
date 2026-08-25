@@ -7,7 +7,7 @@ from typing import Any, Literal
 from config import settings
 from db import save_scan_snapshot
 from providers import akshare_client as mkt
-from rules.fenshi import in_session_bucket, score_offensive_fenshi
+from rules.fenshi import in_attack_window, score_offensive_fenshi, session_allowed
 from rules.risk import anomaly_30d_pct, risk_flags
 
 
@@ -19,21 +19,33 @@ def _is_st(name: str) -> bool:
     return "ST" in n or "退" in name
 
 
-def _filter_spot(df, min_amount_yi: float, min_pct: float, max_pct: float, limit: int):
+def _filter_spot(
+    df,
+    min_amount_yi: float,
+    min_pct: float,
+    max_pct: float | None,
+    limit: int,
+    *,
+    universe_codes: set[str] | None = None,
+):
     amount_floor = min_amount_yi * 1e8
     out = df.copy()
+    out["code"] = out["code"].astype(str).str.zfill(6)
     out = out[~out["name"].astype(str).map(_is_st)]
+    if universe_codes:
+        out = out[out["code"].isin(universe_codes)]
     out = out[out["amount"] >= amount_floor]
     out = out[out["pct"] >= min_pct]
-    out = out[out["pct"] <= max_pct]
-    # 新浪无量比时，用涨幅+成交额排序
+    # 当前涨幅严格小于上限（例如 <6%）
+    if max_pct is not None:
+        out = out[out["pct"] < max_pct]
     sort_cols = [c for c in ("pct", "volume_ratio", "amount") if c in out.columns]
     out = out.sort_values(sort_cols, ascending=False)
     return out.head(limit)
 
 
 def _score_from_spot(row: dict[str, Any]) -> dict[str, Any]:
-    """分时不可用时的兜底打分，保证仍能拉开选股差异。"""
+    """分时不可用时的兜底打分。"""
     pct = float(row.get("pct") or 0)
     amount = float(row.get("amount") or 0)
     vr = float(row.get("volume_ratio") or 0)
@@ -72,7 +84,6 @@ def _score_from_spot(row: dict[str, Any]) -> dict[str, Any]:
         score += 10
         reasons.append(f"量比{vr:.2f}")
 
-    # 偏进攻：收在日内偏高位
     if high > low > 0 and price > 0:
         pos = (price - low) / (high - low)
         if pos >= 0.7:
@@ -86,9 +97,15 @@ def _score_from_spot(row: dict[str, Any]) -> dict[str, Any]:
         score += 10
         reasons.append("现价不低于开盘")
 
+    if in_attack_window():
+        score = min(100.0, score + 5)
+        reasons.insert(0, "核心买点窗口(10:00-10:40)")
+
     return {
         "score": round(min(score, 100.0), 1),
         "above_vwap": None,
+        "pullback": None,
+        "reattack": None,
         "slope": None,
         "vol_expand": None,
         "vwap": None,
@@ -97,7 +114,7 @@ def _score_from_spot(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _enrich_one(row: dict[str, Any], hot_codes: set[str], hot_names: set[str]) -> dict[str, Any] | None:
+def _enrich_one(row: dict[str, Any], board_tags: dict[str, list[str]]) -> dict[str, Any] | None:
     code = str(row["code"]).zfill(6)
     name = str(row["name"])
     minute = None
@@ -120,7 +137,7 @@ def _enrich_one(row: dict[str, Any], hot_codes: set[str], hot_names: set[str]) -
     except Exception as e:
         minute_err = e
 
-    if minute is not None and len(minute) >= 10:
+    if minute is not None and len(minute) >= 15:
         fenshi = score_offensive_fenshi(minute)
         fenshi["proxy"] = False
     else:
@@ -146,10 +163,15 @@ def _enrich_one(row: dict[str, Any], hot_codes: set[str], hot_names: set[str]) -
         return None
 
     reasons = list(fenshi.get("reasons") or [])
-    in_hot = code in hot_codes or name in hot_names
-    if in_hot:
-        reasons.insert(0, "热门板块领涨/相关")
-        fenshi["score"] = min(100.0, float(fenshi.get("score") or 0) + 10)
+    tags = board_tags.get(code, [])
+    in_hot = bool(tags)
+    if tags:
+        reasons.insert(0, f"强势板块: {', '.join(tags[:2])}")
+
+    # 非回踩再攻形态降权，避免仅靠涨幅入选
+    if not fenshi.get("proxy") and not (fenshi.get("pullback") and fenshi.get("reattack")):
+        fenshi["score"] = max(0.0, float(fenshi.get("score") or 0) - 15)
+        reasons.append("未确认回踩再攻(降权)")
 
     return {
         "code": code,
@@ -161,6 +183,7 @@ def _enrich_one(row: dict[str, Any], hot_codes: set[str], hot_names: set[str]) -
         "volume_ratio": round(float(row.get("volume_ratio") or 0), 2),
         "score": fenshi.get("score") or 0,
         "in_hot_board": in_hot,
+        "board_tags": tags,
         "reasons": reasons,
         "risk": {
             **risk,
@@ -169,6 +192,8 @@ def _enrich_one(row: dict[str, Any], hot_codes: set[str], hot_names: set[str]) -
         },
         "fenshi": {
             "above_vwap": fenshi.get("above_vwap"),
+            "pullback": fenshi.get("pullback"),
+            "reattack": fenshi.get("reattack"),
             "slope": fenshi.get("slope"),
             "vol_expand": fenshi.get("vol_expand"),
             "vwap": fenshi.get("vwap"),
@@ -191,56 +216,94 @@ def run_scan(
     max_pct = max_pct if max_pct is not None else settings.max_pct
     top_n = top_n if top_n is not None else settings.top_n_result
 
-    bucket = in_session_bucket()
-    if session == "auto" and bucket == "other" and not settings.demo_mode:
-        session_note = "当前非重点扫描时段(09:45-11:00 / 13:30-14:30)，仍执行全量弱过滤"
-    else:
-        session_note = f"时段桶={bucket}, filter={session}"
+    allowed, session_note = session_allowed(session, demo_mode=settings.demo_mode)
+    if not allowed:
+        return {
+            "session_note": session_note,
+            "data_source": {"spot": "skipped", "minute": "skipped", "candidates": 0, "scored": 0, "fenshi_ok": 0},
+            "hot_boards": [],
+            "universe_sectors": [],
+            "params": {
+                "min_amount_yi": min_amount_yi,
+                "min_pct": min_pct,
+                "max_pct": max_pct,
+                "session": session,
+                "top_n": top_n,
+                "demo_mode": settings.demo_mode,
+            },
+            "count": 0,
+            "items": [],
+        }
 
     spot = mkt.get_spot_df()
     spot_source = mkt.last_spot_source()
+    if str(spot_source).startswith("demo"):
+        session_note += f" · 警告:行情源失败已用演示数据({spot_source})"
+
+    hot_boards: list[dict[str, Any]] = []
+    universe_sectors: list[dict[str, Any]] = []
+    universe_codes: set[str] = set()
+    board_tags: dict[str, list[str]] = {}
+
+    if not settings.demo_mode:
+        try:
+            hot_boards = mkt.fetch_concept_boards_top(board_top_n)
+        except Exception as e:
+            hot_boards = [{"name": f"板块参考拉取失败: {str(e)[:80]}", "pct": 0}]
+
+        try:
+            uni = mkt.fetch_hot_sector_universe(industry_top=5, concept_top=3)
+            universe_sectors = uni.get("sectors") or []
+            universe_codes = set(uni.get("codes") or [])
+            board_tags = dict(uni.get("code_tags") or {})
+            if not universe_codes:
+                session_note += " · 板块成分池为空，退回全市场预筛"
+        except Exception as e:
+            session_note += f" · 板块成分池失败，退回全市场预筛: {str(e)[:60]}"
+    else:
+        hot_boards = [{"name": "演示板块", "pct": 3.2, "up_count": 12, "leader": "演示"}]
+        universe_codes = {"600812", "002212", "003000"}
+        universe_sectors = [{"name": "演示板块", "pct": 3.2, "type": "演示", "members": 3}]
+        board_tags = {"600812": ["演示板块"], "002212": ["演示板块"]}
+
     filtered = _filter_spot(
         spot,
         min_amount_yi=min_amount_yi,
         min_pct=min_pct,
         max_pct=max_pct,
         limit=settings.max_candidates_spot,
+        universe_codes=universe_codes if universe_codes else None,
     )
 
-    hot_boards: list[dict[str, Any]] = []
-    hot_codes: set[str] = set()
-    hot_names: set[str] = set()
-    if not settings.demo_mode:
-        try:
-            hot_boards = mkt.fetch_concept_boards_top(board_top_n)
-            # 用领涨股名称做热门加权（成分股接口依赖东财常失败）
-            for b in hot_boards[:8]:
-                leader = str(b.get("leader") or "").strip()
-                if leader and leader not in ("--", "nan", "None"):
-                    hot_names.add(leader)
-            if hot_names:
-                name_map = spot.set_index(spot["name"].astype(str))["code"].astype(str)
-                for n in list(hot_names):
-                    if n in name_map.index:
-                        val = name_map.loc[n]
-                        if hasattr(val, "iloc"):
-                            hot_codes.add(str(val.iloc[0]).zfill(6))
-                        else:
-                            hot_codes.add(str(val).zfill(6))
-        except Exception as e:
-            msg = str(e)
-            short = f"板块拉取失败: {msg[:120]}"
-            hot_boards = [{"name": short, "pct": 0}]
-    else:
-        hot_boards = [{"name": "演示板块", "pct": 3.2, "up_count": 12, "leader": "演示"}]
-        hot_codes = {"600812", "002212"}
+    if universe_codes and filtered.empty:
+        session_note += " · 强势板块成分内无满足条件的标的"
 
     rows = filtered.to_dict(orient="records")
+    # 候选价用实时单票校正，避免全市场快照/演示价偏差（如差一倍）
+    if rows and not settings.demo_mode:
+        try:
+            rt = mkt.fetch_realtime_quotes([str(r.get("code") or "") for r in rows])
+            for r in rows:
+                code = str(r.get("code") or "").zfill(6)
+                q = rt.get(code) or {}
+                if float(q.get("price") or 0) <= 0:
+                    continue
+                r["price"] = float(q["price"])
+                r["pct"] = float(q.get("pct") if q.get("pct") is not None else r.get("pct") or 0)
+                r["open"] = float(q.get("open") or r.get("open") or 0)
+                if q.get("name"):
+                    r["name"] = q["name"]
+                for k in ("high", "low", "pre_close", "amount"):
+                    if float(q.get(k) or 0) > 0:
+                        r[k] = float(q[k])
+        except Exception:
+            pass
+
     results: list[dict[str, Any]] = []
 
     workers = 6 if not settings.demo_mode else 2
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(_enrich_one, r, hot_codes, hot_names) for r in rows]
+        futs = [pool.submit(_enrich_one, r, board_tags) for r in rows]
         for fut in as_completed(futs):
             item = fut.result()
             if item is not None:
@@ -250,6 +313,14 @@ def run_scan(
     results = results[:top_n]
     scored = sum(1 for x in results if (x.get("score") or 0) > 0)
     fenshi_ok = sum(1 for x in results if not (x.get("fenshi") or {}).get("proxy"))
+    reattack_ok = sum(
+        1
+        for x in results
+        if (x.get("fenshi") or {}).get("pullback") and (x.get("fenshi") or {}).get("reattack")
+    )
+
+    if universe_codes:
+        session_note += f" · 候选池=强势板块成分({len(universe_codes)}只)"
 
     payload = {
         "session_note": session_note,
@@ -259,8 +330,11 @@ def run_scan(
             "candidates": len(rows),
             "scored": scored,
             "fenshi_ok": fenshi_ok,
+            "reattack_ok": reattack_ok,
+            "universe_size": len(universe_codes),
         },
         "hot_boards": hot_boards[:board_top_n],
+        "universe_sectors": universe_sectors[:12],
         "params": {
             "min_amount_yi": min_amount_yi,
             "min_pct": min_pct,
@@ -282,33 +356,51 @@ def run_scan(
 def watchlist_quotes(codes: list[str]) -> list[dict[str, Any]]:
     if not codes:
         return []
-    spot = mkt.get_spot_df()
-    spot["code"] = spot["code"].astype(str).str.zfill(6)
+    rt: dict[str, dict] = {}
+    try:
+        rt = mkt.fetch_realtime_quotes(codes)
+    except Exception:
+        rt = {}
+
+    spot_map: dict[str, dict] = {}
+    missing = [c.zfill(6) for c in codes if float((rt.get(c.zfill(6)) or {}).get("price") or 0) <= 0]
+    if missing:
+        try:
+            spot = mkt.get_spot_df()
+            spot["code"] = spot["code"].astype(str).str.zfill(6)
+            for code in missing:
+                row = spot[spot["code"] == code]
+                if not row.empty:
+                    r = row.iloc[0]
+                    spot_map[code] = {
+                        "name": str(r.get("name") or ""),
+                        "price": float(r.get("price") or 0),
+                        "pct": float(r.get("pct") or 0),
+                        "open": float(r.get("open") or 0),
+                    }
+        except Exception:
+            pass
+
     out = []
     for code in codes:
         code = code.zfill(6)
-        row = spot[spot["code"] == code]
+        q = rt.get(code) or spot_map.get(code) or {}
         base = {
             "code": code,
-            "name": "",
-            "price": 0,
-            "pct": 0,
-            "open": 0,
+            "name": str(q.get("name") or ""),
+            "price": float(q.get("price") or 0),
+            "pct": float(q.get("pct") or 0),
+            "open": float(q.get("open") or 0),
         }
-        if not row.empty:
-            r = row.iloc[0]
-            base.update(
-                {
-                    "name": str(r["name"]),
-                    "price": float(r["price"]),
-                    "pct": float(r["pct"]),
-                    "open": float(r.get("open") or 0),
-                }
-            )
         try:
             daily = None if settings.demo_mode else mkt.fetch_daily(code, limit=40)
             if settings.demo_mode:
-                anom = {"pct_from_low": 40.0, "ma5": base["price"] * 0.98, "last_close": base["price"], "last_open": base["open"]}
+                anom = {
+                    "pct_from_low": 40.0,
+                    "ma5": base["price"] * 0.98,
+                    "last_close": base["price"],
+                    "last_open": base["open"],
+                }
             else:
                 anom = anomaly_30d_pct(daily)
             risk = risk_flags(

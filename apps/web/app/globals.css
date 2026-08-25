@@ -198,6 +198,14 @@ th {
   white-space: pre-wrap;
 }
 
+.good {
+  color: var(--good);
+}
+
+.bad {
+  color: var(--bad);
+}
+
 .footer-note {
   margin-top: 24px;
   color: var(--muted);

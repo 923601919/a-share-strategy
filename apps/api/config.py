@@ -15,8 +15,8 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     # 扫描默认参数
     min_amount_yi: float = 1.0  # 成交额下限（亿元）
-    min_pct: float = 2.0
-    max_pct: float = 6.0  # 涨幅超过此值不考虑（避免追高）
+    min_pct: float = 2.0  # 涨幅下限（%）
+    max_pct: float = 6.0  # 当前涨幅严格小于此值
     max_candidates_spot: int = 80
     top_n_result: int = 30
     anomaly_warn_pct: float = 180.0
