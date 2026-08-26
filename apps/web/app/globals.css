@@ -5,9 +5,12 @@
   --text: #e7eef7;
   --muted: #8b9bb0;
   --accent: #3d9cf0;
-  --good: #3ecf8e;
+  /* 大A传统：涨红跌绿 */
+  --up: #f04848;
+  --down: #2aad6f;
+  --ok: #3ecf8e;
   --warn: #e6b84d;
-  --bad: #e85d5d;
+  --err: #e85d5d;
   --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
 }
 
@@ -156,13 +159,13 @@ th {
 }
 
 .pill.ok {
-  color: var(--good);
+  color: var(--ok);
 }
 .pill.warn {
   color: var(--warn);
 }
 .pill.block {
-  color: var(--bad);
+  color: var(--err);
 }
 
 .bar {
@@ -176,7 +179,7 @@ th {
 .bar > i {
   display: block;
   height: 100%;
-  background: linear-gradient(90deg, var(--good), var(--warn), var(--bad));
+  background: linear-gradient(90deg, var(--down), var(--warn), var(--up));
 }
 
 .chips {
@@ -194,16 +197,19 @@ th {
 }
 
 .err {
-  color: var(--bad);
+  color: var(--err);
   white-space: pre-wrap;
 }
 
-.good {
-  color: var(--good);
+/* 涨跌幅/盈亏：涨红跌绿 */
+.good,
+.up {
+  color: var(--up);
 }
 
-.bad {
-  color: var(--bad);
+.bad,
+.down {
+  color: var(--down);
 }
 
 .footer-note {

@@ -16,6 +16,13 @@ _SSL_MODE = apply_ssl_fix(insecure=not settings.ssl_verify)
 from providers import akshare_client as mkt
 from services.review import get_review, review_history, run_daily_review
 from services.scan import run_scan, watchlist_quotes
+from services.sim import (
+    evaluate_orders,
+    open_position_from_watch,
+    reset_sim,
+    sell_position,
+    sim_overview,
+)
 from services.track import enrich_watch_item, refresh_track_returns, watchlist_stats
 
 app = FastAPI(title="A-Share Strategy API", version="0.1.0")
@@ -41,15 +48,17 @@ class WatchIn(BaseModel):
     entry_price: float | None = None
     entry_pct: float | None = None
     entry_score: float | None = None
+    minute_confirmed: bool = True
 
 
 class ScanIn(BaseModel):
     min_amount_yi: float | None = Field(default=None, description="成交额下限（亿）")
     min_pct: float | None = None
-    max_pct: float | None = Field(default=None, description="当前涨幅上限%，严格小于该值")
+    max_pct: float | None = Field(default=None, description="当前涨幅上限%")
     session: Literal["auto", "morning", "afternoon", "any"] = "auto"
     top_n: int | None = None
     board_top_n: int = 15
+    mode: Literal["fenshi", "leader_dip"] = "fenshi"
 
 
 @app.get("/api/health")
@@ -73,6 +82,7 @@ def scan(body: ScanIn | None = None):
             session=body.session,
             top_n=body.top_n,
             board_top_n=body.board_top_n,
+            mode=body.mode,
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -158,17 +168,20 @@ def post_watchlist(body: WatchIn):
         if q.get("name"):
             name = str(q["name"])
     elif entry_price is None or entry_pct is None:
-        spot = mkt.get_spot_df()
-        spot["code"] = spot["code"].astype(str).str.zfill(6)
-        row = spot[spot["code"] == code]
-        if not row.empty:
-            r = row.iloc[0]
-            if entry_price is None:
-                entry_price = float(r.get("price") or 0)
-            if entry_pct is None:
-                entry_pct = float(r.get("pct") or 0)
-            if not body.name and r.get("name"):
-                name = str(r["name"])
+        try:
+            spot = mkt.get_spot_df_or_empty()
+            spot["code"] = spot["code"].astype(str).str.zfill(6)
+            row = spot[spot["code"] == code]
+            if not row.empty:
+                r = row.iloc[0]
+                if entry_price is None:
+                    entry_price = float(r.get("price") or 0)
+                if entry_pct is None:
+                    entry_pct = float(r.get("pct") or 0)
+                if not body.name and r.get("name"):
+                    name = str(r["name"])
+        except Exception:
+            pass
 
     row = add_watch(
         code,
@@ -179,7 +192,24 @@ def post_watchlist(body: WatchIn):
         entry_pct=entry_pct,
         entry_score=body.entry_score,
     )
-    return row
+
+    sim_result: dict = {"ok": False, "skipped": True, "reason": "无有效入池价，未开仓"}
+    if entry_price and float(entry_price) > 0 and body.minute_confirmed:
+        try:
+            sim_result = open_position_from_watch(
+                code=code,
+                name=name,
+                price=float(entry_price),
+                entry_score=body.entry_score,
+                note=body.note or "",
+                source=body.source,
+            )
+        except Exception as e:
+            sim_result = {"ok": False, "skipped": True, "reason": f"模拟开仓失败: {e}"}
+    elif entry_price and float(entry_price) > 0:
+        sim_result = {"ok": False, "skipped": True, "reason": "分时未确认(代理分)，未自动开仓"}
+
+    return {**row, "sim": sim_result}
 
 
 @app.delete("/api/watchlist/{code}")
@@ -215,3 +245,65 @@ def review_latest(trade_date: str | None = Query(default=None)):
 @app.get("/api/review/history")
 def review_history_api(limit: int = Query(default=20, le=60)):
     return {"items": review_history(limit=limit)}
+
+
+# ---------- 模拟盘 ----------
+
+
+@app.get("/api/sim")
+def get_sim():
+    try:
+        # 打开页面时顺带检查止盈止损是否已触发
+        evaluate_orders()
+        return sim_overview()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/sim/evaluate")
+def sim_evaluate():
+    try:
+        filled = evaluate_orders()
+        return {"evaluate": filled, **sim_overview()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class SimSellIn(BaseModel):
+    position_id: int
+    price: float | None = None
+
+
+@app.post("/api/sim/sell")
+def sim_sell(body: SimSellIn):
+    try:
+        price = body.price
+        if price is None or price <= 0:
+            from db import get_sim_position
+
+            pos = get_sim_position(body.position_id)
+            if not pos:
+                raise HTTPException(404, "持仓不存在")
+            q = (mkt.fetch_realtime_quotes([pos["code"]]) or {}).get(str(pos["code"]).zfill(6)) or {}
+            price = float(q.get("price") or pos.get("cost_price") or 0)
+        res = sell_position(body.position_id, price=float(price), reason="manual")
+        if not res.get("ok"):
+            raise HTTPException(400, res.get("reason") or "卖出失败")
+        return {**res, "overview": sim_overview()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+class SimResetIn(BaseModel):
+    initial_capital: float | None = Field(default=None, description="重置初始资金，默认10万")
+
+
+@app.post("/api/sim/reset")
+def sim_reset(body: SimResetIn | None = None):
+    body = body or SimResetIn()
+    try:
+        return reset_sim(body.initial_capital)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e

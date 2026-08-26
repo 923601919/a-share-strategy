@@ -18,6 +18,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </div>
             <Link href="/">选股</Link>
             <Link href="/watch">跟踪</Link>
+            <Link href="/sim">模拟盘</Link>
             <Link href="/review">复盘</Link>
           </nav>
           {children}

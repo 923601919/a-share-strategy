@@ -104,6 +104,34 @@ export default function ReviewPage() {
             <h3 style={{ marginTop: 0 }}>
               {data.trade_date} 结论
             </h3>
+            {data.summary?.macro_weak ? (
+              <div className="err" style={{ marginBottom: 12, padding: "10px 12px", borderRadius: 8 }}>
+                <strong>外盘偏弱</strong>
+                <div style={{ marginTop: 4 }}>
+                  {data.summary?.global_macro?.weak_reason ||
+                    "隔夜外盘走弱，次日竞价优先考虑卖出/减仓。"}
+                </div>
+                {(data.summary?.global_macro?.indices || []).length > 0 ? (
+                  <div className="chips" style={{ marginTop: 8 }}>
+                    {(data.summary?.global_macro?.indices || []).slice(0, 5).map((i) => (
+                      <div className="chip" key={i.name}>
+                        {i.name} {i.pct > 0 ? "+" : ""}
+                        {i.pct}%
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ) : (data.summary?.global_macro?.indices || []).length > 0 ? (
+              <div className="chips" style={{ marginBottom: 12 }}>
+                {(data.summary?.global_macro?.indices || []).slice(0, 5).map((i) => (
+                  <div className="chip" key={i.name}>
+                    {i.name} {i.pct > 0 ? "+" : ""}
+                    {i.pct}%
+                  </div>
+                ))}
+              </div>
+            ) : null}
             <p style={{ marginTop: 0 }}>{data.summary?.verdict}</p>
             <div className="chips">
               <div className="chip">自选 {data.summary?.watch_count ?? 0}</div>

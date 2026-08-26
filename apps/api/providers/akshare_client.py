@@ -412,6 +412,7 @@ def fetch_hot_sector_universe(
     *,
     industry_top: int = 5,
     concept_top: int = 3,
+    sector_min_pct: float | None = None,
 ) -> dict[str, Any]:
     """
     强势板块成分股候选池（新浪行业/概念）。
@@ -422,6 +423,7 @@ def fetch_hot_sector_universe(
     codes: set[str] = set()
     sectors: list[dict[str, Any]] = []
     code_tags: dict[str, list[str]] = {}
+    min_pct = settings.sector_min_pct if sector_min_pct is None else sector_min_pct
 
     for indicator, limit in (("行业", industry_top), ("概念", concept_top)):
         if limit <= 0:
@@ -442,6 +444,7 @@ def fetch_hot_sector_universe(
         work["_pct"] = pd.to_numeric(work[pct_c], errors="coerce").fillna(0)
         if work["_pct"].abs().max() < 1:
             work["_pct"] *= 100
+        work = work[work["_pct"] >= min_pct]
         work = work.sort_values("_pct", ascending=False).head(limit)
 
         for _, row in work.iterrows():
@@ -495,7 +498,7 @@ def fetch_concept_members(board_name: str) -> set[str]:
 
 
 def demo_spot() -> pd.DataFrame:
-    """无网/演示数据。"""
+    """仅 DEMO_MODE=true 时使用，禁止作为行情失败兜底。"""
     return pd.DataFrame(
         [
             {
@@ -558,7 +561,129 @@ def demo_minute(code: str) -> pd.DataFrame:
     return pd.DataFrame({"time": times.astype(str), "close": closes, "volume": vols, "amount": vols * closes * 100})
 
 
+def quotes_to_spot_df(quotes: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """实时报价字典 → 与 fetch_spot 同结构的 DataFrame。"""
+    rows: list[dict[str, Any]] = []
+    for code, q in (quotes or {}).items():
+        price = _safe_float(q.get("price"))
+        if price <= 0:
+            continue
+        rows.append(
+            {
+                "code": _normalize_code(code),
+                "name": str(q.get("name") or code),
+                "price": price,
+                "pct": _safe_float(q.get("pct")),
+                "amount": _safe_float(q.get("amount")),
+                "turnover": 0.0,
+                "volume_ratio": 0.0,
+                "high": _safe_float(q.get("high")),
+                "low": _safe_float(q.get("low")),
+                "open": _safe_float(q.get("open")),
+                "pre_close": _safe_float(q.get("pre_close")),
+            }
+        )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "code",
+                "name",
+                "price",
+                "pct",
+                "amount",
+                "turnover",
+                "volume_ratio",
+                "high",
+                "low",
+                "open",
+                "pre_close",
+            ]
+        )
+    return pd.DataFrame(rows)
+
+
+def empty_spot_df() -> pd.DataFrame:
+    return quotes_to_spot_df({})
+
+
+def fetch_overnight_global() -> dict[str, Any]:
+    """
+    隔夜外盘参考（美股主要指数），用于复盘宏观偏弱→竞价卖提示。
+    """
+    import akshare as ak
+
+    indices: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    def _parse_pct(row: pd.Series, pct_cols: list[str]) -> float | None:
+        for c in pct_cols:
+            if c in row.index:
+                v = _safe_float(row[c], default=float("nan"))
+                if v == v:
+                    if abs(v) < 1 and v != 0:
+                        v *= 100
+                    return round(v, 2)
+        return None
+
+    try:
+        df = ak.index_us_stock_sina()
+        if df is not None and not df.empty:
+            name_c = next((c for c in df.columns if "名称" in str(c)), df.columns[0])
+            pct_c = next((c for c in df.columns if "涨跌幅" in str(c)), None)
+            for _, row in df.iterrows():
+                name = str(row.get(name_c) or "").strip()
+                if not name:
+                    continue
+                pct = _parse_pct(row, [pct_c] if pct_c else [])
+                if pct is None:
+                    continue
+                indices.append({"name": name, "pct": pct, "market": "US"})
+    except Exception as e:
+        errors.append(f"us_sina:{e}")
+
+    if not indices:
+        try:
+            df = ak.stock_us_spot_em()
+            if df is not None and not df.empty:
+                name_c = next((c for c in df.columns if "名称" in str(c)), df.columns[1])
+                pct_c = next((c for c in df.columns if "涨跌幅" in str(c)), None)
+                focus = ("道琼斯", "纳斯达克", "标普", "纳指", "道指")
+                for _, row in df.iterrows():
+                    name = str(row.get(name_c) or "").strip()
+                    if not any(k in name for k in focus):
+                        continue
+                    pct = _parse_pct(row, [pct_c] if pct_c else [])
+                    if pct is None:
+                        continue
+                    indices.append({"name": name, "pct": pct, "market": "US"})
+        except Exception as e:
+            errors.append(f"us_em:{e}")
+
+    pcts = [float(i["pct"]) for i in indices if i.get("pct") is not None]
+    avg_pct = round(sum(pcts) / len(pcts), 2) if pcts else None
+    down_heavy = sum(1 for p in pcts if p <= settings.global_weak_index_pct)
+    weak = False
+    weak_reason = ""
+    if pcts:
+        if avg_pct is not None and avg_pct <= settings.global_weak_avg_pct:
+            weak = True
+            weak_reason = f"美股主要指数均涨 {avg_pct:.2f}%（偏弱阈值 {settings.global_weak_avg_pct}%）"
+        elif down_heavy >= 2:
+            weak = True
+            weak_reason = f"{down_heavy} 个主要指数跌超 {abs(settings.global_weak_index_pct)}%"
+
+    return {
+        "indices": indices,
+        "avg_pct": avg_pct,
+        "weak": weak,
+        "weak_reason": weak_reason,
+        "errors": errors,
+        "source": "sina_us" if indices and errors == [] else ("mixed" if indices else "none"),
+    }
+
+
 def get_spot_df() -> pd.DataFrame:
+    """获取全市场快照。非 demo 模式失败时抛错，绝不回落演示票。"""
     global _LAST_SPOT_SOURCE
     if settings.demo_mode:
         _LAST_SPOT_SOURCE = "demo"
@@ -566,5 +691,18 @@ def get_spot_df() -> pd.DataFrame:
     try:
         return fetch_spot()
     except Exception as e:
-        _LAST_SPOT_SOURCE = f"demo_fallback:{type(e).__name__}"
+        _LAST_SPOT_SOURCE = f"error:{type(e).__name__}"
+        raise RuntimeError(f"行情快照失败: {e}") from e
+
+
+def get_spot_df_or_empty() -> pd.DataFrame:
+    """扫描用：失败返回空表，不注入演示数据。"""
+    global _LAST_SPOT_SOURCE
+    if settings.demo_mode:
+        _LAST_SPOT_SOURCE = "demo"
         return demo_spot()
+    try:
+        return fetch_spot()
+    except Exception as e:
+        _LAST_SPOT_SOURCE = f"error:{type(e).__name__}:{str(e)[:80]}"
+        return empty_spot_df()

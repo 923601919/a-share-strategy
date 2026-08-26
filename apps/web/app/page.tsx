@@ -3,17 +3,55 @@
 import { useState } from "react";
 import { addWatch, scan, type ScanItem, type ScanResult } from "@/lib/api";
 
+type ScanMode = "fenshi" | "leader_dip";
+
+type ModeFormState = {
+  minPct: number;
+  maxPct: number;
+};
+
+const MODE_DEFAULTS: Record<ScanMode, ModeFormState> = {
+  fenshi: { minPct: 2, maxPct: 6 },
+  leader_dip: { minPct: -3, maxPct: 2 },
+};
+
+function createModeState(): Record<ScanMode, ModeFormState> {
+  return {
+    fenshi: { ...MODE_DEFAULTS.fenshi },
+    leader_dip: { ...MODE_DEFAULTS.leader_dip },
+  };
+}
+
 export default function HomePage() {
+  const [mode, setMode] = useState<ScanMode>("fenshi");
+  const [formByMode, setFormByMode] = useState(createModeState);
+  const [dataByMode, setDataByMode] = useState<Record<ScanMode, ScanResult | null>>({
+    fenshi: null,
+    leader_dip: null,
+  });
   const [minAmount, setMinAmount] = useState(1);
-  const [minPct, setMinPct] = useState(2);
-  const [maxPct, setMaxPct] = useState(6);
   const [session, setSession] = useState("auto");
   const [topN, setTopN] = useState(20);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [data, setData] = useState<ScanResult | null>(null);
   const [msg, setMsg] = useState("");
   const [addingCode, setAddingCode] = useState("");
+
+  const { minPct, maxPct } = formByMode[mode];
+  const data = dataByMode[mode];
+
+  function onModeChange(next: ScanMode) {
+    setMode(next);
+    setError("");
+    setMsg("");
+  }
+
+  function updateForm(patch: Partial<ModeFormState>) {
+    setFormByMode((prev) => ({
+      ...prev,
+      [mode]: { ...prev[mode], ...patch },
+    }));
+  }
 
   async function onScan() {
     setLoading(true);
@@ -26,8 +64,9 @@ export default function HomePage() {
         max_pct: maxPct,
         session,
         top_n: topN,
+        mode,
       });
-      setData(res);
+      setDataByMode((prev) => ({ ...prev, [mode]: res }));
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -39,17 +78,29 @@ export default function HomePage() {
     setError("");
     setMsg("");
     setAddingCode(item.code);
+    const proxy = Boolean((item.fenshi as { proxy?: boolean })?.proxy);
     try {
-      await addWatch({
+      const res = await addWatch({
         code: item.code,
         name: item.name,
-        source: "fenshi",
+        source: mode === "leader_dip" ? "longtou" : "fenshi",
         note: (item.reasons || []).slice(0, 2).join("；"),
         entry_price: item.price,
         entry_pct: item.pct,
         entry_score: item.score,
+        minute_confirmed: !proxy,
       });
-      setMsg(`已加入自选：${item.name}(${item.code})，可到「自选跟踪」查看`);
+      const sim = res?.sim;
+      if (sim?.ok && sim.position) {
+        setMsg(
+          `已入自选并模拟开仓：${res.name}(${res.code}) ${sim.position.shares}股 @${sim.position.cost_price}，止盈${sim.position.take_profit_price}/止损${sim.position.stop_loss_price}`
+        );
+      } else {
+        setMsg(
+          `已加入自选：${res.name}(${res.code})` +
+            (sim?.reason ? `（模拟盘：${sim.reason}）` : "")
+        );
+      }
     } catch (e: any) {
       setError(`加入自选失败：${e?.message || String(e)}`);
     } finally {
@@ -57,13 +108,34 @@ export default function HomePage() {
     }
   }
 
+  const modeTitle = mode === "leader_dip" ? "龙头低吸扫描" : "进攻型分时扫描";
+  const modeDesc =
+    mode === "leader_dip"
+      ? "强势板块龙头，水下/平盘贴近 MA5 低吸。默认涨幅 -3% ~ +2%。"
+      : "强势板块成分内选股 + 回踩均价放量再攻 / 强势推升。默认涨幅 2% ~ <6%。";
+  const maxPctLabel = mode === "leader_dip" ? "涨幅上限≤%" : "当前涨幅<%";
+
   return (
     <>
       <section className="panel">
-        <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>进攻型分时扫描</h1>
+        <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>{modeTitle}</h1>
         <p className="muted" style={{ marginTop: 0 }}>
-          强势板块成分内选股 + 回踩均价放量再攻。默认筛选：当前涨幅 &lt; 6%。
+          {modeDesc}
         </p>
+        <div className="row" style={{ marginBottom: 12 }}>
+          <button
+            className={mode === "fenshi" ? "" : "secondary"}
+            onClick={() => onModeChange("fenshi")}
+          >
+            进攻型分时
+          </button>
+          <button
+            className={mode === "leader_dip" ? "" : "secondary"}
+            onClick={() => onModeChange("leader_dip")}
+          >
+            龙头低吸
+          </button>
+        </div>
         <div className="row">
           <label>
             成交额下限（亿）
@@ -80,16 +152,16 @@ export default function HomePage() {
               type="number"
               step="0.1"
               value={minPct}
-              onChange={(e) => setMinPct(Number(e.target.value))}
+              onChange={(e) => updateForm({ minPct: Number(e.target.value) })}
             />
           </label>
           <label>
-            当前涨幅&lt;%
+            {maxPctLabel}
             <input
               type="number"
               step="0.1"
               value={maxPct}
-              onChange={(e) => setMaxPct(Number(e.target.value))}
+              onChange={(e) => updateForm({ maxPct: Number(e.target.value) })}
             />
           </label>
           <label>
@@ -123,9 +195,10 @@ export default function HomePage() {
             <div className="muted">{data.session_note}</div>
             <div className="muted" style={{ marginTop: 6 }}>
               数据源 spot={data.data_source?.spot ?? "?"} · 候选池{" "}
-              {data.data_source?.universe_size ?? "?"} · 回踩再攻{" "}
-              {data.data_source?.reattack_ok ?? 0}/{data.data_source?.candidates ?? "?"} · 命中{" "}
-              {data.count} 只 · 涨幅&lt;{String(data.params?.max_pct ?? maxPct)}%
+              {data.data_source?.universe_size ?? "?"} · 分时确认{" "}
+              {data.data_source?.fenshi_ok ?? 0}/{data.data_source?.candidates ?? "?"} · 回踩再攻{" "}
+              {data.data_source?.reattack_ok ?? 0} · 强势推升{" "}
+              {data.data_source?.strong_push_ok ?? 0} · 命中 {data.count} 只
             </div>
             <h3 style={{ marginBottom: 8 }}>强势板块（候选池来源）</h3>
             <div className="chips">
@@ -163,50 +236,56 @@ export default function HomePage() {
                 </tr>
               </thead>
               <tbody>
-                {data.items.map((it) => (
-                  <tr key={it.code}>
-                    <td>
-                      <a
-                        href={`https://quote.eastmoney.com/${it.code.startsWith("6") ? "sh" : "sz"}${it.code}.html`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        {it.code}
-                      </a>
-                    </td>
-                    <td>
-                      {it.name}
-                      {it.in_hot_board ? (
-                        <div className="muted">热门板块</div>
-                      ) : null}
-                    </td>
-                    <td>{it.pct}%</td>
-                    <td>{it.score}</td>
-                    <td>{it.volume_ratio}</td>
-                    <td>
-                      <span className={`pill ${it.risk?.level || "ok"}`}>
-                        {it.risk?.anomaly_pct ?? "-"}%
-                      </span>
-                      <div className="bar" style={{ marginTop: 6 }}>
-                        <i
-                          style={{
-                            width: `${Math.min(it.risk?.anomaly_progress || 0, 100)}%`,
-                          }}
-                        />
-                      </div>
-                    </td>
-                    <td className="muted">{(it.reasons || []).join("；")}</td>
-                    <td>
-                      <button
-                        className="secondary"
-                        disabled={addingCode === it.code}
-                        onClick={() => onAdd(it)}
-                      >
-                        {addingCode === it.code ? "加入中…" : "自选"}
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {data.items.map((it) => {
+                  const proxy = Boolean((it.fenshi as { proxy?: boolean })?.proxy);
+                  return (
+                    <tr key={it.code}>
+                      <td>
+                        <a
+                          href={`https://quote.eastmoney.com/${it.code.startsWith("6") ? "sh" : "sz"}${it.code}.html`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {it.code}
+                        </a>
+                      </td>
+                      <td>
+                        {it.name}
+                        {it.in_hot_board ? (
+                          <div className="muted">热门板块</div>
+                        ) : null}
+                        {proxy ? <div className="muted">代理分</div> : null}
+                      </td>
+                      <td className={it.pct > 0 ? "up" : it.pct < 0 ? "down" : ""}>
+                        {it.pct}%
+                      </td>
+                      <td>{it.score}</td>
+                      <td>{it.volume_ratio}</td>
+                      <td>
+                        <span className={`pill ${it.risk?.level || "ok"}`}>
+                          {it.risk?.anomaly_pct ?? "-"}%
+                        </span>
+                        <div className="bar" style={{ marginTop: 6 }}>
+                          <i
+                            style={{
+                              width: `${Math.min(it.risk?.anomaly_progress || 0, 100)}%`,
+                            }}
+                          />
+                        </div>
+                      </td>
+                      <td className="muted">{(it.reasons || []).join("；")}</td>
+                      <td>
+                        <button
+                          className="secondary"
+                          disabled={addingCode === it.code}
+                          onClick={() => onAdd(it)}
+                        >
+                          {addingCode === it.code ? "加入中…" : "自选"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </section>

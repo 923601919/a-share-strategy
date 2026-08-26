@@ -15,6 +15,7 @@ from db import (
 from providers import akshare_client as mkt
 from rules.fenshi import score_offensive_fenshi
 from rules.risk import anomaly_30d_pct, risk_flags
+from services.sim import redesign_all_open_orders
 from services.track import enrich_watch_item
 
 
@@ -22,7 +23,14 @@ def _today() -> str:
     return datetime.now().date().isoformat()
 
 
-def _build_orders_for_watch(item: dict[str, Any], quote: dict[str, Any], daily_info: dict[str, Any]) -> list[dict[str, Any]]:
+def _build_orders_for_watch(
+    item: dict[str, Any],
+    quote: dict[str, Any],
+    daily_info: dict[str, Any],
+    *,
+    macro_weak: bool = False,
+    macro_reason: str = "",
+) -> list[dict[str, Any]]:
     """基于进攻型分时 + 五日线/异动红线，生成次日条件单。"""
     code = str(item["code"]).zfill(6)
     name = str(item.get("name") or code)
@@ -31,7 +39,25 @@ def _build_orders_for_watch(item: dict[str, Any], quote: dict[str, Any], daily_i
     ma5 = daily_info.get("ma5")
     anom = float(daily_info.get("pct_from_low") or 0)
     fenshi = quote.get("fenshi") or {}
+    source = str(item.get("source") or "manual")
     orders: list[dict[str, Any]] = []
+
+    # ---- 宏观偏弱：竞价优先卖出（作者纪律）----
+    if macro_weak:
+        orders.append(
+            {
+                "side": "sell",
+                "priority": 0,
+                "code": code,
+                "name": name,
+                "title": "外盘偏弱·次日竞价卖出",
+                "trigger": macro_reason or "隔夜外盘走弱，A股竞价易承压",
+                "action": "09:15-09:25 竞价挂单卖出或减半；龙头低吸票优先兑现",
+                "price_hint": price,
+                "window": "09:15-09:30",
+                "reason": "宏观偏弱先控回撤；有赚可走、破位必走",
+            }
+        )
 
     # ---- 卖：保护与兑现 ----
     if ma5 and ma5 > 0:
@@ -65,7 +91,8 @@ def _build_orders_for_watch(item: dict[str, Any], quote: dict[str, Any], daily_i
         )
 
     if entry > 0:
-        stop = entry * 0.97
+        stop_pct = 2.5 if source == "longtou" else 3.0
+        stop = entry * (1 - stop_pct / 100)
         orders.append(
             {
                 "side": "sell",
@@ -73,11 +100,12 @@ def _build_orders_for_watch(item: dict[str, Any], quote: dict[str, Any], daily_i
                 "code": code,
                 "name": name,
                 "title": "入池价回撤止损",
-                "trigger": f"现价 <= {stop:.2f}（入池价{entry:.2f} 回撤约3%）",
+                "trigger": f"现价 <= {stop:.2f}（入池价{entry:.2f} 回撤约{stop_pct}%）",
                 "action": "止损卖出",
                 "price_hint": round(stop, 3),
                 "window": "全天",
-                "reason": "自选跟踪短线风险控制",
+                "reason": "自选跟踪短线风险控制"
+                + ("；龙头低吸止损更紧" if source == "longtou" else ""),
             }
         )
 
@@ -114,10 +142,10 @@ def _build_orders_for_watch(item: dict[str, Any], quote: dict[str, Any], daily_i
                     "code": code,
                     "name": name,
                     "title": "回踩均价/五日线承接买入",
-                    "trigger": f"10:00-10:40 回踩至 {buy_zone:.2f} 附近后放量再攻",
+                    "trigger": f"10:15-10:40 回踩至 {buy_zone:.2f} 附近后放量再攻",
                     "action": "分批买入，确认站上均价再加",
                     "price_hint": buy_zone,
-                    "window": "10:00-10:40",
+                    "window": "10:15-10:40",
                     "reason": "进攻型分时：回踩再攻买点",
                 }
             )
@@ -202,6 +230,28 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
     boards: list[dict[str, Any]] = []
     watch_reviews: list[dict[str, Any]] = []
     orders: list[dict[str, Any]] = []
+    global_macro: dict[str, Any] = {}
+
+    # 0) 隔夜外盘
+    try:
+        global_macro = mkt.fetch_overnight_global()
+        if global_macro.get("indices"):
+            idx_txt = "、".join(
+                f"{i.get('name')}{i.get('pct'):+.2f}%"
+                for i in (global_macro.get("indices") or [])[:4]
+                if i.get("pct") is not None
+            )
+            notes.append(f"隔夜外盘: {idx_txt}")
+        if global_macro.get("weak"):
+            notes.append(f"⚠ 外盘偏弱: {global_macro.get('weak_reason')}")
+        elif global_macro.get("errors"):
+            notes.append(f"外盘数据部分失败: {'; '.join(global_macro['errors'][:2])}")
+    except Exception as e:
+        notes.append(f"外盘拉取失败: {e}")
+        global_macro = {"weak": False, "indices": [], "errors": [str(e)]}
+
+    macro_weak = bool(global_macro.get("weak"))
+    macro_reason = str(global_macro.get("weak_reason") or "")
 
     # 1) 板块
     try:
@@ -218,16 +268,22 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
     except Exception as e:
         notes.append(f"强势板块成分池失败: {e}")
 
-    # 2) 自选复盘
+    # 2) 自选复盘（优先实时报价）
     watch = list_watchlist()
+    codes = [str(it["code"]).zfill(6) for it in watch]
     spot_map: dict[str, dict[str, Any]] = {}
     try:
-        spot = mkt.get_spot_df()
-        spot["code"] = spot["code"].astype(str).str.zfill(6)
-        for _, r in spot.iterrows():
-            spot_map[str(r["code"]).zfill(6)] = r.to_dict()
+        spot_map = mkt.fetch_realtime_quotes(codes) if codes else {}
     except Exception as e:
-        notes.append(f"行情快照失败: {e}")
+        notes.append(f"实时报价失败: {e}")
+    if not spot_map:
+        try:
+            spot = mkt.get_spot_df_or_empty()
+            spot["code"] = spot["code"].astype(str).str.zfill(6)
+            for _, r in spot.iterrows():
+                spot_map[str(r["code"]).zfill(6)] = r.to_dict()
+        except Exception as e:
+            notes.append(f"行情快照失败: {e}")
 
     for it in watch:
         code = str(it["code"]).zfill(6)
@@ -244,7 +300,13 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
             "price": price,
             "fenshi": analyzed.get("fenshi") or {},
         }
-        stock_orders = _build_orders_for_watch(it, quote_for_order, analyzed.get("daily") or {})
+        stock_orders = _build_orders_for_watch(
+            it,
+            quote_for_order,
+            analyzed.get("daily") or {},
+            macro_weak=macro_weak,
+            macro_reason=macro_reason,
+        )
         orders.extend(stock_orders)
         watch_reviews.append(
             {
@@ -255,6 +317,41 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
                 "orders_count": len(stock_orders),
             }
         )
+
+    # 2b) 模拟盘：撮合止盈止损 + 复盘重设条件单
+    sim_block: dict[str, Any] = {}
+    try:
+        sim_block = redesign_all_open_orders(quotes=spot_map if spot_map else None)
+        eval_msgs = (sim_block.get("evaluated") or {}).get("messages") or []
+        if eval_msgs:
+            notes.extend([f"模拟盘成交: {m}" for m in eval_msgs])
+        notes.append(
+            f"模拟盘重设条件单 {len(sim_block.get('redesigned') or [])} 只持仓"
+        )
+        # 把模拟盘止盈止损也并入次日条件单列表，便于复盘页统一看
+        for o in sim_block.get("active_orders") or []:
+            otype = str(o.get("order_type") or "")
+            title = "模拟盘止盈卖出" if otype == "take_profit" else "模拟盘止损卖出"
+            if otype not in ("take_profit", "stop_loss"):
+                continue
+            orders.append(
+                {
+                    "side": "sell",
+                    "priority": 1 if otype == "stop_loss" else 2,
+                    "code": o.get("code"),
+                    "name": o.get("name"),
+                    "title": title,
+                    "trigger": f"现价触及 {float(o.get('trigger_price') or 0):.2f}"
+                    + (f"（{o.get('trigger_pct')}%）" if o.get("trigger_pct") is not None else ""),
+                    "action": "自动卖出（模拟盘）",
+                    "price_hint": o.get("trigger_price"),
+                    "window": "全天",
+                    "reason": o.get("reason") or "模拟盘条件单",
+                }
+            )
+    except Exception as e:
+        notes.append(f"模拟盘复盘失败: {e}")
+        sim_block = {"error": str(e)}
 
     # 3) 最近扫描结果里高分票：补次日观察/买入条件（未在自选中的）
     scan_items: list[dict[str, Any]] = []
@@ -311,8 +408,10 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
         "buy_orders": sum(1 for o in orders if o["side"] == "buy"),
         "sell_orders": sum(1 for o in orders if o["side"] == "sell"),
         "top_boards": [{"name": b.get("name"), "pct": b.get("pct")} for b in boards[:8]],
+        "global_macro": global_macro,
+        "macro_weak": macro_weak,
         "notes": notes,
-        "verdict": _verdict(watch_reviews, boards),
+        "verdict": _verdict(watch_reviews, boards, macro_weak=macro_weak, macro_reason=macro_reason),
     }
 
     # 去重条件单（同 code+title）
@@ -333,13 +432,8 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
         "universe_sectors": uni_sectors[:10],
         "watch_reviews": watch_reviews,
         "orders": uniq_orders,
-        "next_day_checklist": [
-            "09:15-09:25 看竞价：开盘能否站上五日线",
-            "重点卖单优先执行（跌破五日线/异动红线）",
-            "10:00-10:40 只做回踩均价后放量再攻的买单",
-            "涨幅已达/超过6%的短线票次日谨慎追高",
-            "无形态宁空仓",
-        ],
+        "sim": sim_block,
+        "next_day_checklist": _next_day_checklist(macro_weak=macro_weak),
     }
 
     if persist:
@@ -348,12 +442,42 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
     return payload
 
 
-def _verdict(watch_reviews: list[dict[str, Any]], boards: list[dict[str, Any]]) -> str:
+def _next_day_checklist(*, macro_weak: bool = False) -> list[str]:
+    items = [
+        "09:15-09:25 看竞价：开盘能否站上五日线",
+    ]
+    if macro_weak:
+        items.append("⚠ 外盘偏弱：竞价阶段优先处理卖单，能走先走、不恋战")
+    items.extend(
+        [
+            "重点卖单优先执行（跌破五日线/异动红线/外盘弱竞价卖）",
+            "10:15-10:40 只做回踩均价后放量再攻的买单",
+            "模拟盘按来源止盈：进攻分时+8%/龙头低吸+5%，触及即卖",
+            "涨幅已达/超过6%的短线票次日谨慎追高",
+            "无形态宁空仓",
+        ]
+    )
+    return items
+
+
+def _verdict(
+    watch_reviews: list[dict[str, Any]],
+    boards: list[dict[str, Any]],
+    *,
+    macro_weak: bool = False,
+    macro_reason: str = "",
+) -> str:
     if not watch_reviews and not boards:
         return "数据不足，建议收盘后再跑一次复盘。"
     up = sum(1 for w in watch_reviews if (w.get("day_return_pct") or 0) > 0)
     down = sum(1 for w in watch_reviews if (w.get("day_return_pct") or 0) < 0)
     board_txt = "、".join(str(b.get("name")) for b in boards[:3]) if boards else "无明显主线"
+    macro_txt = f"隔夜外盘偏弱（{macro_reason}），次日竞价优先减仓。" if macro_weak else ""
+    if macro_weak:
+        return (
+            f"{macro_txt} 自选今日涨{up}/跌{down}。主线参考：{board_txt}。"
+            "买点收缩，只做最强回踩再攻；龙头低吸有赚先走。"
+        )
     if up > down:
         return f"自选今日偏强（涨{up}/跌{down}）。主线参考：{board_txt}。次日优先执行卖出保护单，买点只做回踩再攻。"
     if down > up:
