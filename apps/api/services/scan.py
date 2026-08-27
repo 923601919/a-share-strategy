@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 from config import settings
 from db import save_scan_snapshot
-from providers import akshare_client as mkt
+from providers import market as mkt
 from rules.fenshi import in_attack_window, score_leader_dip, score_offensive_fenshi, session_allowed
 from rules.risk import anomaly_30d_pct, risk_flags
 
 
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
 ScanMode = Literal["fenshi", "leader_dip"]
+ProgressCb = Callable[[str, float, str], None]
+CancelCb = Callable[[], bool]
+
+logger = logging.getLogger("scan")
+
+
+class ScanCancelled(Exception):
+    """扫描被用户取消。"""
 
 
 def _is_st(name: str) -> bool:
@@ -292,9 +302,12 @@ def _empty_scan_payload(
             "top_n": top_n,
             "mode": mode,
             "demo_mode": settings.demo_mode,
+            "strategy_version": settings.strategy_version,
         },
         "count": 0,
         "items": [],
+        "timings": {},
+        "error_code": None,
     }
 
 
@@ -307,7 +320,27 @@ def run_scan(
     top_n: int | None = None,
     board_top_n: int = 15,
     mode: ScanMode = "fenshi",
+    on_progress: ProgressCb | None = None,
+    should_cancel: CancelCb | None = None,
 ) -> dict[str, Any]:
+    timings: dict[str, float] = {}
+    t_all = time.perf_counter()
+
+    def progress(stage: str, pct: float, message: str) -> None:
+        logger.info("scan stage=%s progress=%.0f%% %s", stage, pct * 100, message)
+        if on_progress:
+            try:
+                on_progress(stage, pct, message)
+            except Exception:
+                pass
+
+    def check_cancel() -> None:
+        if should_cancel and should_cancel():
+            raise ScanCancelled("cancelled")
+
+    def mark(name: str, t0: float) -> None:
+        timings[name] = round((time.perf_counter() - t0) * 1000, 1)
+
     if mode == "leader_dip":
         min_pct = min_pct if min_pct is not None else settings.leader_dip_min_pct
         max_pct = max_pct if max_pct is not None else settings.leader_dip_max_pct
@@ -318,6 +351,7 @@ def run_scan(
     top_n = top_n if top_n is not None else settings.top_n_result
     max_pct_inclusive = mode == "leader_dip"
 
+    progress("session", 0.05, "检查交易时段")
     allowed, session_note = session_allowed(session, demo_mode=settings.demo_mode)
     if not allowed:
         payload = _empty_scan_payload(
@@ -332,44 +366,77 @@ def run_scan(
             hot_boards=[],
             universe_sectors=[],
         )
+        payload["error_code"] = "session_blocked"
+        payload["timings"] = timings
         return payload
 
     mode_label = "龙头低吸" if mode == "leader_dip" else "进攻型分时"
     session_note = f"{mode_label} · {session_note}"
 
-    spot = mkt.get_spot_df_or_empty()
-    spot_source = mkt.last_spot_source()
-    spot_empty = spot is None or getattr(spot, "empty", True)
-
     hot_boards: list[dict[str, Any]] = []
     universe_sectors: list[dict[str, Any]] = []
     universe_codes: set[str] = set()
     board_tags: dict[str, list[str]] = {}
+    spot = None
+    spot_source = "none"
+    spot_empty = True
 
-    if settings.demo_mode:
-        hot_boards = [{"name": "演示板块", "pct": 3.2, "up_count": 12, "leader": "演示"}]
-        universe_codes = {"600812", "002212", "003000"}
-        universe_sectors = [{"name": "演示板块", "pct": 3.2, "type": "演示", "members": 3}]
-        board_tags = {"600812": ["演示板块"], "002212": ["演示板块"]}
-    else:
-        try:
-            hot_boards = mkt.fetch_concept_boards_top(board_top_n)
-            hot_boards = [b for b in hot_boards if abs(float(b.get("pct") or 0)) < 30]
-        except Exception as e:
-            hot_boards = []
-            session_note += f" · 板块参考拉取失败: {str(e)[:60]}"
+    try:
+        check_cancel()
+        if settings.demo_mode:
+            hot_boards = [{"name": "演示板块", "pct": 3.2, "up_count": 12, "leader": "演示"}]
+            universe_codes = {"600812", "002212", "003000"}
+            universe_sectors = [{"name": "演示板块", "pct": 3.2, "type": "演示", "members": 3}]
+            board_tags = {"600812": ["演示板块"], "002212": ["演示板块"]}
+            spot = mkt.get_spot_df_or_empty(use_isolated=False)
+            spot_source = mkt.last_spot_source()
+            spot_empty = spot is None or getattr(spot, "empty", True)
+        else:
+            progress("boards", 0.12, "拉取强势板块参考")
+            t0 = time.perf_counter()
+            try:
+                hot_boards = mkt.fetch_concept_boards_top(board_top_n)
+                hot_boards = [b for b in hot_boards if abs(float(b.get("pct") or 0)) < 30]
+            except Exception as e:
+                hot_boards = []
+                session_note += f" · 板块参考拉取失败: {str(e)[:60]}"
+            mark("boards_ms", t0)
 
-        try:
-            uni = mkt.fetch_hot_sector_universe(
-                industry_top=5,
-                concept_top=3,
-                sector_min_pct=settings.sector_min_pct,
-            )
-            universe_sectors = uni.get("sectors") or []
-            universe_codes = set(uni.get("codes") or [])
-            board_tags = dict(uni.get("code_tags") or {})
-            if not universe_codes:
-                session_note += " · 板块成分池为空，跳过扫描（不扫全市场）"
+            check_cancel()
+            progress("universe", 0.25, "构建强势板块成分池")
+            t0 = time.perf_counter()
+            try:
+                uni = mkt.fetch_hot_sector_universe(
+                    industry_top=5,
+                    concept_top=3,
+                    sector_min_pct=settings.sector_min_pct,
+                    use_isolated=settings.sector_universe_use_isolated,
+                    ttl=settings.universe_cache_ttl,
+                )
+                universe_sectors = uni.get("sectors") or []
+                universe_codes = set(uni.get("codes") or [])
+                board_tags = dict(uni.get("code_tags") or {})
+                mark("universe_ms", t0)
+                if not universe_codes:
+                    session_note += " · 板块成分池为空，跳过扫描（不扫全市场）"
+                    payload = _empty_scan_payload(
+                        session_note=session_note,
+                        spot_source=spot_source,
+                        min_amount_yi=min_amount_yi,
+                        min_pct=min_pct,
+                        max_pct=max_pct,
+                        session=session,
+                        top_n=top_n,
+                        mode=mode,
+                        hot_boards=hot_boards[:board_top_n],
+                        universe_sectors=universe_sectors[:12],
+                    )
+                    payload["error_code"] = "empty_universe"
+                    payload["timings"] = timings
+                    return payload
+            except Exception as e:
+                mark("universe_ms", t0)
+                session_note += f" · 板块成分池失败，跳过扫描: {str(e)[:60]}"
                 payload = _empty_scan_payload(
                     session_note=session_note,
                     spot_source=spot_source,
@@ -382,156 +449,203 @@ def run_scan(
                     hot_boards=hot_boards[:board_top_n],
                     universe_sectors=universe_sectors[:12],
                 )
-                try:
-                    save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
-                except Exception:
-                    pass
+                payload["error_code"] = "universe_failed"
+                payload["timings"] = timings
                 return payload
-        except Exception as e:
-            session_note += f" · 板块成分池失败，跳过扫描: {str(e)[:60]}"
-            payload = _empty_scan_payload(
-                session_note=session_note,
-                spot_source=spot_source,
-                min_amount_yi=min_amount_yi,
-                min_pct=min_pct,
-                max_pct=max_pct,
-                session=session,
-                top_n=top_n,
-                mode=mode,
-                hot_boards=hot_boards[:board_top_n],
-                universe_sectors=universe_sectors[:12],
-            )
-            try:
-                save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
-            except Exception:
-                pass
-            return payload
 
-        if spot_empty and universe_codes:
+            check_cancel()
+            progress("quotes", 0.45, f"拉取成分实时报价({len(universe_codes)}只)")
+            t0 = time.perf_counter()
             try:
                 rt = mkt.fetch_realtime_quotes(list(universe_codes))
                 spot = mkt.quotes_to_spot_df(rt)
                 spot_source = "sina_rt_universe"
-                spot_empty = spot.empty
-                session_note += f" · 全市场快照不可用，已用板块成分实时报价({len(spot)}只)"
+                spot_empty = spot is None or getattr(spot, "empty", True)
+                if not spot_empty:
+                    session_note += f" · 用板块成分实时报价({len(spot)}只)"
             except Exception as e:
-                session_note += f" · 板块实时报价也失败: {str(e)[:60]}"
+                session_note += f" · 板块实时报价失败: {str(e)[:60]}"
+            mark("quotes_ms", t0)
 
-        if spot_empty:
-            session_note += " · 无真实行情数据，返回空结果（未使用演示数据）"
-            payload = _empty_scan_payload(
-                session_note=session_note,
-                spot_source=spot_source,
-                min_amount_yi=min_amount_yi,
-                min_pct=min_pct,
-                max_pct=max_pct,
-                session=session,
-                top_n=top_n,
-                mode=mode,
-                hot_boards=hot_boards[:board_top_n],
-                universe_sectors=universe_sectors[:12],
-                universe_size=len(universe_codes),
-            )
+            if spot_empty:
+                check_cancel()
+                progress("spot", 0.55, "实时报价为空，尝试全市场快照(子进程)")
+                t0 = time.perf_counter()
+                try:
+                    spot = mkt.get_spot_df_or_empty(
+                        use_isolated=settings.scan_use_isolated,
+                        ttl=settings.spot_cache_ttl,
+                    )
+                    spot_source = mkt.last_spot_source()
+                    spot_empty = spot is None or getattr(spot, "empty", True)
+                except Exception as e:
+                    session_note += f" · 全市场快照失败: {str(e)[:60]}"
+                    spot_empty = True
+                mark("spot_ms", t0)
+
+            if spot_empty:
+                session_note += " · 无真实行情数据，返回空结果（未使用演示数据）"
+                payload = _empty_scan_payload(
+                    session_note=session_note,
+                    spot_source=spot_source,
+                    min_amount_yi=min_amount_yi,
+                    min_pct=min_pct,
+                    max_pct=max_pct,
+                    session=session,
+                    top_n=top_n,
+                    mode=mode,
+                    hot_boards=hot_boards[:board_top_n],
+                    universe_sectors=universe_sectors[:12],
+                    universe_size=len(universe_codes),
+                )
+                payload["error_code"] = "no_quotes"
+                payload["timings"] = timings
+                return payload
+
+        check_cancel()
+        progress("filter", 0.62, "预筛候选")
+        filtered = _filter_spot(
+            spot,
+            min_amount_yi=min_amount_yi,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            limit=min(settings.max_candidates_spot, 40),
+            universe_codes=universe_codes if universe_codes else None,
+            max_pct_inclusive=max_pct_inclusive,
+        )
+
+        if universe_codes and filtered.empty:
+            session_note += " · 强势板块成分内无满足条件的标的"
+
+        rows = filtered.to_dict(orient="records")
+        if rows and not settings.demo_mode and spot_source != "sina_rt_universe":
             try:
-                save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
+                rt = mkt.fetch_realtime_quotes([str(r.get("code") or "") for r in rows])
+                for r in rows:
+                    code = str(r.get("code") or "").zfill(6)
+                    q = rt.get(code) or {}
+                    if float(q.get("price") or 0) <= 0:
+                        continue
+                    r["price"] = float(q["price"])
+                    r["pct"] = float(q.get("pct") if q.get("pct") is not None else r.get("pct") or 0)
+                    r["open"] = float(q.get("open") or r.get("open") or 0)
+                    if q.get("name"):
+                        r["name"] = q["name"]
+                    for k in ("high", "low", "pre_close", "amount"):
+                        if float(q.get(k) or 0) > 0:
+                            r[k] = float(q[k])
             except Exception:
                 pass
-            return payload
 
-    filtered = _filter_spot(
-        spot,
-        min_amount_yi=min_amount_yi,
-        min_pct=min_pct,
-        max_pct=max_pct,
-        limit=settings.max_candidates_spot,
-        universe_codes=universe_codes if universe_codes else None,
-        max_pct_inclusive=max_pct_inclusive,
-    )
+        results: list[dict[str, Any]] = []
+        timed_out = 0
+        total = max(len(rows), 1)
+        done_n = 0
 
-    if universe_codes and filtered.empty:
-        session_note += " · 强势板块成分内无满足条件的标的"
+        progress("enrich", 0.7, f"分时打分 0/{len(rows)}")
+        t0 = time.perf_counter()
+        workers = 4 if not settings.demo_mode else 2
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(_enrich_one, r, board_tags, mode=mode) for r in rows]
+            for fut in as_completed(futs):
+                check_cancel()
+                try:
+                    item = fut.result(timeout=25)
+                except Exception:
+                    timed_out += 1
+                    item = None
+                done_n += 1
+                if item is not None:
+                    results.append(item)
+                if done_n % 3 == 0 or done_n == total:
+                    progress(
+                        "enrich",
+                        0.7 + 0.25 * (done_n / total),
+                        f"分时打分 {done_n}/{len(rows)}",
+                    )
+        mark("enrich_ms", t0)
 
-    rows = filtered.to_dict(orient="records")
-    if rows and not settings.demo_mode:
+        if timed_out:
+            session_note += f" · {timed_out}只分时超时已跳过"
+
+        results.sort(key=lambda x: (x.get("score") or 0, x.get("pct") or 0), reverse=True)
+        results = results[:top_n]
+        scored = sum(1 for x in results if (x.get("score") or 0) > 0)
+        fenshi_ok = sum(1 for x in results if not (x.get("fenshi") or {}).get("proxy"))
+        reattack_ok = sum(
+            1
+            for x in results
+            if (x.get("fenshi") or {}).get("pullback") and (x.get("fenshi") or {}).get("reattack")
+        )
+        strong_push_ok = sum(1 for x in results if (x.get("fenshi") or {}).get("strong_push"))
+
+        if universe_codes:
+            session_note += f" · 候选池=强势板块成分({len(universe_codes)}只)"
+
+        pct_hint = f"≤{max_pct}%" if max_pct_inclusive else f"<{max_pct}%"
+        timings["total_ms"] = round((time.perf_counter() - t_all) * 1000, 1)
+        payload = {
+            "session_note": session_note + f" · 涨幅{pct_hint}",
+            "data_source": {
+                "spot": spot_source,
+                "minute": "tencent_fallback" if spot_source != "demo" else "demo",
+                "candidates": len(rows),
+                "scored": scored,
+                "fenshi_ok": fenshi_ok,
+                "reattack_ok": reattack_ok,
+                "strong_push_ok": strong_push_ok,
+                "universe_size": len(universe_codes),
+            },
+            "hot_boards": hot_boards[:board_top_n],
+            "universe_sectors": universe_sectors[:12],
+            "params": {
+                "min_amount_yi": min_amount_yi,
+                "min_pct": min_pct,
+                "max_pct": max_pct,
+                "session": session,
+                "top_n": top_n,
+                "mode": mode,
+                "demo_mode": settings.demo_mode,
+                "strategy_version": settings.strategy_version,
+            },
+            "count": len(results),
+            "items": results,
+            "timings": timings,
+            "error_code": None,
+        }
+        progress("done", 1.0, f"完成，命中 {len(results)} 只")
         try:
-            rt = mkt.fetch_realtime_quotes([str(r.get("code") or "") for r in rows])
-            for r in rows:
-                code = str(r.get("code") or "").zfill(6)
-                q = rt.get(code) or {}
-                if float(q.get("price") or 0) <= 0:
-                    continue
-                r["price"] = float(q["price"])
-                r["pct"] = float(q.get("pct") if q.get("pct") is not None else r.get("pct") or 0)
-                r["open"] = float(q.get("open") or r.get("open") or 0)
-                if q.get("name"):
-                    r["name"] = q["name"]
-                for k in ("high", "low", "pre_close", "amount"):
-                    if float(q.get(k) or 0) > 0:
-                        r[k] = float(q[k])
+            save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
         except Exception:
             pass
-
-    results: list[dict[str, Any]] = []
-
-    workers = 6 if not settings.demo_mode else 2
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futs = [pool.submit(_enrich_one, r, board_tags, mode=mode) for r in rows]
-        for fut in as_completed(futs):
-            item = fut.result()
-            if item is not None:
-                results.append(item)
-
-    results.sort(key=lambda x: (x.get("score") or 0, x.get("pct") or 0), reverse=True)
-    results = results[:top_n]
-    scored = sum(1 for x in results if (x.get("score") or 0) > 0)
-    fenshi_ok = sum(1 for x in results if not (x.get("fenshi") or {}).get("proxy"))
-    reattack_ok = sum(
-        1
-        for x in results
-        if (x.get("fenshi") or {}).get("pullback") and (x.get("fenshi") or {}).get("reattack")
-    )
-    strong_push_ok = sum(1 for x in results if (x.get("fenshi") or {}).get("strong_push"))
-
-    if universe_codes:
-        session_note += f" · 候选池=强势板块成分({len(universe_codes)}只)"
-
-    pct_hint = f"≤{max_pct}%" if max_pct_inclusive else f"<{max_pct}%"
-    payload = {
-        "session_note": session_note,
-        "data_source": {
-            "spot": spot_source,
-            "minute": "tencent_fallback" if spot_source != "demo" else "demo",
-            "candidates": len(rows),
-            "scored": scored,
-            "fenshi_ok": fenshi_ok,
-            "reattack_ok": reattack_ok,
-            "strong_push_ok": strong_push_ok,
-            "universe_size": len(universe_codes),
-        },
-        "hot_boards": hot_boards[:board_top_n],
-        "universe_sectors": universe_sectors[:12],
-        "params": {
-            "min_amount_yi": min_amount_yi,
-            "min_pct": min_pct,
-            "max_pct": max_pct,
-            "session": session,
-            "top_n": top_n,
-            "mode": mode,
-            "demo_mode": settings.demo_mode,
-        },
-        "count": len(results),
-        "items": results,
-    }
-    session_note += f" · 涨幅{pct_hint}"
-    payload["session_note"] = session_note
-    try:
-        save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
-    except Exception:
-        pass
-    return payload
+        return payload
+    except ScanCancelled:
+        timings["total_ms"] = round((time.perf_counter() - t_all) * 1000, 1)
+        payload = _empty_scan_payload(
+            session_note=session_note + " · 已取消",
+            spot_source=spot_source,
+            min_amount_yi=min_amount_yi,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            session=session,
+            top_n=top_n,
+            mode=mode,
+            hot_boards=hot_boards[:board_top_n],
+            universe_sectors=universe_sectors[:12],
+            universe_size=len(universe_codes),
+        )
+        payload["error_code"] = "cancelled"
+        payload["timings"] = timings
+        raise
 
 
-def watchlist_quotes(codes: list[str]) -> list[dict[str, Any]]:
+
+def watchlist_quotes(
+    codes: list[str],
+    *,
+    include_risk: bool = False,
+) -> list[dict[str, Any]]:
+    """批量现价。默认只拉实时盘口；include_risk 才会逐票拉日线算异动（较慢）。"""
     if not codes:
         return []
     rt: dict[str, dict] = {}
@@ -544,43 +658,54 @@ def watchlist_quotes(codes: list[str]) -> list[dict[str, Any]]:
     missing = [c.zfill(6) for c in codes if float((rt.get(c.zfill(6)) or {}).get("price") or 0) <= 0]
     if missing:
         try:
-            spot = mkt.get_spot_df_or_empty()
-            spot["code"] = spot["code"].astype(str).str.zfill(6)
-            for code in missing:
-                row = spot[spot["code"] == code]
-                if not row.empty:
-                    r = row.iloc[0]
-                    spot_map[code] = {
-                        "name": str(r.get("name") or ""),
-                        "price": float(r.get("price") or 0),
-                        "pct": float(r.get("pct") or 0),
-                        "open": float(r.get("open") or 0),
-                    }
+            spot = mkt.get_spot_df_or_empty(use_isolated=False)
+            if spot is not None and not getattr(spot, "empty", True):
+                spot = spot.copy()
+                spot["code"] = spot["code"].astype(str).str.zfill(6)
+                for code in missing:
+                    row = spot[spot["code"] == code]
+                    if not row.empty:
+                        r = row.iloc[0]
+                        spot_map[code] = {
+                            "name": str(r.get("name") or ""),
+                            "price": float(r.get("price") or 0),
+                            "pct": float(r.get("pct") or 0),
+                            "open": float(r.get("open") or 0),
+                        }
         except Exception:
             pass
 
-    out = []
+    bases: list[dict[str, Any]] = []
     for code in codes:
         code = code.zfill(6)
         q = rt.get(code) or spot_map.get(code) or {}
-        base = {
-            "code": code,
-            "name": str(q.get("name") or ""),
-            "price": float(q.get("price") or 0),
-            "pct": float(q.get("pct") or 0),
-            "open": float(q.get("open") or 0),
-        }
-        try:
-            daily = None if settings.demo_mode else mkt.fetch_daily(code, limit=40)
-            if settings.demo_mode:
-                anom = {
-                    "pct_from_low": 40.0,
-                    "ma5": base["price"] * 0.98,
-                    "last_close": base["price"],
-                    "last_open": base["open"],
+        bases.append(
+            {
+                "code": code,
+                "name": str(q.get("name") or ""),
+                "price": float(q.get("price") or 0),
+                "pct": float(q.get("pct") or 0),
+                "open": float(q.get("open") or 0),
+                "risk": {"level": "ok", "messages": [], "anomaly_progress": 0, "anomaly_pct": None},
+            }
+        )
+
+    if not include_risk or settings.demo_mode:
+        if settings.demo_mode:
+            for b in bases:
+                b["risk"] = {
+                    "level": "ok",
+                    "messages": [],
+                    "anomaly_progress": 20,
+                    "anomaly_pct": 40.0,
+                    "ma5": b["price"] * 0.98 if b["price"] else None,
                 }
-            else:
-                anom = anomaly_30d_pct(daily)
+        return bases
+
+    def _risk_one(base: dict[str, Any]) -> dict[str, Any]:
+        try:
+            daily = mkt.fetch_daily(base["code"], limit=40)
+            anom = anomaly_30d_pct(daily)
             risk = risk_flags(
                 anom["pct_from_low"],
                 price=base["price"],
@@ -591,6 +716,13 @@ def watchlist_quotes(codes: list[str]) -> list[dict[str, Any]]:
             )
             base["risk"] = {**risk, "anomaly_pct": anom["pct_from_low"], "ma5": anom.get("ma5")}
         except Exception as e:
-            base["risk"] = {"level": "ok", "messages": [str(e)], "anomaly_progress": 0, "anomaly_pct": 0}
-        out.append(base)
-    return out
+            base["risk"] = {
+                "level": "ok",
+                "messages": [str(e)],
+                "anomaly_progress": 0,
+                "anomaly_pct": 0,
+            }
+        return base
+
+    with ThreadPoolExecutor(max_workers=min(6, max(len(bases), 1))) as pool:
+        return list(pool.map(_risk_one, bases))

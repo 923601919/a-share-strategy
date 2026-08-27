@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Query
@@ -13,9 +14,15 @@ from ssl_fix import apply_ssl_fix
 # 必须在首次请求东财前生效
 _SSL_MODE = apply_ssl_fix(insecure=not settings.ssl_verify)
 
-from providers import akshare_client as mkt
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
+from providers import market as mkt
+from services.jobs import job_store
 from services.review import get_review, review_history, run_daily_review
-from services.scan import run_scan, watchlist_quotes
+from services.scan import ScanCancelled, run_scan, watchlist_quotes
 from services.sim import (
     evaluate_orders,
     open_position_from_watch,
@@ -25,7 +32,7 @@ from services.sim import (
 )
 from services.track import enrich_watch_item, refresh_track_returns, watchlist_stats
 
-app = FastAPI(title="A-Share Strategy API", version="0.1.0")
+app = FastAPI(title="A-Share Strategy API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
@@ -63,16 +70,21 @@ class ScanIn(BaseModel):
 
 @app.get("/api/health")
 def health():
+    sources = mkt.source_health()
     return {
         "ok": True,
         "demo_mode": settings.demo_mode,
         "ssl_verify": settings.ssl_verify,
         "ssl_mode": _SSL_MODE,
+        "strategy_version": settings.strategy_version,
+        "scan_use_isolated": settings.scan_use_isolated,
+        "sources": sources,
     }
 
 
 @app.post("/api/scan")
 def scan(body: ScanIn | None = None):
+    """同步扫描（兼容旧客户端）；前端请优先用 /api/scan/jobs。"""
     body = body or ScanIn()
     try:
         return run_scan(
@@ -84,32 +96,115 @@ def scan(body: ScanIn | None = None):
             board_top_n=body.board_top_n,
             mode=body.mode,
         )
+    except ScanCancelled:
+        raise HTTPException(status_code=499, detail="cancelled") from None
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/scan/jobs")
+def start_scan_job(body: ScanIn | None = None):
+    """异步扫描：立即返回 job_id，前端轮询进度。"""
+    body = body or ScanIn()
+    params = body.model_dump()
+    job = job_store.create("scan", params)
+
+    def _run() -> None:
+        def on_progress(stage: str, progress: float, message: str) -> None:
+            job_store.update(
+                job.id,
+                stage=stage,
+                progress=progress,
+                message=message,
+                status="running",
+            )
+
+        try:
+            result = run_scan(
+                min_amount_yi=body.min_amount_yi,
+                min_pct=body.min_pct,
+                max_pct=body.max_pct,
+                session=body.session,
+                top_n=body.top_n,
+                board_top_n=body.board_top_n,
+                mode=body.mode,
+                on_progress=on_progress,
+                should_cancel=lambda: job_store.is_cancelled(job.id),
+            )
+            job_store.update(
+                job.id,
+                status="done",
+                stage="done",
+                progress=1.0,
+                message=f"完成，命中 {result.get('count', 0)} 只",
+                result=result,
+                timings=result.get("timings") or {},
+                error_code=result.get("error_code"),
+            )
+        except ScanCancelled:
+            job_store.update(
+                job.id,
+                status="cancelled",
+                stage="cancelled",
+                progress=1.0,
+                message="已取消",
+                error_code="cancelled",
+            )
+
+    job_store.run_in_background(job.id, _run)
+    return job.to_public(include_result=False)
+
+
+@app.get("/api/scan/jobs/{job_id}")
+def get_scan_job(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return job.to_public(include_result=True)
+
+
+@app.post("/api/scan/jobs/{job_id}/cancel")
+def cancel_scan_job(job_id: str):
+    job = job_store.get(job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    ok = job_store.request_cancel(job_id)
+    job = job_store.get(job_id)
+    return {"ok": ok, **(job.to_public(include_result=False) if job else {})}
 
 
 @app.get("/api/watchlist")
 def get_watchlist(
     with_quotes: bool = Query(default=False),
     refresh_returns: bool = Query(default=False),
+    with_risk: bool = Query(default=False, description="是否拉日线算异动（较慢）"),
 ):
     """默认快速返回库内自选；行情/收益刷新按需开启。"""
     items = list_watchlist()
     quotes: dict[str, dict] = {}
     if with_quotes and items:
         try:
-            quotes = {q["code"]: q for q in watchlist_quotes([i["code"] for i in items])}
+            quotes = {
+                q["code"]: q
+                for q in watchlist_quotes(
+                    [i["code"] for i in items],
+                    include_risk=with_risk,
+                )
+            }
         except Exception:
             quotes = {}
 
     out = []
-    for it in items:
-        q = quotes.get(str(it["code"]).zfill(6), {}) or quotes.get(it["code"], {})
-        try:
-            out.append(enrich_watch_item(it, q, force_refresh=refresh_returns))
-        except Exception:
-            out.append(
-                {
+    if refresh_returns and items:
+        # 收益刷新并行，避免串行日线
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _one(it: dict) -> dict:
+            q = quotes.get(str(it["code"]).zfill(6), {}) or quotes.get(it["code"], {})
+            try:
+                return enrich_watch_item(it, q, force_refresh=True)
+            except Exception:
+                return {
                     **it,
                     "quote": q,
                     "returns": [],
@@ -119,7 +214,27 @@ def get_watchlist(
                         "entry_score": it.get("entry_score"),
                     },
                 }
-            )
+
+        with ThreadPoolExecutor(max_workers=min(6, max(len(items), 1))) as pool:
+            out = list(pool.map(_one, items))
+    else:
+        for it in items:
+            q = quotes.get(str(it["code"]).zfill(6), {}) or quotes.get(it["code"], {})
+            try:
+                out.append(enrich_watch_item(it, q, force_refresh=False))
+            except Exception:
+                out.append(
+                    {
+                        **it,
+                        "quote": q,
+                        "returns": [],
+                        "track": {
+                            "entry_price": it.get("entry_price"),
+                            "entry_pct": it.get("entry_pct"),
+                            "entry_score": it.get("entry_score"),
+                        },
+                    }
+                )
     return {"items": out, "stats": watchlist_stats()}
 
 

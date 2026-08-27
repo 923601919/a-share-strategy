@@ -46,5 +46,12 @@ class Settings(BaseSettings):
     global_weak_avg_pct: float = -0.5
     global_weak_index_pct: float = -0.8  # 单指数跌超此值计为偏弱
 
+    # 策略/软件版本（复盘可回溯）
+    strategy_version: str = "2026.08.26-p0"
+    scan_use_isolated: bool = True  # 危险行情路径走子进程（全市场快照）
+    sector_universe_use_isolated: bool = False  # 新浪板块走子进程易超时，默认进程内
+    spot_cache_ttl: float = 45.0
+    universe_cache_ttl: float = 90.0
+
 
 settings = Settings()

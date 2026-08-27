@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import pandas as pd
 
@@ -12,10 +13,22 @@ from ssl_fix import apply_ssl_fix
 apply_ssl_fix(insecure=not settings.ssl_verify)
 
 _LAST_SPOT_SOURCE = "none"
+_T = TypeVar("_T")
+# 单线程超时池：避免 akshare 无超时请求把扫描永久卡住
+_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ak-timeout")
 
 
 def last_spot_source() -> str:
     return _LAST_SPOT_SOURCE
+
+
+def call_with_timeout(fn: Callable[..., _T], timeout: float, *args: Any, **kwargs: Any) -> _T:
+    """在独立线程执行并超时；超时后抛 TimeoutError（线程仍可能在后台空转）。"""
+    fut = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=timeout)
+    except FuturesTimeout as e:
+        raise TimeoutError(f"{getattr(fn, '__name__', 'call')} timed out after {timeout}s") from e
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -172,14 +185,13 @@ def fetch_realtime_quotes(codes: list[str]) -> dict[str, dict[str, Any]]:
 
 
 def fetch_spot() -> pd.DataFrame:
-    """全市场快照：本机东财常断连，优先新浪，失败再东财。"""
+    """全市场快照：本机东财常断连/易卡死，优先新浪并强制超时。"""
     global _LAST_SPOT_SOURCE
     import akshare as ak
 
     errors: list[str] = []
 
-    # 1) 新浪（更稳）
-    try:
+    def _from_sina() -> pd.DataFrame:
         df = ak.stock_zh_a_spot()
         rename = {
             "代码": "code",
@@ -202,15 +214,9 @@ def fetch_spot() -> pd.DataFrame:
                 df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
         df["turnover"] = 0.0
         df["volume_ratio"] = 0.0
-        if len(df) > 100:
-            _LAST_SPOT_SOURCE = "sina"
-            return df
-        errors.append(f"sina_rows={len(df)}")
-    except Exception as e:
-        errors.append(f"sina:{e}")
+        return df
 
-    # 2) 东财兜底
-    try:
+    def _from_em() -> pd.DataFrame:
         df = ak.stock_zh_a_spot_em()
         rename = {
             "代码": "code",
@@ -236,6 +242,21 @@ def fetch_spot() -> pd.DataFrame:
             df["volume_ratio"] = 0.0
         if "turnover" not in df.columns:
             df["turnover"] = 0.0
+        return df
+
+    # 1) 新浪（更稳），严格超时；超时后绝不继续等
+    try:
+        df = call_with_timeout(_from_sina, 18)
+        if len(df) > 100:
+            _LAST_SPOT_SOURCE = "sina"
+            return df
+        errors.append(f"sina_rows={len(df)}")
+    except Exception as e:
+        errors.append(f"sina:{e}")
+
+    # 2) 东财兜底（部分环境会触发 py_mini_racer，也必须超时）
+    try:
+        df = call_with_timeout(_from_em, 18)
         _LAST_SPOT_SOURCE = "eastmoney"
         return df
     except Exception as e:
@@ -245,33 +266,43 @@ def fetch_spot() -> pd.DataFrame:
 
 
 def fetch_minute(code: str, days: int = 1) -> pd.DataFrame:
-    """1 分钟分时：腾讯优先，失败再东财。"""
+    """1 分钟分时：腾讯优先，失败再东财；每源强制超时。"""
     import akshare as ak
 
     symbol6 = _normalize_code(code)
     end = datetime.now()
     start = end - timedelta(days=max(days, 1) + 2)
 
-    # 1) 腾讯
-    try:
+    def _from_tx() -> pd.DataFrame:
         df = ak.stock_zh_a_minute(symbol=_tx_symbol(symbol6), period="1")
         df = _normalize_minute(df, source="tx")
-        if not df.empty:
-            t = pd.to_datetime(df["time"], errors="coerce")
-            last_day = t.max().normalize()
-            return df[t >= last_day].reset_index(drop=True)
+        if df.empty:
+            return df
+        t = pd.to_datetime(df["time"], errors="coerce")
+        last_day = t.max().normalize()
+        return df[t >= last_day].reset_index(drop=True)
+
+    def _from_em() -> pd.DataFrame:
+        df = ak.stock_zh_a_hist_min_em(
+            symbol=symbol6,
+            start_date=start.strftime("%Y-%m-%d %H:%M:%S"),
+            end_date=end.strftime("%Y-%m-%d %H:%M:%S"),
+            period="1",
+            adjust="",
+        )
+        return _normalize_minute(df, source="em")
+
+    try:
+        df = call_with_timeout(_from_tx, 8)
+        if df is not None and not df.empty:
+            return df
     except Exception:
         pass
 
-    # 2) 东财
-    df = ak.stock_zh_a_hist_min_em(
-        symbol=symbol6,
-        start_date=start.strftime("%Y-%m-%d %H:%M:%S"),
-        end_date=end.strftime("%Y-%m-%d %H:%M:%S"),
-        period="1",
-        adjust="",
-    )
-    return _normalize_minute(df, source="em")
+    try:
+        return call_with_timeout(_from_em, 10)
+    except Exception as e:
+        raise RuntimeError(f"minute fetch failed for {symbol6}: {e}") from e
 
 
 def _normalize_minute(df: pd.DataFrame, source: str) -> pd.DataFrame:
@@ -313,7 +344,7 @@ def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
     end = datetime.now()
     start = end - timedelta(days=limit * 2 + 10)
 
-    try:
+    def _from_em() -> pd.DataFrame:
         df = ak.stock_zh_a_hist(
             symbol=symbol6,
             period="daily",
@@ -331,12 +362,18 @@ def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
             "成交额": "amount",
             "涨跌幅": "pct",
         }
-        df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-    except Exception:
+        return df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+
+    def _from_sina() -> pd.DataFrame:
         df = ak.stock_zh_a_daily(symbol=_sina_symbol(symbol6), adjust="")
-        # 已有英文字段
         if "date" not in df.columns and "日期" in df.columns:
             df = df.rename(columns={"日期": "date"})
+        return df
+
+    try:
+        df = call_with_timeout(_from_em, 10)
+    except Exception:
+        df = call_with_timeout(_from_sina, 10)
 
     for col in ("open", "close", "high", "low", "volume", "amount", "pct"):
         if col in df.columns:
@@ -352,7 +389,7 @@ def fetch_concept_boards_top(n: int = 20) -> list[dict[str, Any]]:
     errors: list[str] = []
 
     try:
-        df = ak.stock_board_industry_summary_ths()
+        df = call_with_timeout(ak.stock_board_industry_summary_ths, 12)
         cols = list(df.columns)
         name_c = cols[1] if len(cols) > 1 else None
         pct_c = cols[2] if len(cols) > 2 else None
@@ -372,7 +409,7 @@ def fetch_concept_boards_top(n: int = 20) -> list[dict[str, Any]]:
 
     if len(rows) < n:
         try:
-            df = ak.stock_sector_spot(indicator="行业")
+            df = call_with_timeout(ak.stock_sector_spot, 12, indicator="行业")
             colmap = {str(c): c for c in df.columns}
             name_c = next((colmap[k] for k in colmap if "板块" in k), df.columns[1])
             pct_c = next((colmap[k] for k in colmap if "涨跌幅" in k), df.columns[4])
@@ -429,7 +466,7 @@ def fetch_hot_sector_universe(
         if limit <= 0:
             continue
         try:
-            df = ak.stock_sector_spot(indicator=indicator)
+            df = call_with_timeout(ak.stock_sector_spot, 12, indicator=indicator)
         except Exception:
             continue
         if df is None or df.empty:
@@ -453,7 +490,7 @@ def fetch_hot_sector_universe(
             if not label or not name:
                 continue
             try:
-                members = ak.stock_sector_detail(sector=label)
+                members = call_with_timeout(ak.stock_sector_detail, 10, sector=label)
             except Exception:
                 continue
             if members is None or members.empty or "code" not in members.columns:
@@ -706,3 +743,28 @@ def get_spot_df_or_empty() -> pd.DataFrame:
     except Exception as e:
         _LAST_SPOT_SOURCE = f"error:{type(e).__name__}:{str(e)[:80]}"
         return empty_spot_df()
+
+
+def get_spot_df_or_empty_bundle() -> dict[str, Any]:
+    """子进程隔离用：一并返回 source。"""
+    df = get_spot_df_or_empty()
+    return {"df": df, "source": last_spot_source()}
+
+
+def fetch_hot_sector_universe_bundle(
+    *,
+    industry_top: int = 5,
+    concept_top: int = 3,
+    sector_min_pct: float | None = None,
+) -> dict[str, Any]:
+    """子进程隔离用：codes 转为 list 便于序列化。"""
+    uni = fetch_hot_sector_universe(
+        industry_top=industry_top,
+        concept_top=concept_top,
+        sector_min_pct=sector_min_pct,
+    )
+    return {
+        "codes": list(uni.get("codes") or []),
+        "sectors": uni.get("sectors") or [],
+        "code_tags": uni.get("code_tags") or {},
+    }

@@ -18,42 +18,66 @@ function fmtRet(v: number | null | undefined) {
 export default function WatchPage() {
   const [data, setData] = useState<WatchlistResponse | null>(null);
   const [loading, setLoading] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
+  const [refreshingQuotes, setRefreshingQuotes] = useState(false);
+  const [refreshingReturns, setRefreshingReturns] = useState(false);
   const [error, setError] = useState("");
 
-  async function load(heavy = false) {
-    if (heavy) setRefreshing(true);
-    else setLoading(true);
+  async function loadLight() {
+    setLoading(true);
     setError("");
     try {
-      const res = await getWatchlist({
-        with_quotes: heavy,
-        refresh_returns: heavy,
-      });
-      setData(res);
+      // 只读库：自选 + 已缓存 T+N，不打行情网
+      setData(await getWatchlist());
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
       setLoading(false);
-      setRefreshing(false);
+    }
+  }
+
+  async function refreshQuotes() {
+    setRefreshingQuotes(true);
+    setError("");
+    try {
+      // 仅批量实时报价，不拉日线异动
+      setData(await getWatchlist({ with_quotes: true }));
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setRefreshingQuotes(false);
+    }
+  }
+
+  async function refreshReturns() {
+    setRefreshingReturns(true);
+    setError("");
+    try {
+      setData(
+        await getWatchlist({
+          with_quotes: true,
+          refresh_returns: true,
+          with_risk: true,
+        })
+      );
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    } finally {
+      setRefreshingReturns(false);
     }
   }
 
   useEffect(() => {
-    // 先秒开库内自选，再后台拉行情/收益
-    (async () => {
-      await load(false);
-      await load(true);
-    })();
+    loadLight();
   }, []);
 
   async function onRemove(code: string) {
     await removeWatch(code);
-    await load(false);
+    await loadLight();
   }
 
   const items = data?.items || [];
   const stats = data?.stats;
+  const busy = loading || refreshingQuotes || refreshingReturns;
 
   return (
     <>
@@ -62,13 +86,19 @@ export default function WatchPage() {
           <div>
             <h1 style={{ margin: "0 0 6px", fontSize: 20 }}>自选跟踪</h1>
             <p className="muted" style={{ margin: 0 }}>
-              记录入池价，跟踪 T+0~T+3 涨跌幅。共 {items.length} 只
-              {refreshing ? " · 正在刷新行情…" : ""}
+              进入页面只读本地记录，不自动拉行情。共 {items.length} 只
+              {refreshingQuotes ? " · 刷新现价中…" : ""}
+              {refreshingReturns ? " · 刷新收益中…" : ""}
             </p>
           </div>
-          <button onClick={() => load(true)} disabled={loading || refreshing}>
-            {refreshing ? "刷新中…" : "刷新行情/收益"}
-          </button>
+          <div className="row">
+            <button className="secondary" onClick={refreshQuotes} disabled={busy}>
+              {refreshingQuotes ? "现价…" : "刷新现价"}
+            </button>
+            <button onClick={refreshReturns} disabled={busy}>
+              {refreshingReturns ? "收益…" : "刷新收益/异动"}
+            </button>
+          </div>
         </div>
         {error ? <p className="err">{error}</p> : null}
         {loading && items.length === 0 ? <p className="muted">加载自选中…</p> : null}
@@ -135,13 +165,7 @@ export default function WatchPage() {
                     <td>{it.code}</td>
                     <td>{it.name}</td>
                     <td>{tr?.entry_price ?? it.entry_price ?? "-"}</td>
-                    <td>
-                      {it.quote?.price
-                        ? it.quote.price
-                        : refreshing
-                          ? "…"
-                          : "-"}
-                    </td>
+                    <td>{it.quote?.price ? it.quote.price : "-"}</td>
                     <td>{tr?.entry_score ?? it.entry_score ?? "-"}</td>
                     <td>{fmtRet(tr?.t0?.return_pct)}</td>
                     <td>{fmtRet(tr?.t1?.return_pct)}</td>

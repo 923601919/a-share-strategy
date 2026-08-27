@@ -61,20 +61,105 @@ export type ScanResult = {
   params: Record<string, unknown>;
   count: number;
   items: ScanItem[];
+  timings?: Record<string, number>;
+  error_code?: string | null;
 };
 
-export function scan(body?: {
+export type ScanJob = {
+  job_id: string;
+  kind: string;
+  status: "queued" | "running" | "done" | "error" | "cancelled" | string;
+  stage: string;
+  progress: number;
+  message: string;
+  error?: string | null;
+  error_code?: string | null;
+  timings?: Record<string, number>;
+  result?: ScanResult;
+  params?: Record<string, unknown>;
+};
+
+export type ScanBody = {
   min_amount_yi?: number;
   min_pct?: number;
   max_pct?: number;
   session?: string;
   top_n?: number;
   mode?: "fenshi" | "leader_dip";
-}) {
+};
+
+export function scan(body?: ScanBody) {
   return request<ScanResult>("/api/scan", {
     method: "POST",
     body: JSON.stringify(body || {}),
   });
+}
+
+export function startScanJob(body?: ScanBody) {
+  return request<ScanJob>("/api/scan/jobs", {
+    method: "POST",
+    body: JSON.stringify(body || {}),
+  });
+}
+
+export function getScanJob(jobId: string) {
+  return request<ScanJob>(`/api/scan/jobs/${jobId}`);
+}
+
+export function cancelScanJob(jobId: string) {
+  return request<{ ok: boolean } & ScanJob>(`/api/scan/jobs/${jobId}/cancel`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+const ERROR_HINTS: Record<string, string> = {
+  session_blocked: "当前不在扫描时段。可把时段改为「不限」再试。",
+  empty_universe: "强势板块成分池为空，暂无候选。",
+  universe_failed: "板块成分池拉取失败（网络或数据源）。稍后重试。",
+  no_quotes: "没有拿到真实行情报价。",
+  cancelled: "扫描已取消。",
+};
+
+export function explainScanError(code?: string | null, fallback?: string) {
+  if (code && ERROR_HINTS[code]) return ERROR_HINTS[code];
+  return fallback || "扫描失败";
+}
+
+/** 异步扫描：轮询进度，可中止。 */
+export async function scanWithProgress(
+  body: ScanBody | undefined,
+  opts: {
+    onProgress?: (job: ScanJob) => void;
+    shouldStop?: () => boolean;
+    intervalMs?: number;
+  } = {}
+): Promise<ScanResult> {
+  const started = await startScanJob(body);
+  const interval = opts.intervalMs ?? 800;
+  while (true) {
+    if (opts.shouldStop?.()) {
+      try {
+        await cancelScanJob(started.job_id);
+      } catch {
+        /* ignore */
+      }
+      throw new Error(explainScanError("cancelled"));
+    }
+    const job = await getScanJob(started.job_id);
+    opts.onProgress?.(job);
+    if (job.status === "done") {
+      if (!job.result) throw new Error("扫描完成但无结果");
+      return job.result;
+    }
+    if (job.status === "cancelled") {
+      throw new Error(explainScanError("cancelled"));
+    }
+    if (job.status === "error") {
+      throw new Error(explainScanError(job.error_code, job.error || job.message || "扫描失败"));
+    }
+    await new Promise((r) => setTimeout(r, interval));
+  }
 }
 
 export type WatchTrackDay = {
@@ -133,10 +218,15 @@ export type WatchlistResponse = {
   stats: WatchlistStats;
 };
 
-export function getWatchlist(opts?: { with_quotes?: boolean; refresh_returns?: boolean }) {
+export function getWatchlist(opts?: {
+  with_quotes?: boolean;
+  refresh_returns?: boolean;
+  with_risk?: boolean;
+}) {
   const q = new URLSearchParams();
   if (opts?.with_quotes) q.set("with_quotes", "true");
   if (opts?.refresh_returns) q.set("refresh_returns", "true");
+  if (opts?.with_risk) q.set("with_risk", "true");
   const qs = q.toString();
   return request<WatchlistResponse>(`/api/watchlist${qs ? `?${qs}` : ""}`);
 }
