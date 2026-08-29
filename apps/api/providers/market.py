@@ -150,6 +150,7 @@ def fetch_hot_sector_universe(
         else:
             uni = raw.fetch_hot_sector_universe(**kwargs)
         if not uni.get("codes"):
+            logger.warning("primary sector universe empty, trying board+em fallback")
             uni = _fallback_sector_universe(
                 industry_top=industry_top,
                 concept_top=concept_top,
@@ -160,8 +161,10 @@ def fetch_hot_sector_universe(
             uni = {**uni, "codes": set(uni["codes"])}
         elif not isinstance(uni.get("codes"), set):
             uni = {**uni, "codes": set(uni.get("codes") or [])}
-        _cache_set(key, uni, ttl)
         n = len(uni.get("codes") or [])
+        # 空池不缓存，避免短暂失败锁死后续扫描 90s
+        if n > 0:
+            _cache_set(key, uni, ttl)
         _mark("sector_universe", ok=n > 0, detail=f"codes={n}", ms=(time.perf_counter() - t0) * 1000)
         return uni
     except Exception as e:
@@ -177,6 +180,8 @@ def _fallback_sector_universe(
     sector_min_pct: float | None = None,
 ) -> dict[str, Any]:
     """新浪板块失败时：用同花顺行业榜 + 东财成分兜底。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     min_pct = settings.sector_min_pct if sector_min_pct is None else sector_min_pct
     codes: set[str] = set()
     sectors: list[dict[str, Any]] = []
@@ -191,26 +196,38 @@ def _fallback_sector_universe(
     picked = [b for b in boards if float(b.get("pct") or 0) >= min_pct]
     picked = picked[: industry_top + concept_top]
 
-    for b in picked:
+    def _one(b: dict[str, Any]) -> tuple[str, float, set[str]]:
         name = str(b.get("name") or "").strip()
         if not name:
-            continue
+            return "", 0.0, set()
         members = raw.fetch_concept_members(name)
-        if not members:
-            continue
-        codes |= members
-        for c in members:
-            code_tags.setdefault(c, [])
-            if name not in code_tags[c]:
-                code_tags[c].append(name)
-        sectors.append(
-            {
-                "name": name,
-                "pct": round(float(b.get("pct") or 0), 2),
-                "type": "fallback",
-                "members": len(members),
-            }
-        )
+        return name, float(b.get("pct") or 0), members
+
+    with ThreadPoolExecutor(max_workers=min(6, max(len(picked), 1)), thread_name_prefix="uni-fb") as pool:
+        futs = [pool.submit(_one, b) for b in picked]
+        try:
+            for fut in as_completed(futs, timeout=50):
+                try:
+                    name, pct, members = fut.result()
+                except Exception:
+                    continue
+                if not name or not members:
+                    continue
+                codes |= members
+                for c in members:
+                    code_tags.setdefault(c, [])
+                    if name not in code_tags[c]:
+                        code_tags[c].append(name)
+                sectors.append(
+                    {
+                        "name": name,
+                        "pct": round(pct, 2),
+                        "type": "fallback",
+                        "members": len(members),
+                    }
+                )
+        except TimeoutError:
+            logger.warning("fallback sector universe timed out with partial results")
 
     logger.info("fallback sector universe: %s boards, %s codes", len(sectors), len(codes))
     return {"codes": codes, "sectors": sectors, "code_tags": code_tags}

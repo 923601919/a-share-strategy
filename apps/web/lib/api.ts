@@ -213,9 +213,19 @@ export type WatchlistStats = {
   by_score_bucket: Record<string, { count: number; win_rate: number; avg_return: number }>;
 };
 
+export type WatchlistExpired = {
+  code: string;
+  name?: string;
+  reason?: string;
+  t3_return_pct?: number | null;
+  exit_return_pct?: number | null;
+  completed_at?: string;
+};
+
 export type WatchlistResponse = {
   items: WatchItem[];
   stats: WatchlistStats;
+  expired?: WatchlistExpired[];
 };
 
 export function getWatchlist(opts?: {

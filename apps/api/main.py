@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from config import settings
-from db import add_watch, init_db, list_watchlist, list_watch_tracks, remove_watch
+from db import add_watch, get_track_returns, init_db, list_watchlist, list_watch_tracks, remove_watch
 from ssl_fix import apply_ssl_fix
 
 # 必须在首次请求东财前生效
@@ -30,7 +30,12 @@ from services.sim import (
     sell_position,
     sim_overview,
 )
-from services.track import enrich_watch_item, refresh_track_returns, watchlist_stats
+from services.track import (
+    enrich_watch_item,
+    expire_past_t3_watchlist,
+    refresh_track_returns,
+    watchlist_stats,
+)
 
 app = FastAPI(title="A-Share Strategy API", version="0.2.0")
 app.add_middleware(
@@ -179,7 +184,11 @@ def get_watchlist(
     refresh_returns: bool = Query(default=False),
     with_risk: bool = Query(default=False, description="是否拉日线算异动（较慢）"),
 ):
-    """默认快速返回库内自选；行情/收益刷新按需开启。"""
+    """默认快速返回库内自选；行情/收益刷新按需开启。超过 T+3 的条目会自动归档并移出。"""
+    expired = expire_past_t3_watchlist(
+        fetch_quotes=with_quotes or refresh_returns,
+        force_refresh=refresh_returns,
+    )
     items = list_watchlist()
     quotes: dict[str, dict] = {}
     if with_quotes and items:
@@ -235,7 +244,7 @@ def get_watchlist(
                         },
                     }
                 )
-    return {"items": out, "stats": watchlist_stats()}
+    return {"items": out, "stats": watchlist_stats(), "expired": expired}
 
 
 @app.get("/api/watchlist/stats")
@@ -248,7 +257,9 @@ def get_watchlist_history(limit: int = Query(default=100, le=500)):
     tracks = list_watch_tracks(active_only=False, limit=limit)
     rows = []
     for tr in tracks:
-        rets = refresh_track_returns(tr, persist=True)
+        rets = get_track_returns(int(tr["id"]))
+        if not rets:
+            rets = refresh_track_returns(tr, persist=True, force=False)
         ret_map = {r["day_offset"]: r for r in rets}
         rows.append(
             {

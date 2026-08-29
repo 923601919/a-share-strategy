@@ -21,13 +21,20 @@ export default function WatchPage() {
   const [refreshingQuotes, setRefreshingQuotes] = useState(false);
   const [refreshingReturns, setRefreshingReturns] = useState(false);
   const [error, setError] = useState("");
+  const [expiredNotice, setExpiredNotice] = useState("");
 
   async function loadLight() {
     setLoading(true);
     setError("");
+    setExpiredNotice("");
     try {
-      // 只读库：自选 + 已缓存 T+N，不打行情网
-      setData(await getWatchlist());
+      // 只读库：自选 + 已缓存 T+N，不打行情网；超过 T+3 会自动归档移除
+      const res = await getWatchlist();
+      setData(res);
+      if (res.expired?.length) {
+        const names = res.expired.map((e) => `${e.code}${e.name ? ` ${e.name}` : ""}`).join("、");
+        setExpiredNotice(`已自动归档并移出 ${res.expired.length} 只（超过 T+3）：${names}`);
+      }
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -38,9 +45,14 @@ export default function WatchPage() {
   async function refreshQuotes() {
     setRefreshingQuotes(true);
     setError("");
+    setExpiredNotice("");
     try {
-      // 仅批量实时报价，不拉日线异动
-      setData(await getWatchlist({ with_quotes: true }));
+      const res = await getWatchlist({ with_quotes: true });
+      setData(res);
+      if (res.expired?.length) {
+        const names = res.expired.map((e) => `${e.code}${e.name ? ` ${e.name}` : ""}`).join("、");
+        setExpiredNotice(`已自动归档并移出 ${res.expired.length} 只（超过 T+3）：${names}`);
+      }
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -51,14 +63,18 @@ export default function WatchPage() {
   async function refreshReturns() {
     setRefreshingReturns(true);
     setError("");
+    setExpiredNotice("");
     try {
-      setData(
-        await getWatchlist({
-          with_quotes: true,
-          refresh_returns: true,
-          with_risk: true,
-        })
-      );
+      const res = await getWatchlist({
+        with_quotes: true,
+        refresh_returns: true,
+        with_risk: true,
+      });
+      setData(res);
+      if (res.expired?.length) {
+        const names = res.expired.map((e) => `${e.code}${e.name ? ` ${e.name}` : ""}`).join("、");
+        setExpiredNotice(`已自动归档并移出 ${res.expired.length} 只（超过 T+3）：${names}`);
+      }
     } catch (e: any) {
       setError(e?.message || String(e));
     } finally {
@@ -86,7 +102,7 @@ export default function WatchPage() {
           <div>
             <h1 style={{ margin: "0 0 6px", fontSize: 20 }}>自选跟踪</h1>
             <p className="muted" style={{ margin: 0 }}>
-              进入页面只读本地记录，不自动拉行情。共 {items.length} 只
+              进入页面只读本地记录，不自动拉行情。超过 T+3 会自动归档并移出自选。共 {items.length} 只
               {refreshingQuotes ? " · 刷新现价中…" : ""}
               {refreshingReturns ? " · 刷新收益中…" : ""}
             </p>
@@ -101,6 +117,7 @@ export default function WatchPage() {
           </div>
         </div>
         {error ? <p className="err">{error}</p> : null}
+        {expiredNotice ? <p className="muted">{expiredNotice}</p> : null}
         {loading && items.length === 0 ? <p className="muted">加载自选中…</p> : null}
       </section>
 

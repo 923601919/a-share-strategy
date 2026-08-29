@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import pandas as pd
@@ -9,7 +9,9 @@ from config import settings
 from db import (
     create_watch_track,
     get_track_returns,
+    list_watchlist,
     list_watch_tracks,
+    remove_watch,
     upsert_track_returns,
 )
 from providers import akshare_client as mkt
@@ -22,6 +24,33 @@ def _parse_entry_date(created_at: str) -> str:
         return dt.date().isoformat()
     except Exception:
         return datetime.now().date().isoformat()
+
+
+def _today_iso() -> str:
+    return datetime.now().date().isoformat()
+
+
+def is_past_t3(returns: list[dict[str, Any]], *, today: str | None = None) -> bool:
+    """当前日历日是否已超过 T+3 交易日（T+3 收盘日之后）。"""
+    today = (today or _today_iso())[:10]
+    t3 = next((r for r in returns if int(r.get("day_offset", -1)) == 3), None)
+    if not t3:
+        return False
+    trade_date = str(t3.get("trade_date") or "")[:10]
+    return bool(trade_date) and today > trade_date
+
+
+def _needs_t3_refresh(entry_date: str, returns: list[dict[str, Any]], *, today: str | None = None) -> bool:
+    """入池已久但尚无 T+3 落库时，尝试拉日线补全。"""
+    if is_past_t3(returns, today=today):
+        return False
+    if any(int(r.get("day_offset", -1)) == 3 for r in returns):
+        return False
+    try:
+        elapsed = (datetime.fromisoformat(today or _today_iso()).date() - datetime.fromisoformat(entry_date).date()).days
+    except Exception:
+        elapsed = 0
+    return elapsed >= 4
 
 
 def _daily_bars(code: str, limit: int = 40) -> pd.DataFrame:
@@ -85,6 +114,153 @@ def compute_short_term_returns(
             }
         )
     return rows
+
+
+def _build_completion_snapshot(
+    item: dict[str, Any],
+    returns: list[dict[str, Any]],
+    *,
+    quote: dict[str, Any] | None = None,
+    reason: str = "auto_t3",
+) -> dict[str, Any]:
+    ret_map = {int(r["day_offset"]): r for r in returns}
+    entry_price = float(item.get("entry_price") or 0)
+    exit_price = None
+    if quote and float(quote.get("price") or 0) > 0:
+        exit_price = float(quote["price"])
+    elif returns:
+        exit_price = float(returns[-1].get("close_price") or 0) or None
+    exit_return_pct = None
+    if exit_price and entry_price > 0:
+        exit_return_pct = round((exit_price / entry_price - 1.0) * 100, 2)
+    return {
+        "reason": reason,
+        "completed_at": datetime.now(timezone.utc).astimezone().isoformat(),
+        "code": item.get("code"),
+        "name": item.get("name"),
+        "source": item.get("source"),
+        "note": item.get("note"),
+        "entry_price": entry_price,
+        "entry_pct": item.get("entry_pct"),
+        "entry_score": item.get("entry_score"),
+        "entry_date": _parse_entry_date(str(item.get("created_at") or "")),
+        "created_at": item.get("created_at"),
+        "returns": returns,
+        "t0": ret_map.get(0),
+        "t1": ret_map.get(1),
+        "t2": ret_map.get(2),
+        "t3": ret_map.get(3),
+        "t3_return_pct": ret_map.get(3, {}).get("return_pct"),
+        "exit_price": exit_price,
+        "exit_return_pct": exit_return_pct,
+        "quote": quote or {},
+    }
+
+
+def finalize_and_remove_watch(
+    item: dict[str, Any],
+    *,
+    reason: str = "auto_t3",
+    quote: dict[str, Any] | None = None,
+    force_refresh: bool = True,
+) -> dict[str, Any] | None:
+    """归档 T+0~T+3 与退出快照后，从自选移除。"""
+    track_id = int(item.get("track_id") or 0)
+    code = str(item.get("code") or "").zfill(6)
+    if not track_id or not code:
+        return None
+
+    track = {
+        "id": track_id,
+        "code": code,
+        "entry_price": item.get("entry_price"),
+        "created_at": item.get("created_at"),
+    }
+    returns: list[dict[str, Any]] = []
+    try:
+        returns = refresh_track_returns(track, persist=True, force=force_refresh)
+    except Exception:
+        returns = get_track_returns(track_id)
+    if not returns:
+        returns = get_track_returns(track_id)
+
+    snapshot = _build_completion_snapshot(item, returns, quote=quote, reason=reason)
+    ok = remove_watch(
+        code,
+        reason=reason,
+        exit_price=snapshot.get("exit_price"),
+        exit_return_pct=snapshot.get("exit_return_pct"),
+        snapshot=snapshot,
+    )
+    if not ok:
+        return None
+    return {
+        "code": code,
+        "name": item.get("name"),
+        "reason": reason,
+        "t3_return_pct": snapshot.get("t3_return_pct"),
+        "exit_return_pct": snapshot.get("exit_return_pct"),
+        "completed_at": snapshot.get("completed_at"),
+    }
+
+
+def expire_past_t3_watchlist(
+    *,
+    fetch_quotes: bool = False,
+    force_refresh: bool = False,
+) -> list[dict[str, Any]]:
+    """超过 T+3 的自选：补全收益、写入归档快照并移出列表。"""
+    items = list_watchlist()
+    if not items:
+        return []
+
+    quotes: dict[str, dict[str, Any]] = {}
+    if fetch_quotes:
+        try:
+            from services.scan import watchlist_quotes
+
+            for q in watchlist_quotes([i["code"] for i in items], include_risk=True):
+                quotes[str(q["code"]).zfill(6)] = q
+        except Exception:
+            quotes = {}
+
+    today = _today_iso()
+    expired: list[dict[str, Any]] = []
+    for item in items:
+        track_id = int(item.get("track_id") or 0)
+        if not track_id:
+            continue
+        entry_date = _parse_entry_date(str(item.get("created_at") or ""))
+        returns = get_track_returns(track_id)
+
+        if _needs_t3_refresh(entry_date, returns, today=today) or force_refresh:
+            track = {
+                "id": track_id,
+                "code": item["code"],
+                "entry_price": item.get("entry_price"),
+                "created_at": item.get("created_at"),
+            }
+            try:
+                refreshed = refresh_track_returns(track, persist=True, force=True)
+                if refreshed:
+                    returns = refreshed
+            except Exception:
+                pass
+
+        if not is_past_t3(returns, today=today):
+            continue
+
+        code = str(item["code"]).zfill(6)
+        quote = quotes.get(code)
+        row = finalize_and_remove_watch(
+            item,
+            reason="auto_t3",
+            quote=quote,
+            force_refresh=True,
+        )
+        if row:
+            expired.append(row)
+    return expired
 
 
 def refresh_track_returns(

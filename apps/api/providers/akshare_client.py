@@ -14,8 +14,10 @@ apply_ssl_fix(insecure=not settings.ssl_verify)
 
 _LAST_SPOT_SOURCE = "none"
 _T = TypeVar("_T")
-# 单线程超时池：避免 akshare 无超时请求把扫描永久卡住
-_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="ak-timeout")
+# 超时池：扫描时现价/板块/成分并发，4 容易排队假超时导致成分池为空
+_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="ak-timeout")
+# 板块成分专用池，避免和 spot/日线互相挤占
+_SECTOR_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ak-sector")
 
 
 def last_spot_source() -> str:
@@ -25,6 +27,14 @@ def last_spot_source() -> str:
 def call_with_timeout(fn: Callable[..., _T], timeout: float, *args: Any, **kwargs: Any) -> _T:
     """在独立线程执行并超时；超时后抛 TimeoutError（线程仍可能在后台空转）。"""
     fut = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=timeout)
+    except FuturesTimeout as e:
+        raise TimeoutError(f"{getattr(fn, '__name__', 'call')} timed out after {timeout}s") from e
+
+
+def _call_sector_timeout(fn: Callable[..., _T], timeout: float, *args: Any, **kwargs: Any) -> _T:
+    fut = _SECTOR_POOL.submit(fn, *args, **kwargs)
     try:
         return fut.result(timeout=timeout)
     except FuturesTimeout as e:
@@ -445,6 +455,45 @@ def fetch_concept_boards_top(n: int = 20) -> list[dict[str, Any]]:
     return uniq
 
 
+def _pick_sector_spot_columns(df: pd.DataFrame) -> tuple[Any, Any, Any]:
+    """新浪板块表：优先按列名，避免把涨跌额当成涨跌幅。"""
+    cols = list(df.columns)
+    colmap = {str(c): c for c in cols}
+    label_c = colmap.get("label") or cols[0]
+    name_c = next((colmap[k] for k in colmap if "板块" in k or k in ("name", "板块")), None)
+    if name_c is None:
+        name_c = cols[1] if len(cols) > 1 else cols[0]
+    # 涨跌幅通常在涨跌额之后；优先列名，其次第 6 列（index 5）
+    pct_c = next((colmap[k] for k in colmap if "涨跌幅" in k or "changepercent" in k.lower()), None)
+    if pct_c is None:
+        pct_c = cols[5] if len(cols) > 5 else (cols[4] if len(cols) > 4 else cols[-1])
+    return label_c, name_c, pct_c
+
+
+def _member_codes_from_df(df: pd.DataFrame | None) -> set[str]:
+    if df is None or df.empty:
+        return set()
+    for col in ("code", "代码", "股票代码", "证券代码", "symbol"):
+        if col not in df.columns:
+            continue
+        vals = df[col].tolist()
+        if col == "symbol":
+            return {_normalize_code(x) for x in vals if x is not None}
+        return {_normalize_code(x) for x in vals if x is not None}
+    return set()
+
+
+def _fetch_sina_sector_members(label: str) -> set[str]:
+    import akshare as ak
+
+    try:
+        # 已在 _SECTOR_POOL worker 内时直接调用，避免嵌套提交死锁
+        members = ak.stock_sector_detail(sector=label)
+    except Exception:
+        return set()
+    return _member_codes_from_df(members)
+
+
 def fetch_hot_sector_universe(
     *,
     industry_top: int = 5,
@@ -452,34 +501,34 @@ def fetch_hot_sector_universe(
     sector_min_pct: float | None = None,
 ) -> dict[str, Any]:
     """
-    强势板块成分股候选池（新浪行业/概念）。
+    强势板块成分股候选池（新浪行业/概念，失败则东财成分兜底）。
     返回 codes、板块列表、code->板块名 标签。
     """
     import akshare as ak
+    from concurrent.futures import as_completed
 
     codes: set[str] = set()
     sectors: list[dict[str, Any]] = []
     code_tags: dict[str, list[str]] = {}
     min_pct = settings.sector_min_pct if sector_min_pct is None else sector_min_pct
+    jobs: list[tuple[str, str, float, str]] = []  # label, name, pct, type
 
     for indicator, limit in (("行业", industry_top), ("概念", concept_top)):
         if limit <= 0:
             continue
         try:
-            df = call_with_timeout(ak.stock_sector_spot, 12, indicator=indicator)
+            df = _call_sector_timeout(ak.stock_sector_spot, 15, indicator=indicator)
         except Exception:
             continue
         if df is None or df.empty:
             continue
 
-        colmap = {str(c): c for c in df.columns}
-        name_c = next((colmap[k] for k in colmap if "板块" in k), df.columns[1])
-        pct_c = next((colmap[k] for k in colmap if "涨跌幅" in k), df.columns[4])
-        label_c = "label" if "label" in df.columns else df.columns[0]
-
+        label_c, name_c, pct_c = _pick_sector_spot_columns(df)
         work = df.copy()
         work["_pct"] = pd.to_numeric(work[pct_c], errors="coerce").fillna(0)
-        if work["_pct"].abs().max() < 1:
+        # 仅当整列都像小数涨跌幅（如 0.02）时放大；涨跌额也可能 <1，不能误乘
+        pct_abs_max = float(work["_pct"].abs().max() or 0)
+        if 0 < pct_abs_max <= 0.3:
             work["_pct"] *= 100
         work = work[work["_pct"] >= min_pct]
         work = work.sort_values("_pct", ascending=False).head(limit)
@@ -489,49 +538,81 @@ def fetch_hot_sector_universe(
             name = str(row.get(name_c, "")).strip()
             if not label or not name:
                 continue
-            try:
-                members = call_with_timeout(ak.stock_sector_detail, 10, sector=label)
-            except Exception:
-                continue
-            if members is None or members.empty or "code" not in members.columns:
-                continue
-            member_codes = {_normalize_code(x) for x in members["code"].tolist()}
-            codes |= member_codes
-            for c in member_codes:
-                code_tags.setdefault(c, [])
-                if name not in code_tags[c]:
-                    code_tags[c].append(name)
-            sectors.append(
-                {
-                    "name": name,
-                    "pct": round(float(row["_pct"]), 2),
-                    "type": indicator,
-                    "members": len(member_codes),
-                }
-            )
+            jobs.append((label, name, float(row["_pct"]), indicator))
 
+    def _one(job: tuple[str, str, float, str]) -> tuple[str, str, float, str, set[str]]:
+        label, name, pct, indicator = job
+        member_codes = _fetch_sina_sector_members(label)
+        if not member_codes:
+            member_codes = _fetch_em_members_direct(name)
+        return label, name, pct, indicator, member_codes
+
+    if jobs:
+        futs = {_SECTOR_POOL.submit(_one, j): j for j in jobs}
+        try:
+            for fut in as_completed(futs, timeout=45):
+                try:
+                    _label, name, pct, indicator, member_codes = fut.result()
+                except Exception:
+                    continue
+                if not member_codes:
+                    continue
+                codes |= member_codes
+                for c in member_codes:
+                    code_tags.setdefault(c, [])
+                    if name not in code_tags[c]:
+                        code_tags[c].append(name)
+                sectors.append(
+                    {
+                        "name": name,
+                        "pct": round(pct, 2),
+                        "type": indicator,
+                        "members": len(member_codes),
+                    }
+                )
+        except TimeoutError:
+            pass
+
+    sectors.sort(key=lambda x: x.get("pct") or 0, reverse=True)
     return {"codes": codes, "sectors": sectors, "code_tags": code_tags}
 
 
-def fetch_concept_members(board_name: str) -> set[str]:
-    """成分股。东财 push2 失败时返回空集。"""
+def _fetch_em_members_direct(board_name: str) -> set[str]:
+    """在已占用的 worker 内直接拉东财成分（不再进线程池）。"""
     import akshare as ak
 
-    for fetcher_name in ("stock_board_industry_cons_em", "stock_board_concept_cons_em"):
-        fetcher = getattr(ak, fetcher_name, None)
-        if fetcher is None:
+    name = (board_name or "").strip()
+    if not name:
+        return set()
+    candidates = [name]
+    for suffix in ("板块", "概念", "行业"):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            candidates.append(name[: -len(suffix)])
+    seen: set[str] = set()
+    for symbol in candidates:
+        if not symbol or symbol in seen:
             continue
-        try:
-            df = fetcher(symbol=board_name)
-        except Exception:
-            continue
-        if df is None or df.empty:
-            continue
-        col = "代码" if "代码" in df.columns else None
-        if not col:
-            continue
-        return {_normalize_code(x) for x in df[col].tolist()}
+        seen.add(symbol)
+        for fetcher_name in ("stock_board_industry_cons_em", "stock_board_concept_cons_em"):
+            fetcher = getattr(ak, fetcher_name, None)
+            if fetcher is None:
+                continue
+            try:
+                df = fetcher(symbol=symbol)
+            except Exception:
+                continue
+            codes = _member_codes_from_df(df)
+            if codes:
+                return codes
     return set()
+
+
+def fetch_concept_members(board_name: str) -> set[str]:
+    """成分股。东财行业/概念；失败返回空集。带超时，可被外部线程调用。"""
+    try:
+        return _call_sector_timeout(_fetch_em_members_direct, 15, board_name)
+    except Exception:
+        return set()
 
 
 def demo_spot() -> pd.DataFrame:

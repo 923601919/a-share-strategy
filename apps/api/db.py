@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -149,8 +150,21 @@ def init_db() -> None:
             """
         )
         _migrate_watchlist(conn)
+        _migrate_watch_tracks(conn)
         _migrate_sim_positions(conn)
         _ensure_sim_account(conn)
+
+
+def _migrate_watch_tracks(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(watch_tracks)").fetchall()}
+    for col, typ in [
+        ("exit_price", "REAL"),
+        ("exit_return_pct", "REAL"),
+        ("completion_reason", "TEXT"),
+        ("completion_snapshot", "TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE watch_tracks ADD COLUMN {col} {typ}")
 
 
 def _migrate_sim_positions(conn: sqlite3.Connection) -> None:
@@ -258,15 +272,49 @@ def add_watch(
     }
 
 
-def remove_watch(code: str) -> bool:
-    code = code.strip().zfill(6)
+def complete_watch_track(
+    track_id: int,
+    *,
+    reason: str,
+    exit_price: float | None = None,
+    exit_return_pct: float | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> None:
     now = datetime.now(timezone.utc).astimezone().isoformat()
+    snap_json = json.dumps(snapshot, ensure_ascii=False) if snapshot else None
+    with get_db() as conn:
+        conn.execute(
+            """
+            UPDATE watch_tracks SET
+                removed_at=?,
+                exit_price=?,
+                exit_return_pct=?,
+                completion_reason=?,
+                completion_snapshot=?
+            WHERE id=?
+            """,
+            (now, exit_price, exit_return_pct, reason, snap_json, track_id),
+        )
+
+
+def remove_watch(
+    code: str,
+    *,
+    reason: str = "manual",
+    exit_price: float | None = None,
+    exit_return_pct: float | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> bool:
+    code = code.strip().zfill(6)
     with get_db() as conn:
         row = conn.execute("SELECT track_id FROM watchlist WHERE code=?", (code,)).fetchone()
         if row and row["track_id"]:
-            conn.execute(
-                "UPDATE watch_tracks SET removed_at=? WHERE id=?",
-                (now, row["track_id"]),
+            complete_watch_track(
+                int(row["track_id"]),
+                reason=reason,
+                exit_price=exit_price,
+                exit_return_pct=exit_return_pct,
+                snapshot=snapshot,
             )
         cur = conn.execute("DELETE FROM watchlist WHERE code=?", (code,))
         return cur.rowcount > 0
