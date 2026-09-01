@@ -14,10 +14,10 @@ apply_ssl_fix(insecure=not settings.ssl_verify)
 
 _LAST_SPOT_SOURCE = "none"
 _T = TypeVar("_T")
-# 超时池：扫描时现价/板块/成分并发，4 容易排队假超时导致成分池为空
-_TIMEOUT_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="ak-timeout")
-# 板块成分专用池，避免和 spot/日线互相挤占
+# 板块成分并行专用池（任务内同步完成，不用于可超时丢弃的请求）
 _SECTOR_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ak-sector")
+_abandoned = 0
+_abandoned_lock = __import__("threading").Lock()
 
 
 def last_spot_source() -> str:
@@ -25,15 +25,45 @@ def last_spot_source() -> str:
 
 
 def call_with_timeout(fn: Callable[..., _T], timeout: float, *args: Any, **kwargs: Any) -> _T:
-    """在独立线程执行并超时；超时后抛 TimeoutError（线程仍可能在后台空转）。"""
-    fut = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
-    try:
-        return fut.result(timeout=timeout)
-    except FuturesTimeout as e:
-        raise TimeoutError(f"{getattr(fn, '__name__', 'call')} timed out after {timeout}s") from e
+    """
+    在一次性守护线程中执行并超时。
+    不用共享线程池，避免超时任务占满 worker 导致后续假超时。
+    超时后线程可能仍在跑，但不会堵住新请求。
+    """
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def _runner() -> None:
+        try:
+            box["value"] = fn(*args, **kwargs)
+        except Exception as e:
+            box["error"] = e
+
+    t = threading.Thread(target=_runner, name=f"ak-to-{getattr(fn, '__name__', 'call')}", daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        global _abandoned
+        with _abandoned_lock:
+            _abandoned += 1
+            n = _abandoned
+        if n % 10 == 1:
+            import logging
+
+            logging.getLogger("akshare_client").warning(
+                "timed-out background calls so far: %s (last=%s)",
+                n,
+                getattr(fn, "__name__", "call"),
+            )
+        raise TimeoutError(f"{getattr(fn, '__name__', 'call')} timed out after {timeout}s")
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
 
 
 def _call_sector_timeout(fn: Callable[..., _T], timeout: float, *args: Any, **kwargs: Any) -> _T:
+    """板块列表等短调用：仍走专用池，但超时不占用共享通用池。"""
     fut = _SECTOR_POOL.submit(fn, *args, **kwargs)
     try:
         return fut.result(timeout=timeout)

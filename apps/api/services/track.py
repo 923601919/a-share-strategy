@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -15,6 +15,13 @@ from db import (
     upsert_track_returns,
 )
 from providers import akshare_client as mkt
+
+ProgressCb = Callable[[str, float, str], None]
+CancelCb = Callable[[], bool]
+
+
+class WatchRefreshCancelled(Exception):
+    """自选刷新被用户取消。"""
 
 
 def _parse_entry_date(created_at: str) -> str:
@@ -209,7 +216,10 @@ def expire_past_t3_watchlist(
     fetch_quotes: bool = False,
     force_refresh: bool = False,
 ) -> list[dict[str, Any]]:
-    """超过 T+3 的自选：补全收益、写入归档快照并移出列表。"""
+    """
+    超过 T+3 的自选：归档并移出。
+    默认只读本地已落库收益（进页不打行情）；force_refresh=True 时才补全日线。
+    """
     items = list_watchlist()
     if not items:
         return []
@@ -230,10 +240,10 @@ def expire_past_t3_watchlist(
         track_id = int(item.get("track_id") or 0)
         if not track_id:
             continue
-        entry_date = _parse_entry_date(str(item.get("created_at") or ""))
         returns = get_track_returns(track_id)
 
-        if _needs_t3_refresh(entry_date, returns, today=today) or force_refresh:
+        # 仅在用户点「刷新收益」时才打日线；进页轻量加载绝不联网
+        if force_refresh:
             track = {
                 "id": track_id,
                 "code": item["code"],
@@ -256,7 +266,7 @@ def expire_past_t3_watchlist(
             item,
             reason="auto_t3",
             quote=quote,
-            force_refresh=True,
+            force_refresh=force_refresh,
         )
         if row:
             expired.append(row)
@@ -452,3 +462,92 @@ def watchlist_stats(*, min_score: float | None = None) -> dict[str, Any]:
         "by_source": {k: _agg(v) for k, v in by_source.items()},
         "by_score_bucket": {k: _agg(v) for k, v in by_bucket.items()},
     }
+
+
+def run_watchlist_refresh(
+    *,
+    with_quotes: bool = True,
+    with_risk: bool = True,
+    on_progress: ProgressCb | None = None,
+    should_cancel: CancelCb | None = None,
+) -> dict[str, Any]:
+    """
+    刷新自选收益/现价/异动（可取消、带进度）。
+    每只票只拉一次日线；最后用本地收益做 T+3 归档。
+    """
+
+    def prog(stage: str, progress: float, message: str) -> None:
+        if should_cancel and should_cancel():
+            raise WatchRefreshCancelled()
+        if on_progress:
+            on_progress(stage, progress, message)
+
+    prog("start", 0.02, "读取自选")
+    items = list_watchlist()
+    total = len(items)
+    if total == 0:
+        prog("done", 1.0, "无自选")
+        return {"items": [], "stats": watchlist_stats(), "expired": []}
+
+    # 1) 逐只刷新 T+0..T+3（进度主体）
+    for i, it in enumerate(items):
+        code = str(it.get("code") or "").zfill(6)
+        prog("returns", 0.05 + 0.55 * (i / total), f"刷新收益 {i + 1}/{total} · {code}")
+        track_id = it.get("track_id")
+        if not track_id:
+            continue
+        track = {
+            "id": track_id,
+            "code": code,
+            "entry_price": it.get("entry_price"),
+            "created_at": it.get("created_at"),
+        }
+        try:
+            refresh_track_returns(track, persist=True, force=True)
+        except Exception:
+            pass
+
+    # 2) 用已落库收益归档超过 T+3（不再重复打日线）
+    prog("expire", 0.65, "归档超过 T+3 的自选")
+    expired = expire_past_t3_watchlist(fetch_quotes=False, force_refresh=False)
+    items = list_watchlist()
+
+    # 3) 现价 + 异动
+    quotes: dict[str, dict] = {}
+    if with_quotes and items:
+        prog("quotes", 0.75, f"拉取现价{'/异动' if with_risk else ''}（{len(items)} 只）")
+        try:
+            from services.scan import watchlist_quotes
+
+            quotes = {
+                q["code"]: q
+                for q in watchlist_quotes([i["code"] for i in items], include_risk=with_risk)
+            }
+        except Exception:
+            quotes = {}
+
+    # 4) 组装结果（读库，不再联网）
+    prog("assemble", 0.92, "汇总结果")
+    out = []
+    for it in items:
+        if should_cancel and should_cancel():
+            raise WatchRefreshCancelled()
+        q = quotes.get(str(it["code"]).zfill(6), {}) or quotes.get(it["code"], {})
+        try:
+            out.append(enrich_watch_item(it, q, force_refresh=False))
+        except Exception:
+            out.append(
+                {
+                    **it,
+                    "quote": q,
+                    "returns": [],
+                    "track": {
+                        "entry_price": it.get("entry_price"),
+                        "entry_pct": it.get("entry_pct"),
+                        "entry_score": it.get("entry_score"),
+                    },
+                }
+            )
+
+    prog("done", 1.0, f"完成 · 自选 {len(out)} 只" + (f" · 归档 {len(expired)}" if expired else ""))
+    return {"items": out, "stats": watchlist_stats(), "expired": expired}

@@ -121,6 +121,19 @@ button.secondary {
   border: 1px solid var(--line);
 }
 
+button.ghost {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--muted);
+  padding: 4px 8px;
+  font-size: 13px;
+}
+
+button.ghost:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;

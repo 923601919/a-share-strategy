@@ -7,20 +7,17 @@ from typing import Any
 from config import settings
 from db import (
     cancel_sim_orders_by_types,
-    cancel_sim_orders_for_position,
     get_open_sim_position_by_code,
     get_sim_account,
     get_sim_position,
     get_watch_source,
     insert_sim_order,
-    insert_sim_position,
-    insert_sim_trade,
     list_sim_orders,
     list_sim_positions,
     list_sim_trades,
-    mark_sim_order_filled,
+    open_sim_position_tx,
     reset_sim_account,
-    set_sim_cash,
+    sell_sim_position_tx,
     update_sim_position,
 )
 from providers import akshare_client as mkt
@@ -28,6 +25,46 @@ from providers import akshare_client as mkt
 
 def _now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat()
+
+
+def _parse_local_date(iso_or_date: str | None):
+    """ISO / YYYY-MM-DD -> date（本地日历日）。"""
+    from datetime import date as date_cls
+
+    if not iso_or_date:
+        return None
+    s = str(iso_or_date).strip()
+    try:
+        if "T" in s or s.endswith("Z"):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.astimezone().date() if dt.tzinfo else dt.date()
+        return date_cls.fromisoformat(s[:10])
+    except Exception:
+        try:
+            return date_cls.fromisoformat(s[:10])
+        except Exception:
+            return None
+
+
+def is_t1_sellable(*, opened_at: str | None, as_of: str | None = None) -> bool:
+    """
+    A股 T+1：买入当日不可卖出。
+    以本地日历日比较（研究工具近似；未接交易日历）。
+    """
+    open_d = _parse_local_date(opened_at)
+    asof_d = _parse_local_date(as_of) if as_of else datetime.now().astimezone().date()
+    if open_d is None or asof_d is None:
+        return False
+    return asof_d > open_d
+
+
+def t1_block_reason(*, opened_at: str | None, as_of: str | None = None) -> str | None:
+    if is_t1_sellable(opened_at=opened_at, as_of=as_of):
+        return None
+    open_d = _parse_local_date(opened_at)
+    if open_d is None:
+        return "无法判定开仓日，禁止卖出（T+1）"
+    return f"T+1限制：{open_d.isoformat()} 开仓，次日方可卖出"
 
 
 def _fee(amount: float) -> float:
@@ -134,8 +171,9 @@ def design_position_size(
     }
 
 
-def _create_tp_sl_orders(pos: dict[str, Any]) -> list[dict[str, Any]]:
-    orders = []
+def _tp_sl_order_payloads(pos: dict[str, Any]) -> list[dict[str, Any]]:
+    """构建止盈/止损单 payload（不落库）。"""
+    orders: list[dict[str, Any]] = []
     tp = float(pos.get("take_profit_price") or 0)
     sl = float(pos.get("stop_loss_price") or 0)
     tp_pct = pos.get("take_profit_pct")
@@ -144,35 +182,33 @@ def _create_tp_sl_orders(pos: dict[str, Any]) -> list[dict[str, Any]]:
     src_label = {"fenshi": "进攻分时", "longtou": "龙头低吸"}.get(src, "默认")
     if tp > 0:
         orders.append(
-            insert_sim_order(
-                {
-                    "position_id": pos["id"],
-                    "code": pos["code"],
-                    "name": pos["name"],
-                    "side": "sell",
-                    "order_type": "take_profit",
-                    "trigger_price": tp,
-                    "trigger_pct": tp_pct,
-                    "reason": f"止盈({src_label})：相对成本涨幅达 {tp_pct}%",
-                }
-            )
+            {
+                "code": pos["code"],
+                "name": pos["name"],
+                "side": "sell",
+                "order_type": "take_profit",
+                "trigger_price": tp,
+                "trigger_pct": tp_pct,
+                "reason": f"止盈({src_label})：相对成本涨幅达 {tp_pct}%",
+            }
         )
     if sl > 0:
         orders.append(
-            insert_sim_order(
-                {
-                    "position_id": pos["id"],
-                    "code": pos["code"],
-                    "name": pos["name"],
-                    "side": "sell",
-                    "order_type": "stop_loss",
-                    "trigger_price": sl,
-                    "trigger_pct": sl_pct,
-                    "reason": f"止损：相对成本跌幅达 {sl_pct}%",
-                }
-            )
+            {
+                "code": pos["code"],
+                "name": pos["name"],
+                "side": "sell",
+                "order_type": "stop_loss",
+                "trigger_price": sl,
+                "trigger_pct": sl_pct,
+                "reason": f"止损：相对成本跌幅达 {sl_pct}%",
+            }
         )
     return orders
+
+
+def _create_tp_sl_orders(pos: dict[str, Any]) -> list[dict[str, Any]]:
+    return [insert_sim_order({**o, "position_id": pos["id"]}) for o in _tp_sl_order_payloads(pos)]
 
 
 def open_position_from_watch(
@@ -221,7 +257,6 @@ def open_position_from_watch(
     total = amount + fee
     cash = float(acct["cash"])
     if total > cash:
-        # 再压一手
         shares = _lot_shares(cash - settings.sim_min_commission, price)
         if shares <= 0:
             return {
@@ -239,50 +274,49 @@ def open_position_from_watch(
         price, take_profit_pct, stop_loss_pct, source=source
     )
     now = _now()
-    pos = insert_sim_position(
-        {
-            "code": code,
-            "name": name,
-            "shares": shares,
-            "cost_price": price,
-            "opened_at": now,
-            "take_profit_pct": tp_pct,
-            "stop_loss_pct": sl_pct,
-            "take_profit_price": tp_price,
-            "stop_loss_price": sl_price,
-            "entry_score": entry_score,
-            "note": note,
-            "source": source,
-        }
+    pos_payload = {
+        "code": code,
+        "name": name,
+        "shares": shares,
+        "cost_price": price,
+        "opened_at": now,
+        "take_profit_pct": tp_pct,
+        "stop_loss_pct": sl_pct,
+        "take_profit_price": tp_price,
+        "stop_loss_price": sl_price,
+        "entry_score": entry_score,
+        "note": note,
+        "source": source,
+    }
+    trade_payload = {
+        "code": code,
+        "name": name,
+        "side": "buy",
+        "shares": shares,
+        "price": price,
+        "amount": round(amount, 2),
+        "fee": round(fee, 2),
+        "pnl": None,
+        "pnl_pct": None,
+        "reason": "watch_auto_open",
+        "order_id": None,
+        "traded_at": now,
+        "meta": json.dumps({"sizing": sizing}, ensure_ascii=False),
+    }
+    tx = open_sim_position_tx(
+        position=pos_payload,
+        trade=trade_payload,
+        cash_after=cash - total,
+        orders=_tp_sl_order_payloads(pos_payload),
     )
-    set_sim_cash(cash - total)
-    trade = insert_sim_trade(
-        {
-            "code": code,
-            "name": name,
-            "side": "buy",
-            "shares": shares,
-            "price": price,
-            "amount": round(amount, 2),
-            "fee": round(fee, 2),
-            "pnl": None,
-            "pnl_pct": None,
-            "reason": "watch_auto_open",
-            "position_id": pos["id"],
-            "order_id": None,
-            "traded_at": now,
-            "meta": json.dumps({"sizing": sizing}, ensure_ascii=False),
-        }
-    )
-    orders = _create_tp_sl_orders(pos)
     return {
         "ok": True,
         "skipped": False,
-        "position": pos,
-        "orders": orders,
-        "trade": trade,
+        "position": tx["position"],
+        "orders": tx["orders"],
+        "trade": tx["trade"],
         "sizing": sizing,
-        "account": get_sim_account(),
+        "account": tx["account"],
     }
 
 
@@ -341,6 +375,10 @@ def sell_position(
     if price <= 0:
         return {"ok": False, "reason": "无效卖出价"}
 
+    blocked = t1_block_reason(opened_at=str(pos.get("opened_at") or ""))
+    if blocked:
+        return {"ok": False, "reason": blocked, "error_code": "t1_locked"}
+
     shares = int(pos["shares"])
     cost = float(pos["cost_price"])
     amount = shares * price
@@ -351,36 +389,33 @@ def sell_position(
     now = _now()
 
     acct = get_sim_account()
-    set_sim_cash(float(acct["cash"]) + amount - fee)
-    update_sim_position(position_id, status="closed", closed_at=now)
-    cancel_sim_orders_for_position(position_id)
-
-    if order_id:
-        mark_sim_order_filled(order_id, price)
-
-    trade = insert_sim_trade(
-        {
-            "code": pos["code"],
-            "name": pos["name"],
-            "side": "sell",
-            "shares": shares,
-            "price": price,
-            "amount": round(amount, 2),
-            "fee": round(fee, 2),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "reason": reason,
-            "position_id": position_id,
-            "order_id": order_id,
-            "traded_at": now,
-            "meta": json.dumps({"cost_price": cost}, ensure_ascii=False),
-        }
+    cash_after = float(acct["cash"]) + amount - fee
+    trade_payload = {
+        "code": pos["code"],
+        "name": pos["name"],
+        "side": "sell",
+        "shares": shares,
+        "price": price,
+        "amount": round(amount, 2),
+        "fee": round(fee, 2),
+        "pnl": round(pnl, 2),
+        "pnl_pct": round(pnl_pct, 2),
+        "reason": reason,
+        "traded_at": now,
+        "meta": json.dumps({"cost_price": cost}, ensure_ascii=False),
+    }
+    tx = sell_sim_position_tx(
+        position_id=position_id,
+        trade=trade_payload,
+        cash_after=cash_after,
+        order_id=order_id,
+        fill_price=price if order_id else None,
     )
     return {
         "ok": True,
-        "trade": trade,
-        "position": get_sim_position(position_id),
-        "account": get_sim_account(),
+        "trade": tx["trade"],
+        "position": tx["position"],
+        "account": tx["account"],
     }
 
 
@@ -437,6 +472,8 @@ def evaluate_orders(*, quotes: dict[str, dict] | None = None) -> dict[str, Any]:
             messages.append(
                 f"{code} {otype} @ {px:.2f} 盈亏 {trade.get('pnl')} ({trade.get('pnl_pct')}%)"
             )
+        elif res.get("error_code") == "t1_locked":
+            messages.append(f"{code} 触发{otype}但受T+1限制，未卖出")
 
     return {"checked": len(active), "filled": filled, "messages": messages}
 
@@ -491,6 +528,7 @@ def sim_overview() -> dict[str, Any]:
         unreal = (px / cost - 1) * 100 if cost > 0 else 0.0
         unreal_pnl = (px - cost) * shares
         market_value += mv
+        sellable = is_t1_sellable(opened_at=str(p.get("opened_at") or ""))
         pos_out.append(
             {
                 **p,
@@ -499,6 +537,10 @@ def sim_overview() -> dict[str, Any]:
                 "unrealized_pnl": round(unreal_pnl, 2),
                 "unrealized_pct": round(unreal, 2),
                 "quote_pct": q.get("pct"),
+                "t1_sellable": sellable,
+                "t1_lock_reason": None
+                if sellable
+                else t1_block_reason(opened_at=str(p.get("opened_at") or "")),
             }
         )
 

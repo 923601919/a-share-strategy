@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Literal
@@ -9,12 +10,21 @@ from typing import Any, Callable, Literal
 from config import settings
 from db import save_scan_snapshot
 from providers import market as mkt
-from rules.fenshi import in_attack_window, score_leader_dip, score_offensive_fenshi, session_allowed
+from rules.fenshi import (
+    apply_day_vol_and_false_push,
+    day_volume_health,
+    detect_false_push,
+    in_attack_window,
+    score_leader_dip,
+    score_offensive_fenshi,
+    session_allowed,
+)
 from rules.risk import anomaly_30d_pct, risk_flags
 
 
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
 ScanMode = Literal["fenshi", "leader_dip"]
+UniversePolicy = Literal["hot_only", "quota", "soft"]
 ProgressCb = Callable[[str, float, str], None]
 CancelCb = Callable[[], bool]
 
@@ -150,11 +160,134 @@ def _score_from_spot(row: dict[str, Any], *, mode: ScanMode = "fenshi") -> dict[
     }
 
 
+def _rows_from_filter(df, *, min_amount_yi, min_pct, max_pct, limit, universe_codes, max_pct_inclusive):
+    filtered = _filter_spot(
+        df,
+        min_amount_yi=min_amount_yi,
+        min_pct=min_pct,
+        max_pct=max_pct,
+        limit=limit,
+        universe_codes=universe_codes,
+        max_pct_inclusive=max_pct_inclusive,
+    )
+    return filtered.to_dict(orient="records")
+
+
+def _build_candidate_rows(
+    spot,
+    *,
+    universe_policy: UniversePolicy,
+    universe_codes: set[str],
+    min_amount_yi: float,
+    min_pct: float,
+    max_pct: float | None,
+    max_pct_inclusive: bool,
+) -> tuple[list[dict[str, Any]], str]:
+    """按策略组装待打分候选。返回 (rows, note)。"""
+    base_limit = min(settings.max_candidates_spot, 40)
+    if universe_policy == "hot_only":
+        rows = _rows_from_filter(
+            spot,
+            min_amount_yi=min_amount_yi,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            limit=base_limit,
+            universe_codes=universe_codes if universe_codes else None,
+            max_pct_inclusive=max_pct_inclusive,
+        )
+        return rows, f"候选=强势板块硬过滤({len(rows)})"
+
+    if universe_policy == "soft":
+        soft_limit = min(max(settings.max_candidates_spot, 60), 80)
+        rows = _rows_from_filter(
+            spot,
+            min_amount_yi=min_amount_yi,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            limit=soft_limit,
+            universe_codes=None,
+            max_pct_inclusive=max_pct_inclusive,
+        )
+        hot_n = sum(1 for r in rows if str(r.get("code") or "").zfill(6) in universe_codes)
+        return rows, f"候选=全市场软加权({len(rows)}，其中热门{hot_n})"
+
+    # quota：主池 + 卫星池
+    primary_limit = min(base_limit, 32)
+    sat_limit = max(8, int(round(base_limit * settings.universe_quota_satellite_pct)))
+    primary = _rows_from_filter(
+        spot,
+        min_amount_yi=min_amount_yi,
+        min_pct=min_pct,
+        max_pct=max_pct,
+        limit=primary_limit,
+        universe_codes=universe_codes if universe_codes else None,
+        max_pct_inclusive=max_pct_inclusive,
+    )
+    broad = _rows_from_filter(
+        spot,
+        min_amount_yi=min_amount_yi,
+        min_pct=min_pct,
+        max_pct=max_pct,
+        limit=min(settings.max_candidates_spot, 80),
+        universe_codes=None,
+        max_pct_inclusive=max_pct_inclusive,
+    )
+    primary_codes = {str(r.get("code") or "").zfill(6) for r in primary}
+    satellite = [
+        r
+        for r in broad
+        if str(r.get("code") or "").zfill(6) not in primary_codes
+        and str(r.get("code") or "").zfill(6) not in universe_codes
+    ][:sat_limit]
+    rows = primary + satellite
+    return rows, f"候选=配额主池{len(primary)}+卫星{len(satellite)}"
+
+
+def _apply_quota_top(
+    results: list[dict[str, Any]],
+    top_n: int,
+    *,
+    satellite_pct: float,
+) -> list[dict[str, Any]]:
+    """结果层强制为非热门留名额；不足则用总分回填。"""
+    if top_n <= 0 or not results:
+        return []
+    hot = sorted(
+        [x for x in results if x.get("in_hot_board")],
+        key=lambda x: (x.get("score") or 0, x.get("pct") or 0),
+        reverse=True,
+    )
+    cold = sorted(
+        [x for x in results if not x.get("in_hot_board")],
+        key=lambda x: (x.get("score") or 0, x.get("pct") or 0),
+        reverse=True,
+    )
+    n_sat = min(len(cold), max(1, math.ceil(top_n * satellite_pct - 1e-12))) if cold else 0
+    n_hot = top_n - n_sat
+    picked = hot[:n_hot] + cold[:n_sat]
+    if len(picked) < top_n:
+        seen = {str(x.get("code")) for x in picked}
+        rest = sorted(
+            results,
+            key=lambda x: (x.get("score") or 0, x.get("pct") or 0),
+            reverse=True,
+        )
+        for x in rest:
+            if len(picked) >= top_n:
+                break
+            c = str(x.get("code"))
+            if c not in seen:
+                picked.append(x)
+                seen.add(c)
+    return picked[:top_n]
+
+
 def _enrich_one(
     row: dict[str, Any],
     board_tags: dict[str, list[str]],
     *,
     mode: ScanMode = "fenshi",
+    universe_policy: UniversePolicy = "hot_only",
 ) -> dict[str, Any] | None:
     code = str(row["code"]).zfill(6)
     name = str(row["name"])
@@ -207,6 +340,24 @@ def _enrich_one(
         if minute_err is not None:
             fenshi["reasons"] = [f"分时拉取失败已降级: {minute_err}"] + list(fenshi.get("reasons") or [])
 
+    # 进攻型：今/昨量硬过滤 + 假推升降权（leader_dip 不套用 block）
+    if mode == "fenshi" and not fenshi.get("proxy") and minute is not None and len(minute) >= 15:
+        day_vol = day_volume_health(
+            minute,
+            daily,
+            block_by_1000=settings.day_vol_block_by_1000,
+            block_by_1130=settings.day_vol_block_by_1130,
+            warn_by_1130=settings.day_vol_warn_by_1130,
+        )
+        if day_vol.get("level") == "block":
+            return None
+        false_push = detect_false_push(
+            minute,
+            day_vol_ratio=day_vol.get("ratio"),
+            day_vol_level=str(day_vol.get("level") or ""),
+        )
+        fenshi = apply_day_vol_and_false_push(fenshi, day_vol, false_push)
+
     risk = risk_flags(
         anom["pct_from_low"],
         price=float(row.get("price") or 0),
@@ -223,8 +374,11 @@ def _enrich_one(
     in_hot = bool(tags)
     if tags:
         reasons.insert(0, f"强势板块: {', '.join(tags[:2])}")
-        if mode == "leader_dip":
-            fenshi["score"] = min(100.0, float(fenshi.get("score") or 0) + 8)
+        if mode == "leader_dip" or universe_policy == "soft":
+            bonus = settings.soft_hot_board_bonus if universe_policy == "soft" else 8.0
+            fenshi["score"] = min(100.0, float(fenshi.get("score") or 0) + bonus)
+            if universe_policy == "soft" and mode == "fenshi":
+                reasons.append(f"热门板块加权+{bonus:g}")
 
     # 进攻型分时：非回踩再攻/强势推升形态降权
     if (
@@ -262,6 +416,9 @@ def _enrich_one(
             "vol_expand": fenshi.get("vol_expand"),
             "vwap": fenshi.get("vwap"),
             "proxy": bool(fenshi.get("proxy")),
+            "day_vol_ratio": fenshi.get("day_vol_ratio"),
+            "day_vol_level": fenshi.get("day_vol_level"),
+            "false_push": fenshi.get("false_push"),
         },
     }
 
@@ -320,6 +477,7 @@ def run_scan(
     top_n: int | None = None,
     board_top_n: int = 15,
     mode: ScanMode = "fenshi",
+    universe_policy: UniversePolicy = "hot_only",
     on_progress: ProgressCb | None = None,
     should_cancel: CancelCb | None = None,
 ) -> dict[str, Any]:
@@ -371,6 +529,10 @@ def run_scan(
         return payload
 
     mode_label = "龙头低吸" if mode == "leader_dip" else "进攻型分时"
+    if universe_policy == "quota":
+        mode_label += "·配额测试"
+    elif universe_policy == "soft":
+        mode_label += "·软加权测试"
     session_note = f"{mode_label} · {session_note}"
 
     hot_boards: list[dict[str, Any]] = []
@@ -418,7 +580,28 @@ def run_scan(
                 board_tags = dict(uni.get("code_tags") or {})
                 mark("universe_ms", t0)
                 if not universe_codes:
-                    session_note += " · 板块成分池为空，跳过扫描（不扫全市场）"
+                    if universe_policy == "hot_only":
+                        session_note += " · 板块成分池为空，跳过扫描（不扫全市场）"
+                        payload = _empty_scan_payload(
+                            session_note=session_note,
+                            spot_source=spot_source,
+                            min_amount_yi=min_amount_yi,
+                            min_pct=min_pct,
+                            max_pct=max_pct,
+                            session=session,
+                            top_n=top_n,
+                            mode=mode,
+                            hot_boards=hot_boards[:board_top_n],
+                            universe_sectors=universe_sectors[:12],
+                        )
+                        payload["error_code"] = "empty_universe"
+                        payload["timings"] = timings
+                        return payload
+                    session_note += " · 板块成分池为空，测试策略继续用全市场候选"
+            except Exception as e:
+                mark("universe_ms", t0)
+                if universe_policy == "hot_only":
+                    session_note += f" · 板块成分池失败，跳过扫描: {str(e)[:60]}"
                     payload = _empty_scan_payload(
                         session_note=session_note,
                         spot_source=spot_source,
@@ -431,45 +614,35 @@ def run_scan(
                         hot_boards=hot_boards[:board_top_n],
                         universe_sectors=universe_sectors[:12],
                     )
-                    payload["error_code"] = "empty_universe"
+                    payload["error_code"] = "universe_failed"
                     payload["timings"] = timings
                     return payload
-            except Exception as e:
-                mark("universe_ms", t0)
-                session_note += f" · 板块成分池失败，跳过扫描: {str(e)[:60]}"
-                payload = _empty_scan_payload(
-                    session_note=session_note,
-                    spot_source=spot_source,
-                    min_amount_yi=min_amount_yi,
-                    min_pct=min_pct,
-                    max_pct=max_pct,
-                    session=session,
-                    top_n=top_n,
-                    mode=mode,
-                    hot_boards=hot_boards[:board_top_n],
-                    universe_sectors=universe_sectors[:12],
-                )
-                payload["error_code"] = "universe_failed"
-                payload["timings"] = timings
-                return payload
+                session_note += f" · 板块成分池失败，测试策略降级全市场: {str(e)[:60]}"
 
             check_cancel()
-            progress("quotes", 0.45, f"拉取成分实时报价({len(universe_codes)}只)")
-            t0 = time.perf_counter()
-            try:
-                rt = mkt.fetch_realtime_quotes(list(universe_codes))
-                spot = mkt.quotes_to_spot_df(rt)
-                spot_source = "sina_rt_universe"
-                spot_empty = spot is None or getattr(spot, "empty", True)
-                if not spot_empty:
-                    session_note += f" · 用板块成分实时报价({len(spot)}只)"
-            except Exception as e:
-                session_note += f" · 板块实时报价失败: {str(e)[:60]}"
-            mark("quotes_ms", t0)
+            # soft/quota 需要全市场快照；hot_only 优先成分实时报价
+            need_full_spot = universe_policy in ("soft", "quota")
+            if universe_codes and not need_full_spot:
+                progress("quotes", 0.45, f"拉取成分实时报价({len(universe_codes)}只)")
+                t0 = time.perf_counter()
+                try:
+                    rt = mkt.fetch_realtime_quotes(list(universe_codes))
+                    spot = mkt.quotes_to_spot_df(rt)
+                    spot_source = "sina_rt_universe"
+                    spot_empty = spot is None or getattr(spot, "empty", True)
+                    if not spot_empty:
+                        session_note += f" · 用板块成分实时报价({len(spot)}只)"
+                except Exception as e:
+                    session_note += f" · 板块实时报价失败: {str(e)[:60]}"
+                mark("quotes_ms", t0)
 
-            if spot_empty:
+            if spot_empty or need_full_spot:
                 check_cancel()
-                progress("spot", 0.55, "实时报价为空，尝试全市场快照(子进程)")
+                progress(
+                    "spot",
+                    0.55,
+                    "拉取全市场快照" if need_full_spot else "实时报价为空，尝试全市场快照(子进程)",
+                )
                 t0 = time.perf_counter()
                 try:
                     spot = mkt.get_spot_df_or_empty(
@@ -478,6 +651,8 @@ def run_scan(
                     )
                     spot_source = mkt.last_spot_source()
                     spot_empty = spot is None or getattr(spot, "empty", True)
+                    if need_full_spot and not spot_empty:
+                        session_note += f" · 全市场快照({len(spot)}只)"
                 except Exception as e:
                     session_note += f" · 全市场快照失败: {str(e)[:60]}"
                     spot_empty = True
@@ -504,20 +679,20 @@ def run_scan(
 
         check_cancel()
         progress("filter", 0.62, "预筛候选")
-        filtered = _filter_spot(
+        rows, cand_note = _build_candidate_rows(
             spot,
+            universe_policy=universe_policy,
+            universe_codes=universe_codes,
             min_amount_yi=min_amount_yi,
             min_pct=min_pct,
             max_pct=max_pct,
-            limit=min(settings.max_candidates_spot, 40),
-            universe_codes=universe_codes if universe_codes else None,
             max_pct_inclusive=max_pct_inclusive,
         )
+        session_note += f" · {cand_note}"
 
-        if universe_codes and filtered.empty:
+        if universe_policy == "hot_only" and universe_codes and not rows:
             session_note += " · 强势板块成分内无满足条件的标的"
 
-        rows = filtered.to_dict(orient="records")
         if rows and not settings.demo_mode and spot_source != "sina_rt_universe":
             try:
                 rt = mkt.fetch_realtime_quotes([str(r.get("code") or "") for r in rows])
@@ -537,6 +712,13 @@ def run_scan(
             except Exception:
                 pass
 
+        # soft/quota：用成分标签标记热门（全市场票也可能命中）
+        if universe_policy in ("soft", "quota") and universe_codes:
+            for r in rows:
+                code = str(r.get("code") or "").zfill(6)
+                if code in universe_codes and code not in board_tags:
+                    board_tags[code] = board_tags.get(code) or ["强势板块"]
+
         results: list[dict[str, Any]] = []
         timed_out = 0
         total = max(len(rows), 1)
@@ -546,7 +728,16 @@ def run_scan(
         t0 = time.perf_counter()
         workers = 4 if not settings.demo_mode else 2
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [pool.submit(_enrich_one, r, board_tags, mode=mode) for r in rows]
+            futs = [
+                pool.submit(
+                    _enrich_one,
+                    r,
+                    board_tags,
+                    mode=mode,
+                    universe_policy=universe_policy,
+                )
+                for r in rows
+            ]
             for fut in as_completed(futs):
                 check_cancel()
                 try:
@@ -569,7 +760,17 @@ def run_scan(
             session_note += f" · {timed_out}只分时超时已跳过"
 
         results.sort(key=lambda x: (x.get("score") or 0, x.get("pct") or 0), reverse=True)
-        results = results[:top_n]
+        if universe_policy == "quota":
+            results = _apply_quota_top(
+                results,
+                top_n,
+                satellite_pct=settings.universe_quota_satellite_pct,
+            )
+            session_note += (
+                f" · 结果配额非主线约{int(round(100 * settings.universe_quota_satellite_pct))}%"
+            )
+        else:
+            results = results[:top_n]
         scored = sum(1 for x in results if (x.get("score") or 0) > 0)
         fenshi_ok = sum(1 for x in results if not (x.get("fenshi") or {}).get("proxy"))
         reattack_ok = sum(
@@ -579,8 +780,10 @@ def run_scan(
         )
         strong_push_ok = sum(1 for x in results if (x.get("fenshi") or {}).get("strong_push"))
 
-        if universe_codes:
+        if universe_policy == "hot_only" and universe_codes:
             session_note += f" · 候选池=强势板块成分({len(universe_codes)}只)"
+        elif universe_codes:
+            session_note += f" · 热门成分参考({len(universe_codes)}只)"
 
         pct_hint = f"≤{max_pct}%" if max_pct_inclusive else f"<{max_pct}%"
         timings["total_ms"] = round((time.perf_counter() - t_all) * 1000, 1)
@@ -605,6 +808,7 @@ def run_scan(
                 "session": session,
                 "top_n": top_n,
                 "mode": mode,
+                "universe_policy": universe_policy,
                 "demo_mode": settings.demo_mode,
                 "strategy_version": settings.strategy_version,
             },

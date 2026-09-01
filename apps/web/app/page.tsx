@@ -10,31 +10,74 @@ import {
   type ScanResult,
 } from "@/lib/api";
 
+/** 页面 Tab：后两个为测试策略，不改现网进攻型/龙头低吸 */
+type UiTab = "fenshi" | "leader_dip" | "fenshi_quota" | "fenshi_soft";
 type ScanMode = "fenshi" | "leader_dip";
+type UniversePolicy = "hot_only" | "quota" | "soft";
 
 type ModeFormState = {
   minPct: number;
   maxPct: number;
 };
 
-const MODE_DEFAULTS: Record<ScanMode, ModeFormState> = {
+const TAB_DEFAULTS: Record<UiTab, ModeFormState> = {
   fenshi: { minPct: 2, maxPct: 6 },
   leader_dip: { minPct: -3, maxPct: 2 },
+  fenshi_quota: { minPct: 2, maxPct: 6 },
+  fenshi_soft: { minPct: 2, maxPct: 6 },
 };
 
-const STORAGE_KEY = "ashare.scan.v1";
+const TAB_META: Record<
+  UiTab,
+  { title: string; desc: string; mode: ScanMode; policy: UniversePolicy; test?: boolean }
+> = {
+  fenshi: {
+    title: "进攻型分时扫描",
+    desc: "强势板块成分内选股 + 回踩均价放量再攻 / 强势推升。默认涨幅 2% ~ <6%。",
+    mode: "fenshi",
+    policy: "hot_only",
+  },
+  leader_dip: {
+    title: "龙头低吸扫描",
+    desc: "强势板块龙头，水下/平盘贴近 MA5 低吸。默认涨幅 -3% ~ +2%。",
+    mode: "leader_dip",
+    policy: "hot_only",
+  },
+  fenshi_quota: {
+    title: "测试·配额制",
+    desc: "主池仍用强势板块；结果约 25% 名额留给形态过关的非主线票（测试，不影响现网）。",
+    mode: "fenshi",
+    policy: "quota",
+    test: true,
+  },
+  fenshi_soft: {
+    title: "测试·软加权",
+    desc: "全市场涨幅/成交额初筛，热门板块只加分不加硬过滤（测试，不影响现网）。",
+    mode: "fenshi",
+    policy: "soft",
+    test: true,
+  },
+};
 
-function createModeState(): Record<ScanMode, ModeFormState> {
+const STORAGE_KEY = "ashare.scan.v2";
+
+function createTabState(): Record<UiTab, ModeFormState> {
   return {
-    fenshi: { ...MODE_DEFAULTS.fenshi },
-    leader_dip: { ...MODE_DEFAULTS.leader_dip },
+    fenshi: { ...TAB_DEFAULTS.fenshi },
+    leader_dip: { ...TAB_DEFAULTS.leader_dip },
+    fenshi_quota: { ...TAB_DEFAULTS.fenshi_quota },
+    fenshi_soft: { ...TAB_DEFAULTS.fenshi_soft },
   };
 }
 
+function emptyData(): Record<UiTab, ScanResult | null> {
+  return { fenshi: null, leader_dip: null, fenshi_quota: null, fenshi_soft: null };
+}
+
 function loadPersisted(): {
-  mode?: ScanMode;
-  formByMode?: Record<ScanMode, ModeFormState>;
-  dataByMode?: Record<ScanMode, ScanResult | null>;
+  tab?: UiTab;
+  formByTab?: Record<UiTab, ModeFormState>;
+  dataByTab?: Record<UiTab, ScanResult | null>;
   minAmount?: number;
   session?: string;
   topN?: number;
@@ -49,12 +92,9 @@ function loadPersisted(): {
 }
 
 export default function HomePage() {
-  const [mode, setMode] = useState<ScanMode>("fenshi");
-  const [formByMode, setFormByMode] = useState(createModeState);
-  const [dataByMode, setDataByMode] = useState<Record<ScanMode, ScanResult | null>>({
-    fenshi: null,
-    leader_dip: null,
-  });
+  const [tab, setTab] = useState<UiTab>("fenshi");
+  const [formByTab, setFormByTab] = useState(createTabState);
+  const [dataByTab, setDataByTab] = useState(emptyData);
   const [minAmount, setMinAmount] = useState(1);
   const [session, setSession] = useState("auto");
   const [topN, setTopN] = useState(20);
@@ -67,16 +107,16 @@ export default function HomePage() {
   const stopRef = useRef(false);
   const [storageReady, setStorageReady] = useState(false);
 
-  const { minPct, maxPct } = formByMode[mode];
-  const data = dataByMode[mode];
+  const meta = TAB_META[tab];
+  const { minPct, maxPct } = formByTab[tab];
+  const data = dataByTab[tab];
 
-  // 仅客户端挂载后读 sessionStorage，避免 SSR 与首屏 hydration 不一致
   useEffect(() => {
     const persisted = loadPersisted();
     if (persisted) {
-      if (persisted.mode) setMode(persisted.mode);
-      if (persisted.formByMode) setFormByMode(persisted.formByMode);
-      if (persisted.dataByMode) setDataByMode(persisted.dataByMode);
+      if (persisted.tab && persisted.tab in TAB_META) setTab(persisted.tab);
+      if (persisted.formByTab) setFormByTab({ ...createTabState(), ...persisted.formByTab });
+      if (persisted.dataByTab) setDataByTab({ ...emptyData(), ...persisted.dataByTab });
       if (persisted.minAmount != null) setMinAmount(persisted.minAmount);
       if (persisted.session) setSession(persisted.session);
       if (persisted.topN != null) setTopN(persisted.topN);
@@ -89,24 +129,24 @@ export default function HomePage() {
     try {
       sessionStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ mode, formByMode, dataByMode, minAmount, session, topN })
+        JSON.stringify({ tab, formByTab, dataByTab, minAmount, session, topN })
       );
     } catch {
       /* ignore quota */
     }
-  }, [mode, formByMode, dataByMode, minAmount, session, topN, storageReady]);
+  }, [tab, formByTab, dataByTab, minAmount, session, topN, storageReady]);
 
-  function onModeChange(next: ScanMode) {
-    setMode(next);
+  function onTabChange(next: UiTab) {
+    setTab(next);
     setError("");
     setErrorKind("");
     setMsg("");
   }
 
   function updateForm(patch: Partial<ModeFormState>) {
-    setFormByMode((prev) => ({
+    setFormByTab((prev) => ({
       ...prev,
-      [mode]: { ...prev[mode], ...patch },
+      [tab]: { ...prev[tab], ...patch },
     }));
   }
 
@@ -132,14 +172,15 @@ export default function HomePage() {
           max_pct: maxPct,
           session,
           top_n: topN,
-          mode,
+          mode: meta.mode,
+          universe_policy: meta.policy,
         },
         {
           shouldStop: () => stopRef.current,
           onProgress: (job) => setProgress(job),
         }
       );
-      setDataByMode((prev) => ({ ...prev, [mode]: res }));
+      setDataByTab((prev) => ({ ...prev, [tab]: res }));
       if (res.error_code) {
         setErrorKind(res.error_code === "session_blocked" ? "session" : "data");
         setError(explainScanError(res.error_code, res.session_note));
@@ -174,7 +215,7 @@ export default function HomePage() {
       const res = await addWatch({
         code: item.code,
         name: item.name,
-        source: mode === "leader_dip" ? "longtou" : "fenshi",
+        source: meta.mode === "leader_dip" ? "longtou" : "fenshi",
         note: (item.reasons || []).slice(0, 2).join("；"),
         entry_price: item.price,
         entry_pct: item.pct,
@@ -200,34 +241,33 @@ export default function HomePage() {
     }
   }
 
-  const modeTitle = mode === "leader_dip" ? "龙头低吸扫描" : "进攻型分时扫描";
-  const modeDesc =
-    mode === "leader_dip"
-      ? "强势板块龙头，水下/平盘贴近 MA5 低吸。默认涨幅 -3% ~ +2%。"
-      : "强势板块成分内选股 + 回踩均价放量再攻 / 强势推升。默认涨幅 2% ~ <6%。";
-  const maxPctLabel = mode === "leader_dip" ? "涨幅上限≤%" : "当前涨幅<%";
+  const maxPctLabel = meta.mode === "leader_dip" ? "涨幅上限≤%" : "当前涨幅<%";
   const pct = Math.round((progress?.progress || 0) * 100);
+  const tabs: UiTab[] = ["fenshi", "leader_dip", "fenshi_quota", "fenshi_soft"];
 
   return (
     <>
       <section className="panel">
-        <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>{modeTitle}</h1>
+        <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>{meta.title}</h1>
         <p className="muted" style={{ marginTop: 0 }}>
-          {modeDesc}
+          {meta.desc}
         </p>
-        <div className="row" style={{ marginBottom: 12 }}>
-          <button
-            className={mode === "fenshi" ? "" : "secondary"}
-            onClick={() => onModeChange("fenshi")}
-          >
-            进攻型分时
-          </button>
-          <button
-            className={mode === "leader_dip" ? "" : "secondary"}
-            onClick={() => onModeChange("leader_dip")}
-          >
-            龙头低吸
-          </button>
+        <div className="row" style={{ marginBottom: 12, flexWrap: "wrap" }}>
+          {tabs.map((id) => (
+            <button
+              key={id}
+              className={tab === id ? "" : "secondary"}
+              onClick={() => onTabChange(id)}
+            >
+              {id === "fenshi"
+                ? "进攻型分时"
+                : id === "leader_dip"
+                  ? "龙头低吸"
+                  : id === "fenshi_quota"
+                    ? "测试·配额"
+                    : "测试·软加权"}
+            </button>
+          ))}
         </div>
         <div className="row">
           <label>
@@ -318,15 +358,21 @@ export default function HomePage() {
               {data.params?.strategy_version
                 ? ` · 策略 ${String(data.params.strategy_version)}`
                 : ""}
+              {data.params?.universe_policy
+                ? ` · 池策略 ${String(data.params.universe_policy)}`
+                : ""}
             </div>
             <h3 style={{ marginBottom: 8 }}>强势板块（候选池来源）</h3>
             <div className="chips">
-              {(data.universe_sectors || data.hot_boards || []).slice(0, 12).map((b) => (
-                <div className="chip" key={`${b.name}-${b.type ?? ""}`}>
-                  {b.name} {b.pct?.toFixed?.(2) ?? b.pct}%
-                  {b.type ? ` (${b.type})` : ""}
-                </div>
-              ))}
+              {(data.universe_sectors || data.hot_boards || []).slice(0, 12).map((b) => {
+                const type = "type" in b ? (b as { type?: string }).type : undefined;
+                return (
+                  <div className="chip" key={`${b.name}-${type ?? ""}`}>
+                    {b.name} {b.pct?.toFixed?.(2) ?? b.pct}%
+                    {type ? ` (${type})` : ""}
+                  </div>
+                );
+              })}
             </div>
             <h3 style={{ marginTop: 12, marginBottom: 8 }}>同花顺行业参考</h3>
             <div className="chips">
@@ -371,6 +417,8 @@ export default function HomePage() {
                         {it.name}
                         {it.in_hot_board ? (
                           <div className="muted">热门板块</div>
+                        ) : meta.test ? (
+                          <div className="muted">非主线</div>
                         ) : null}
                         {proxy ? <div className="muted">代理分</div> : null}
                       </td>

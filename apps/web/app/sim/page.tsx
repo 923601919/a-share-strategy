@@ -108,7 +108,7 @@ export default function SimPage() {
           <div>
             <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>模拟盘</h1>
             <p className="muted" style={{ margin: 0 }}>
-              初始资金 10 万。加入自选时自动开仓并挂止盈/止损；复盘时重设条件单；触及即自动卖出并记交易。
+              初始资金 10 万。加入自选时自动开仓并挂止盈/止损；卖出遵循 A 股 T+1（当日买入不可卖）。
             </p>
           </div>
           <div className="row">
@@ -199,9 +199,15 @@ export default function SimPage() {
                   <td className="down">{p.stop_loss_price ?? "-"}</td>
                   <td>{fmtMoney(p.market_value)}</td>
                   <td>
-                    <button className="secondary" onClick={() => onSell(p.id)}>
-                      卖出
-                    </button>
+                    {p.t1_sellable === false ? (
+                      <span className="muted" title={p.t1_lock_reason || "T+1"}>
+                        T+1锁定
+                      </span>
+                    ) : (
+                      <button className="secondary" onClick={() => onSell(p.id)}>
+                        卖出
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))

@@ -66,13 +66,33 @@ npm run dev
 
 ## 环境变量（API）
 
+见仓库根目录 [`.env.example`](.env.example)。常用项：
+
 | 变量 | 含义 | 默认 |
 |------|------|------|
 | `DEMO_MODE` | true 时用演示数据 | false |
-| `SSL_VERIFY` | true 严格校验证书；Windows 缺 CA 时默认 false | false |
+| `SSL_VERIFY` | 校验证书；本地 Windows 脚本未设置时为 false | true（config） |
+| `API_KEY` | 非空则需 `X-API-Key` | 空 |
+| `JWT_SECRET` | 非空则开启多人登录（JWT） | 空 |
+| `AUTH_REQUIRED` | 显式开关；空则随 `JWT_SECRET` | 自动 |
+| `DOCS_ENABLED` | 是否暴露 `/docs` | true |
+| `CORS_ORIGINS` | 允许的前端源 | localhost:3000 |
+| `SCAN_MAX_CONCURRENT` | 同时 running 扫描数 | 1 |
 | `MIN_AMOUNT_YI` | 成交额下限（亿） | 1 |
 | `ANOMALY_WARN_PCT` | 异动警告阈值 | 180 |
 | `ANOMALY_BLOCK_PCT` | 异动剔除阈值 | 195 |
+
+前端见 [`apps/web/.env.example`](apps/web/.env.example)（`NEXT_PUBLIC_API_BASE` / `NEXT_PUBLIC_API_KEY`）。
+
+### 多人（给朋友用）
+
+1. `.env` 设置 `JWT_SECRET`（随机长串）与生产 `CORS_ORIGINS`
+2. 创建管理员：`python scripts/create_admin.py --username alice --password '******'`
+3. 生成邀请码：同脚本加 `--invite`，或登录后点导航「邀请码」
+4. 朋友打开 `/login` →「用邀请码注册」；每人自选 / 模拟盘互不共享
+5. 生产建议 `DOCS_ENABLED=false`，必要时再加反向代理 HTTPS
+
+同步 OpenAPI 到前端：`python scripts/export-openapi.py`（需 API 依赖）。
 
 （也可改 `config.py`）
 
@@ -80,3 +100,4 @@ npm run dev
 
 - 免费行情源有延迟与限流，扫描请控制频率
 - 「进攻型」盘感无法完全量化，结果需人工看分时图确认
+- API 默认绑定 `127.0.0.1`；给朋友用请设 `JWT_SECRET`（并建议反代 + HTTPS）

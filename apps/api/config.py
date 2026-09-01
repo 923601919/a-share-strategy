@@ -9,7 +9,10 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=(str(Path(__file__).resolve().parent / ".env"), str(ROOT / ".env")),
+        extra="ignore",
+    )
 
     db_path: Path = DATA_DIR / "app.db"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -23,11 +26,28 @@ class Settings(BaseSettings):
     sector_min_pct: float = 0.0  # 板块涨幅低于此不入候选池
     max_candidates_spot: int = 80
     top_n_result: int = 30
+    # 测试策略：配额制卫星池占比（非主线名额）
+    universe_quota_satellite_pct: float = 0.25
+    # 软加权：热门板块加分（仅 soft 策略对进攻型生效）
+    soft_hot_board_bonus: float = 8.0
     anomaly_warn_pct: float = 180.0
     anomaly_block_pct: float = 195.0
+    # 进攻型分时：今累计成交/昨全日（优先成交额）
+    day_vol_block_by_1000: float = 1.0  # ≤10:00 且 ≥昨全日 → 剔除
+    day_vol_block_by_1130: float = 2.0  # ≤11:30 且 ≥2×昨量 → 剔除
+    day_vol_warn_by_1130: float = 1.2  # ≤11:30 且 ≥1.2× → 降权
     demo_mode: bool = False  # True 时用内置样例，不请求行情
-    # Windows 常见缺 CA：默认关闭校验以便拉东财；正式环境可设 SSL_VERIFY=true
-    ssl_verify: bool = False
+    # 默认校验证书；Windows 缺 CA 时设 SSL_VERIFY=false
+    ssl_verify: bool = True
+    # 非空则要求请求头 X-API-Key（本地研究可留空；多人部署建议配合 JWT）
+    api_key: str = ""
+    # 多人：设 JWT_SECRET 后默认开启登录；本地可留空关闭鉴权
+    jwt_secret: str = ""
+    jwt_expire_hours: int = 168  # 7 天
+    # None=自动（有 jwt_secret 则开）；显式 true/false 可覆盖
+    auth_required: bool | None = None
+    # 生产建议 false，避免公开 OpenAPI
+    docs_enabled: bool = True
 
     # 模拟盘（默认 / 按自选来源）
     sim_initial_capital: float = 100_000.0
@@ -47,11 +67,21 @@ class Settings(BaseSettings):
     global_weak_index_pct: float = -0.8  # 单指数跌超此值计为偏弱
 
     # 策略/软件版本（复盘可回溯）
-    strategy_version: str = "2026.08.26-p0"
+    strategy_version: str = "2026.09.01-sw"
     scan_use_isolated: bool = True  # 危险行情路径走子进程（全市场快照）
     sector_universe_use_isolated: bool = False  # 新浪板块走子进程易超时，默认进程内
+    # 超时后线程可能空转：热点路径优先子进程硬杀
+    prefer_isolated_timeout: bool = True
+    scan_max_concurrent: int = 1  # 同时 running 的扫描数
+    scan_snapshot_keep: int = 30  # scan_snapshots 保留条数
     spot_cache_ttl: float = 45.0
     universe_cache_ttl: float = 90.0
 
 
 settings = Settings()
+
+
+def auth_is_required() -> bool:
+    if settings.auth_required is not None:
+        return bool(settings.auth_required)
+    return bool((settings.jwt_secret or "").strip())

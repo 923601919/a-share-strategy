@@ -8,5 +8,7 @@ if (-not (Test-Path ".\.venv\Scripts\uvicorn.exe")) {
 }
 # 默认真实行情；需要演示数据时：$env:DEMO_MODE="true"
 if (-not $env:DEMO_MODE) { $env:DEMO_MODE = "false" }
-Write-Host "DEMO_MODE=$($env:DEMO_MODE)  API -> http://127.0.0.1:8000"
+# Windows 本地常见缺 CA：未显式设置时关闭校验（正式环境请设 SSL_VERIFY=true）
+if (-not $env:SSL_VERIFY) { $env:SSL_VERIFY = "false" }
+Write-Host "DEMO_MODE=$($env:DEMO_MODE) SSL_VERIFY=$($env:SSL_VERIFY)  API -> http://127.0.0.1:8000"
 & .\.venv\Scripts\uvicorn.exe main:app --reload --host 127.0.0.1 --port 8000

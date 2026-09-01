@@ -1,20 +1,203 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 import pandas as pd
 
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
+DayVolLevel = Literal["block", "warn", "healthy", "ok", "skip"]
 
 
 def _hm(now_hm: str | None = None) -> int:
-    from datetime import datetime
-
     if now_hm is None:
         now = datetime.now()
         return now.hour * 100 + now.minute
     parts = now_hm.split(":")
     return int(parts[0]) * 100 + int(parts[1])
+
+
+def _session_elapsed_minutes(hm: int) -> int:
+    """已过交易分钟数（上午 120 + 下午 120 = 240）。非交易时段夹到边界。"""
+    if hm < 930:
+        return 0
+    if hm <= 1130:
+        return (hm // 100 - 9) * 60 + (hm % 100) - 30
+    if hm < 1300:
+        return 120
+    if hm <= 1500:
+        return 120 + (hm // 100 - 13) * 60 + (hm % 100)
+    return 240
+
+
+def _metric_sum(df: pd.DataFrame) -> tuple[float, str]:
+    """优先成交额，否则成交量。返回 (值, 字段名)。"""
+    if df is None or df.empty:
+        return 0.0, "amount"
+    if "amount" in df.columns:
+        amt = float(pd.to_numeric(df["amount"], errors="coerce").fillna(0).sum())
+        if amt > 0:
+            return amt, "amount"
+    if "volume" in df.columns:
+        vol = float(pd.to_numeric(df["volume"], errors="coerce").fillna(0).sum())
+        return vol, "volume"
+    return 0.0, "amount"
+
+
+def _prev_session_metric(daily: pd.DataFrame, field: str) -> float:
+    """上一完整交易日的 amount/volume。末行若为今日则用前一行。"""
+    if daily is None or daily.empty or field not in daily.columns:
+        return 0.0
+    df = daily.dropna(subset=[field]).copy()
+    if df.empty:
+        return 0.0
+    idx = -1
+    if "date" in df.columns:
+        last_dt = pd.to_datetime(df["date"].iloc[-1], errors="coerce")
+        if pd.notna(last_dt) and last_dt.date() == datetime.now().date() and len(df) >= 2:
+            idx = -2
+    val = float(pd.to_numeric(df[field].iloc[idx], errors="coerce") or 0)
+    return val if val > 0 else 0.0
+
+
+def day_volume_health(
+    minute: pd.DataFrame | None,
+    daily: pd.DataFrame | None,
+    *,
+    now_hm: str | None = None,
+    block_by_1000: float = 1.0,
+    block_by_1130: float = 2.0,
+    warn_by_1130: float = 1.2,
+) -> dict[str, Any]:
+    """
+    今累计成交 / 昨全日（优先成交额）。
+    对齐作者细节：早盘超昨全日、午盘约 2× 视为日内出货。
+    """
+    empty = {
+        "level": "skip",
+        "ratio": None,
+        "metric": "amount",
+        "today_cum": 0.0,
+        "prev_day": 0.0,
+        "message": "日量数据不足",
+    }
+    if minute is None or minute.empty or daily is None or daily.empty:
+        return empty
+
+    today_cum, metric = _metric_sum(minute)
+    prev = _prev_session_metric(daily, metric)
+    if metric == "amount" and prev <= 0 and "volume" in daily.columns and "volume" in minute.columns:
+        # 日线无额时回退量比
+        today_cum = float(pd.to_numeric(minute["volume"], errors="coerce").fillna(0).sum())
+        metric = "volume"
+        prev = _prev_session_metric(daily, "volume")
+
+    if today_cum <= 0 or prev <= 0:
+        return {**empty, "today_cum": today_cum, "prev_day": prev, "metric": metric}
+
+    ratio = today_cum / prev
+    hm = _hm(now_hm)
+    level: DayVolLevel = "ok"
+    message = f"今/昨{metric}比 {ratio:.2f}x"
+
+    if hm <= 1000 and ratio >= block_by_1000:
+        level = "block"
+        message = f"早盘今/昨{metric}已达 {ratio:.2f}x（≥{block_by_1000:g}），疑似日内出货"
+    elif hm <= 1130 and ratio >= block_by_1130:
+        level = "block"
+        message = f"午前今/昨{metric}已达 {ratio:.2f}x（≥{block_by_1130:g}），疑似日内出货"
+    elif hm <= 1130 and ratio >= warn_by_1130:
+        level = "warn"
+        message = f"午前今/昨{metric}偏快 {ratio:.2f}x（≥{warn_by_1130:g}）"
+    else:
+        elapsed = max(_session_elapsed_minutes(hm), 1)
+        expected_frac = elapsed / 240.0
+        pace = ratio / expected_frac if expected_frac > 0 else ratio
+        if 0.4 <= pace <= 1.5:
+            level = "healthy"
+            message = f"日量健康(轻微放量) 今/昨{metric} {ratio:.2f}x · 进度归一 {pace:.2f}"
+        else:
+            message = f"今/昨{metric}比 {ratio:.2f}x · 进度归一 {pace:.2f}"
+
+    return {
+        "level": level,
+        "ratio": round(ratio, 3),
+        "metric": metric,
+        "today_cum": round(today_cum, 2),
+        "prev_day": round(prev, 2),
+        "message": message,
+    }
+
+
+def detect_false_push(
+    minute: pd.DataFrame | None,
+    *,
+    day_vol_ratio: float | None = None,
+    day_vol_level: str | None = None,
+    lookback: int = 30,
+) -> dict[str, Any]:
+    """冲高后跌破均价 + 日量偏大 → 假进攻。"""
+    out = {"false_push": False, "near_high_then_below": False}
+    if minute is None or len(minute) < 15 or "close" not in minute.columns:
+        return out
+
+    df = minute.dropna(subset=["close"]).reset_index(drop=True)
+    vwap = compute_vwap_series(df)
+    n = len(df)
+    lb = min(lookback, n)
+    c = df["close"].iloc[-lb:].astype(float)
+    last = float(c.iloc[-1])
+    last_vwap = float(vwap.iloc[-1]) if len(vwap) else last
+    window_high = float(c.max())
+    touched_high = (c >= window_high * 0.98).any()
+    below_vwap = last < last_vwap * 0.998
+    near_high_then_below = bool(touched_high and below_vwap)
+
+    vol_hot = bool(
+        day_vol_level in ("warn", "block")
+        or (day_vol_ratio is not None and day_vol_ratio >= 1.0)
+    )
+    false_push = bool(near_high_then_below and vol_hot)
+    return {
+        "false_push": false_push,
+        "near_high_then_below": near_high_then_below,
+        "below_vwap": below_vwap,
+    }
+
+
+def apply_day_vol_and_false_push(
+    fenshi: dict[str, Any],
+    day_vol: dict[str, Any],
+    false_push: dict[str, Any],
+) -> dict[str, Any]:
+    """对进攻型打分结果施加日量健康加分 / warn 与假推升降权（block 由调用方剔除）。"""
+    out = dict(fenshi)
+    reasons = list(out.get("reasons") or [])
+    score = float(out.get("score") or 0)
+    level = str(day_vol.get("level") or "skip")
+    ratio = day_vol.get("ratio")
+
+    out["day_vol_ratio"] = ratio
+    out["day_vol_level"] = level
+
+    if level == "healthy":
+        score = min(100.0, score + 5)
+        reasons.append(str(day_vol.get("message") or "日量健康(轻微放量)"))
+    elif level == "warn":
+        score = max(0.0, score - 15)
+        reasons.append(str(day_vol.get("message") or "日量偏快(降权)"))
+
+    if false_push.get("false_push"):
+        out["strong_push"] = False
+        out["pullback"] = False
+        out["reattack"] = False
+        score = max(0.0, score - 25)
+        reasons.append("冲高跌破均价·疑似假进攻")
+
+    out["score"] = round(min(score, 100.0), 1)
+    out["reasons"] = reasons
+    out["false_push"] = bool(false_push.get("false_push"))
+    return out
 
 
 def in_session_bucket(now_hm: str | None = None) -> str:

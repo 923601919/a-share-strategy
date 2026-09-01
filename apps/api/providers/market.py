@@ -3,7 +3,8 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Any
+from concurrent.futures import Future
+from typing import Any, Callable, TypeVar
 
 import pandas as pd
 
@@ -13,9 +14,15 @@ from providers.isolated import call_isolated
 
 logger = logging.getLogger("market")
 
+_T = TypeVar("_T")
+
 # 简易 TTL 缓存（进程内）
 _cache: dict[str, tuple[float, Any]] = {}
 _cache_lock = threading.Lock()
+
+# 同 key 单飞：并发 miss 只打一次源站
+_inflight: dict[str, Future] = {}
+_inflight_lock = threading.Lock()
 
 # 数据源健康状态
 _source_health: dict[str, dict[str, Any]] = {}
@@ -38,6 +45,34 @@ def _cache_get(key: str) -> Any | None:
 def _cache_set(key: str, value: Any, ttl: float) -> None:
     with _cache_lock:
         _cache[key] = (time.time() + ttl, value)
+
+
+def _single_flight(key: str, fn: Callable[[], _T], *, wait_timeout: float = 120.0) -> _T:
+    """同一 key 仅一个 in-flight 请求，其余等待同一结果。"""
+    with _inflight_lock:
+        existing = _inflight.get(key)
+        if existing is not None:
+            fut = existing
+            owner = False
+        else:
+            fut = Future()
+            _inflight[key] = fut
+            owner = True
+
+    if not owner:
+        return fut.result(timeout=wait_timeout)
+
+    try:
+        value = fn()
+        fut.set_result(value)
+        return value
+    except Exception as e:
+        fut.set_exception(e)
+        raise
+    finally:
+        with _inflight_lock:
+            if _inflight.get(key) is fut:
+                _inflight.pop(key, None)
 
 
 def _mark(source: str, *, ok: bool, detail: str = "", ms: float | None = None) -> None:
@@ -94,31 +129,35 @@ def get_spot_df_or_empty(*, use_isolated: bool = True, ttl: float = 45.0) -> pd.
     if cached is not None:
         return cached["df"] if isinstance(cached, dict) else cached
 
-    t0 = time.perf_counter()
-    try:
-        if use_isolated:
-            bundle = call_isolated("get_spot_df_or_empty_bundle", timeout=22)
-            df = bundle.get("df") if isinstance(bundle, dict) else bundle
-            src = (bundle or {}).get("source") if isinstance(bundle, dict) else "isolated"
-            _LAST_SPOT_SOURCE_OVERRIDE = src
-        else:
-            df = raw.get_spot_df_or_empty()
-            _LAST_SPOT_SOURCE_OVERRIDE = None
-        if df is None:
-            df = raw.empty_spot_df()
-        _cache_set("spot_df", {"df": df, "source": last_spot_source()}, ttl)
-        _mark(
-            "spot",
-            ok=not getattr(df, "empty", True),
-            detail=last_spot_source(),
-            ms=(time.perf_counter() - t0) * 1000,
-        )
-        return df
-    except Exception as e:
-        logger.warning("spot fetch failed: %s", e)
-        _LAST_SPOT_SOURCE_OVERRIDE = f"error:{e}"
-        _mark("spot", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
-        return raw.empty_spot_df()
+    def _load() -> pd.DataFrame:
+        global _LAST_SPOT_SOURCE_OVERRIDE
+        t0 = time.perf_counter()
+        try:
+            if use_isolated:
+                bundle = call_isolated("get_spot_df_or_empty_bundle", timeout=22)
+                df = bundle.get("df") if isinstance(bundle, dict) else bundle
+                src = (bundle or {}).get("source") if isinstance(bundle, dict) else "isolated"
+                _LAST_SPOT_SOURCE_OVERRIDE = src
+            else:
+                df = raw.get_spot_df_or_empty()
+                _LAST_SPOT_SOURCE_OVERRIDE = None
+            if df is None:
+                df = raw.empty_spot_df()
+            _cache_set("spot_df", {"df": df, "source": last_spot_source()}, ttl)
+            _mark(
+                "spot",
+                ok=not getattr(df, "empty", True),
+                detail=last_spot_source(),
+                ms=(time.perf_counter() - t0) * 1000,
+            )
+            return df
+        except Exception as e:
+            logger.warning("spot fetch failed: %s", e)
+            _LAST_SPOT_SOURCE_OVERRIDE = f"error:{e}"
+            _mark("spot", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
+            return raw.empty_spot_df()
+
+    return _single_flight("spot_df", _load, wait_timeout=ttl + 30)
 
 
 def fetch_hot_sector_universe(
@@ -134,43 +173,45 @@ def fetch_hot_sector_universe(
     if cached is not None:
         return cached
 
-    t0 = time.perf_counter()
-    kwargs = {
-        "industry_top": industry_top,
-        "concept_top": concept_top,
-        "sector_min_pct": sector_min_pct,
-    }
-    try:
-        if use_isolated and settings.sector_universe_use_isolated and not settings.demo_mode:
-            try:
-                uni = call_isolated("fetch_hot_sector_universe_bundle", timeout=90, kwargs=kwargs)
-            except Exception as iso_err:
-                logger.warning("isolated sector universe failed, fallback in-process: %s", iso_err)
+    def _load() -> dict[str, Any]:
+        t0 = time.perf_counter()
+        kwargs = {
+            "industry_top": industry_top,
+            "concept_top": concept_top,
+            "sector_min_pct": sector_min_pct,
+        }
+        try:
+            if use_isolated and settings.sector_universe_use_isolated and not settings.demo_mode:
+                try:
+                    uni = call_isolated("fetch_hot_sector_universe_bundle", timeout=90, kwargs=kwargs)
+                except Exception as iso_err:
+                    logger.warning("isolated sector universe failed, fallback in-process: %s", iso_err)
+                    uni = raw.fetch_hot_sector_universe(**kwargs)
+            else:
                 uni = raw.fetch_hot_sector_universe(**kwargs)
-        else:
-            uni = raw.fetch_hot_sector_universe(**kwargs)
-        if not uni.get("codes"):
-            logger.warning("primary sector universe empty, trying board+em fallback")
-            uni = _fallback_sector_universe(
-                industry_top=industry_top,
-                concept_top=concept_top,
-                sector_min_pct=sector_min_pct,
-            )
-        uni = uni or {"codes": [], "sectors": [], "code_tags": {}}
-        if isinstance(uni.get("codes"), list):
-            uni = {**uni, "codes": set(uni["codes"])}
-        elif not isinstance(uni.get("codes"), set):
-            uni = {**uni, "codes": set(uni.get("codes") or [])}
-        n = len(uni.get("codes") or [])
-        # 空池不缓存，避免短暂失败锁死后续扫描 90s
-        if n > 0:
-            _cache_set(key, uni, ttl)
-        _mark("sector_universe", ok=n > 0, detail=f"codes={n}", ms=(time.perf_counter() - t0) * 1000)
-        return uni
-    except Exception as e:
-        logger.warning("sector universe failed: %s", e)
-        _mark("sector_universe", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
-        raise
+            if not uni.get("codes"):
+                logger.warning("primary sector universe empty, trying board+em fallback")
+                uni = _fallback_sector_universe(
+                    industry_top=industry_top,
+                    concept_top=concept_top,
+                    sector_min_pct=sector_min_pct,
+                )
+            uni = uni or {"codes": [], "sectors": [], "code_tags": {}}
+            if isinstance(uni.get("codes"), list):
+                uni = {**uni, "codes": set(uni["codes"])}
+            elif not isinstance(uni.get("codes"), set):
+                uni = {**uni, "codes": set(uni.get("codes") or [])}
+            n = len(uni.get("codes") or [])
+            if n > 0:
+                _cache_set(key, uni, ttl)
+            _mark("sector_universe", ok=n > 0, detail=f"codes={n}", ms=(time.perf_counter() - t0) * 1000)
+            return uni
+        except Exception as e:
+            logger.warning("sector universe failed: %s", e)
+            _mark("sector_universe", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
+            raise
+
+    return _single_flight(key, _load, wait_timeout=ttl + 60)
 
 
 def _fallback_sector_universe(
@@ -238,15 +279,19 @@ def fetch_concept_boards_top(n: int = 20, ttl: float = 90.0) -> list[dict[str, A
     cached = _cache_get(key)
     if cached is not None:
         return cached
-    t0 = time.perf_counter()
-    try:
-        rows = raw.fetch_concept_boards_top(n)
-        _cache_set(key, rows, ttl)
-        _mark("boards", ok=True, detail=f"n={len(rows)}", ms=(time.perf_counter() - t0) * 1000)
-        return rows
-    except Exception as e:
-        _mark("boards", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
-        raise
+
+    def _load() -> list[dict[str, Any]]:
+        t0 = time.perf_counter()
+        try:
+            rows = raw.fetch_concept_boards_top(n)
+            _cache_set(key, rows, ttl)
+            _mark("boards", ok=True, detail=f"n={len(rows)}", ms=(time.perf_counter() - t0) * 1000)
+            return rows
+        except Exception as e:
+            _mark("boards", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
+            raise
+
+    return _single_flight(key, _load, wait_timeout=ttl + 30)
 
 
 def fetch_minute(code: str, days: int = 1) -> pd.DataFrame:

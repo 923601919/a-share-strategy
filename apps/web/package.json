@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "sync-openapi": "node -e \"console.log('Run: python ../../scripts/export-openapi.py (from apps/api venv)')\""
   },
   "dependencies": {
     "next": "^14.2.5",

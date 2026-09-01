@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import { Suspense } from "react";
+import AppNav from "../components/AppNav";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -12,15 +13,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html lang="zh-CN">
       <body>
         <main>
-          <nav className="nav">
-            <div className="brand">
-              分时<span>雷达</span>
-            </div>
-            <Link href="/">选股</Link>
-            <Link href="/watch">跟踪</Link>
-            <Link href="/sim">模拟盘</Link>
-            <Link href="/review">复盘</Link>
-          </nav>
+          <Suspense fallback={<nav className="nav" />}>
+            <AppNav />
+          </Suspense>
           {children}
           <p className="footer-note">
             研究工具，非投资建议。规则参考公开短线方法论归纳，请人工确认分时形态。

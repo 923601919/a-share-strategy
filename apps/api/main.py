@@ -1,15 +1,38 @@
 from __future__ import annotations
 
 import logging
-from typing import Literal
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from config import settings
-from db import add_watch, get_track_returns, init_db, list_watchlist, list_watch_tracks, remove_watch
+from auth import (
+    admin_create_invite,
+    bootstrap_admin,
+    get_current_user,
+    login,
+    public_user,
+    register_with_invite,
+    require_admin,
+)
+from config import auth_is_required, settings
+from db import (
+    add_watch,
+    count_users,
+    get_track_returns_map,
+    init_db,
+    list_archived_watch_tracks,
+    list_invites,
+    list_watchlist,
+    remove_watch,
+)
 from ssl_fix import apply_ssl_fix
+from user_ctx import user_scope
 
 # 必须在首次请求东财前生效
 _SSL_MODE = apply_ssl_fix(insecure=not settings.ssl_verify)
@@ -33,11 +56,20 @@ from services.sim import (
 from services.track import (
     enrich_watch_item,
     expire_past_t3_watchlist,
-    refresh_track_returns,
+    run_watchlist_refresh,
+    WatchRefreshCancelled,
     watchlist_stats,
 )
 
-app = FastAPI(title="A-Share Strategy API", version="0.2.0")
+_docs = "/docs" if settings.docs_enabled else None
+_redoc = "/redoc" if settings.docs_enabled else None
+app = FastAPI(
+    title="A-Share Strategy API",
+    version="0.4.0",
+    docs_url=_docs,
+    redoc_url=_redoc,
+    openapi_url="/openapi.json" if settings.docs_enabled else None,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in settings.cors_origins.split(",") if o.strip()],
@@ -46,10 +78,38 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_AUTH_PUBLIC = {
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/bootstrap",
+    "/api/auth/status",
+}
+
+
+class ApiKeyMiddleware(BaseHTTPMiddleware):
+    """若配置了 API_KEY，则除公开路径外要求 X-API-Key。"""
+
+    async def dispatch(self, request: Request, call_next):
+        key = (settings.api_key or "").strip()
+        if not key:
+            return await call_next(request)
+        path = request.url.path or ""
+        if path in _AUTH_PUBLIC or path in ("/docs", "/openapi.json", "/redoc") or path.startswith("/docs"):
+            return await call_next(request)
+        got = request.headers.get("x-api-key") or request.headers.get("X-API-Key") or ""
+        if got != key:
+            return JSONResponse(status_code=401, content={"detail": "invalid or missing X-API-Key"})
+        return await call_next(request)
+
+
+app.add_middleware(ApiKeyMiddleware)
+
 
 @app.on_event("startup")
 def _startup() -> None:
     init_db()
+    job_store.mark_inflight_lost()
 
 
 class WatchIn(BaseModel):
@@ -71,6 +131,28 @@ class ScanIn(BaseModel):
     top_n: int | None = None
     board_top_n: int = 15
     mode: Literal["fenshi", "leader_dip"] = "fenshi"
+    # hot_only=现网；quota/soft=选股页测试 Tab
+    universe_policy: Literal["hot_only", "quota", "soft"] = "hot_only"
+
+
+class AuthLoginIn(BaseModel):
+    username: str
+    password: str
+
+
+class AuthRegisterIn(BaseModel):
+    username: str
+    password: str
+    invite_code: str
+
+
+class AuthBootstrapIn(BaseModel):
+    username: str
+    password: str
+
+
+class InviteCreateIn(BaseModel):
+    note: str = ""
 
 
 @app.get("/api/health")
@@ -83,12 +165,64 @@ def health():
         "ssl_mode": _SSL_MODE,
         "strategy_version": settings.strategy_version,
         "scan_use_isolated": settings.scan_use_isolated,
+        "scan_max_concurrent": settings.scan_max_concurrent,
+        "api_key_required": bool((settings.api_key or "").strip()),
+        "auth_required": auth_is_required(),
+        "bootstrap_available": auth_is_required() and count_users() == 0,
         "sources": sources,
     }
 
 
+@app.get("/api/auth/status")
+def auth_status():
+    return {
+        "auth_required": auth_is_required(),
+        "bootstrap_available": auth_is_required() and count_users() == 0,
+        "user_count": count_users(),
+    }
+
+
+@app.post("/api/auth/bootstrap")
+def auth_bootstrap(body: AuthBootstrapIn):
+    """首个管理员：仅在库中无用户时可用。"""
+    return bootstrap_admin(username=body.username, password=body.password)
+
+
+@app.post("/api/auth/register")
+def auth_register(body: AuthRegisterIn):
+    return register_with_invite(
+        username=body.username,
+        password=body.password,
+        invite_code=body.invite_code,
+    )
+
+
+@app.post("/api/auth/login")
+def auth_login(body: AuthLoginIn):
+    return login(username=body.username, password=body.password)
+
+
+@app.get("/api/auth/me")
+def auth_me(user: dict[str, Any] = Depends(get_current_user)):
+    return public_user(user)
+
+
+@app.post("/api/auth/invites")
+def auth_create_invite(
+    body: InviteCreateIn | None = None,
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    body = body or InviteCreateIn()
+    return admin_create_invite(created_by=int(admin["id"]), note=body.note)
+
+
+@app.get("/api/auth/invites")
+def auth_list_invites(admin: dict[str, Any] = Depends(require_admin)):
+    return {"items": list_invites()}
+
+
 @app.post("/api/scan")
-def scan(body: ScanIn | None = None):
+def scan(body: ScanIn | None = None, user: dict[str, Any] = Depends(get_current_user)):
     """同步扫描（兼容旧客户端）；前端请优先用 /api/scan/jobs。"""
     body = body or ScanIn()
     try:
@@ -100,6 +234,7 @@ def scan(body: ScanIn | None = None):
             top_n=body.top_n,
             board_top_n=body.board_top_n,
             mode=body.mode,
+            universe_policy=body.universe_policy,
         )
     except ScanCancelled:
         raise HTTPException(status_code=499, detail="cancelled") from None
@@ -108,73 +243,77 @@ def scan(body: ScanIn | None = None):
 
 
 @app.post("/api/scan/jobs")
-def start_scan_job(body: ScanIn | None = None):
+def start_scan_job(body: ScanIn | None = None, user: dict[str, Any] = Depends(get_current_user)):
     """异步扫描：立即返回 job_id，前端轮询进度。"""
     body = body or ScanIn()
     params = body.model_dump()
-    job = job_store.create("scan", params)
+    uid = int(user["id"])
+    job = job_store.create("scan", params, user_id=uid)
 
     def _run() -> None:
-        def on_progress(stage: str, progress: float, message: str) -> None:
-            job_store.update(
-                job.id,
-                stage=stage,
-                progress=progress,
-                message=message,
-                status="running",
-            )
+        with user_scope(uid):
+            def on_progress(stage: str, progress: float, message: str) -> None:
+                job_store.update(
+                    job.id,
+                    stage=stage,
+                    progress=progress,
+                    message=message,
+                    status="running",
+                )
 
-        try:
-            result = run_scan(
-                min_amount_yi=body.min_amount_yi,
-                min_pct=body.min_pct,
-                max_pct=body.max_pct,
-                session=body.session,
-                top_n=body.top_n,
-                board_top_n=body.board_top_n,
-                mode=body.mode,
-                on_progress=on_progress,
-                should_cancel=lambda: job_store.is_cancelled(job.id),
-            )
-            job_store.update(
-                job.id,
-                status="done",
-                stage="done",
-                progress=1.0,
-                message=f"完成，命中 {result.get('count', 0)} 只",
-                result=result,
-                timings=result.get("timings") or {},
-                error_code=result.get("error_code"),
-            )
-        except ScanCancelled:
-            job_store.update(
-                job.id,
-                status="cancelled",
-                stage="cancelled",
-                progress=1.0,
-                message="已取消",
-                error_code="cancelled",
-            )
+            try:
+                result = run_scan(
+                    min_amount_yi=body.min_amount_yi,
+                    min_pct=body.min_pct,
+                    max_pct=body.max_pct,
+                    session=body.session,
+                    top_n=body.top_n,
+                    board_top_n=body.board_top_n,
+                    mode=body.mode,
+                    universe_policy=body.universe_policy,
+                    on_progress=on_progress,
+                    should_cancel=lambda: job_store.is_cancelled(job.id),
+                )
+                job_store.update(
+                    job.id,
+                    status="done",
+                    stage="done",
+                    progress=1.0,
+                    message=f"完成，命中 {result.get('count', 0)} 只",
+                    result=result,
+                    timings=result.get("timings") or {},
+                    error_code=result.get("error_code"),
+                )
+            except ScanCancelled:
+                job_store.update(
+                    job.id,
+                    status="cancelled",
+                    stage="cancelled",
+                    progress=1.0,
+                    message="已取消",
+                    error_code="cancelled",
+                )
 
     job_store.run_in_background(job.id, _run)
     return job.to_public(include_result=False)
 
 
 @app.get("/api/scan/jobs/{job_id}")
-def get_scan_job(job_id: str):
-    job = job_store.get(job_id)
+def get_scan_job(job_id: str, user: dict[str, Any] = Depends(get_current_user)):
+    job = job_store.get(job_id, user_id=int(user["id"]))
     if not job:
         raise HTTPException(404, "job not found")
     return job.to_public(include_result=True)
 
 
 @app.post("/api/scan/jobs/{job_id}/cancel")
-def cancel_scan_job(job_id: str):
-    job = job_store.get(job_id)
+def cancel_scan_job(job_id: str, user: dict[str, Any] = Depends(get_current_user)):
+    uid = int(user["id"])
+    job = job_store.get(job_id, user_id=uid)
     if not job:
         raise HTTPException(404, "job not found")
-    ok = job_store.request_cancel(job_id)
-    job = job_store.get(job_id)
+    ok = job_store.request_cancel(job_id, user_id=uid)
+    job = job_store.get(job_id, user_id=uid)
     return {"ok": ok, **(job.to_public(include_result=False) if job else {})}
 
 
@@ -183,6 +322,7 @@ def get_watchlist(
     with_quotes: bool = Query(default=False),
     refresh_returns: bool = Query(default=False),
     with_risk: bool = Query(default=False, description="是否拉日线算异动（较慢）"),
+    user: dict[str, Any] = Depends(get_current_user),
 ):
     """默认快速返回库内自选；行情/收益刷新按需开启。超过 T+3 的条目会自动归档并移出。"""
     expired = expire_past_t3_watchlist(
@@ -205,9 +345,6 @@ def get_watchlist(
 
     out = []
     if refresh_returns and items:
-        # 收益刷新并行，避免串行日线
-        from concurrent.futures import ThreadPoolExecutor
-
         def _one(it: dict) -> dict:
             q = quotes.get(str(it["code"]).zfill(6), {}) or quotes.get(it["code"], {})
             try:
@@ -224,8 +361,9 @@ def get_watchlist(
                     },
                 }
 
+        ctx = copy_context()
         with ThreadPoolExecutor(max_workers=min(6, max(len(items), 1))) as pool:
-            out = list(pool.map(_one, items))
+            out = list(pool.map(lambda it: ctx.run(_one, it), items))
     else:
         for it in items:
             q = quotes.get(str(it["code"]).zfill(6), {}) or quotes.get(it["code"], {})
@@ -247,32 +385,120 @@ def get_watchlist(
     return {"items": out, "stats": watchlist_stats(), "expired": expired}
 
 
+@app.post("/api/watchlist/refresh/jobs")
+def start_watchlist_refresh_job(
+    with_quotes: bool = Query(default=True),
+    with_risk: bool = Query(default=True),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """异步刷新收益/现价/异动：立即返回 job_id，前端轮询进度。"""
+    params = {"with_quotes": with_quotes, "with_risk": with_risk}
+    uid = int(user["id"])
+    job = job_store.create("watch_refresh", params, user_id=uid)
+
+    def _run() -> None:
+        with user_scope(uid):
+            def on_progress(stage: str, progress: float, message: str) -> None:
+                job_store.update(
+                    job.id,
+                    stage=stage,
+                    progress=progress,
+                    message=message,
+                    status="running",
+                )
+
+            try:
+                result = run_watchlist_refresh(
+                    with_quotes=with_quotes,
+                    with_risk=with_risk,
+                    on_progress=on_progress,
+                    should_cancel=lambda: job_store.is_cancelled(job.id),
+                )
+                job_store.update(
+                    job.id,
+                    status="done",
+                    stage="done",
+                    progress=1.0,
+                    message=f"完成，自选 {len(result.get('items') or [])} 只",
+                    result=result,
+                )
+            except WatchRefreshCancelled:
+                job_store.update(
+                    job.id,
+                    status="cancelled",
+                    stage="cancelled",
+                    progress=1.0,
+                    message="已取消",
+                    error_code="cancelled",
+                )
+
+    job_store.run_in_background(job.id, _run)
+    return job.to_public(include_result=False)
+
+
+@app.get("/api/watchlist/refresh/jobs/{job_id}")
+def get_watchlist_refresh_job(job_id: str, user: dict[str, Any] = Depends(get_current_user)):
+    job = job_store.get(job_id, user_id=int(user["id"]))
+    if not job:
+        raise HTTPException(404, "job not found")
+    return job.to_public(include_result=True)
+
+
+@app.post("/api/watchlist/refresh/jobs/{job_id}/cancel")
+def cancel_watchlist_refresh_job(job_id: str, user: dict[str, Any] = Depends(get_current_user)):
+    uid = int(user["id"])
+    job = job_store.get(job_id, user_id=uid)
+    if not job:
+        raise HTTPException(404, "job not found")
+    ok = job_store.request_cancel(job_id, user_id=uid)
+    job = job_store.get(job_id, user_id=uid)
+    return {"ok": ok, **(job.to_public(include_result=False) if job else {})}
+
+
 @app.get("/api/watchlist/stats")
-def get_watchlist_stats():
+def get_watchlist_stats(user: dict[str, Any] = Depends(get_current_user)):
     return watchlist_stats()
 
 
 @app.get("/api/watchlist/history")
-def get_watchlist_history(limit: int = Query(default=100, le=500)):
-    tracks = list_watch_tracks(active_only=False, limit=limit)
+def get_watchlist_history(
+    limit: int = Query(default=100, le=500),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """纯本地库：归档快照 + 已落库 T+N，不打行情网。"""
+    tracks = list_archived_watch_tracks(limit=limit)
+    ret_by_id = get_track_returns_map([int(tr["id"]) for tr in tracks])
     rows = []
     for tr in tracks:
-        rets = get_track_returns(int(tr["id"]))
+        tid = int(tr["id"])
+        rets = ret_by_id.get(tid) or []
         if not rets:
-            rets = refresh_track_returns(tr, persist=True, force=False)
-        ret_map = {r["day_offset"]: r for r in rets}
+            snap = tr.get("completion_snapshot")
+            if isinstance(snap, dict):
+                snap_rets = snap.get("returns")
+                if isinstance(snap_rets, list):
+                    rets = snap_rets
+        ret_map = {
+            int(r["day_offset"]): r
+            for r in rets
+            if isinstance(r, dict) and r.get("day_offset") is not None
+        }
         rows.append(
             {
                 **tr,
+                "completion_snapshot": None,
                 "returns": rets,
-                "t3_return_pct": ret_map.get(3, {}).get("return_pct"),
+                "t3_return_pct": (ret_map.get(3) or {}).get("return_pct"),
+                "exit_price": tr.get("exit_price"),
+                "exit_return_pct": tr.get("exit_return_pct"),
+                "completion_reason": tr.get("completion_reason"),
             }
         )
     return {"items": rows, "stats": watchlist_stats()}
 
 
 @app.post("/api/watchlist")
-def post_watchlist(body: WatchIn):
+def post_watchlist(body: WatchIn, user: dict[str, Any] = Depends(get_current_user)):
     if not body.code.strip():
         raise HTTPException(400, "code required")
     code = body.code.strip().zfill(6)
@@ -280,7 +506,6 @@ def post_watchlist(body: WatchIn):
     entry_price = body.entry_price
     entry_pct = body.entry_pct
 
-    # 入池价强制用实时单票报价，避免扫描页演示价/脏价（常见差约一倍）写入跟踪
     try:
         q = (mkt.fetch_realtime_quotes([code]) or {}).get(code) or {}
     except Exception:
@@ -339,7 +564,7 @@ def post_watchlist(body: WatchIn):
 
 
 @app.delete("/api/watchlist/{code}")
-def delete_watchlist(code: str):
+def delete_watchlist(code: str, user: dict[str, Any] = Depends(get_current_user)):
     ok = remove_watch(code)
     if not ok:
         raise HTTPException(404, "not found")
@@ -352,7 +577,7 @@ class ReviewIn(BaseModel):
 
 
 @app.post("/api/review/run")
-def review_run(body: ReviewIn | None = None):
+def review_run(body: ReviewIn | None = None, user: dict[str, Any] = Depends(get_current_user)):
     body = body or ReviewIn()
     try:
         return run_daily_review(trade_date=body.trade_date, persist=body.persist)
@@ -361,7 +586,10 @@ def review_run(body: ReviewIn | None = None):
 
 
 @app.get("/api/review/latest")
-def review_latest(trade_date: str | None = Query(default=None)):
+def review_latest(
+    trade_date: str | None = Query(default=None),
+    user: dict[str, Any] = Depends(get_current_user),
+):
     data = get_review(trade_date)
     if not data:
         raise HTTPException(404, "暂无复盘，请先点击生成复盘")
@@ -369,17 +597,16 @@ def review_latest(trade_date: str | None = Query(default=None)):
 
 
 @app.get("/api/review/history")
-def review_history_api(limit: int = Query(default=20, le=60)):
+def review_history_api(
+    limit: int = Query(default=20, le=60),
+    user: dict[str, Any] = Depends(get_current_user),
+):
     return {"items": review_history(limit=limit)}
 
 
-# ---------- 模拟盘 ----------
-
-
 @app.get("/api/sim")
-def get_sim():
+def get_sim(user: dict[str, Any] = Depends(get_current_user)):
     try:
-        # 打开页面时顺带检查止盈止损是否已触发
         evaluate_orders()
         return sim_overview()
     except Exception as e:
@@ -387,7 +614,7 @@ def get_sim():
 
 
 @app.post("/api/sim/evaluate")
-def sim_evaluate():
+def sim_evaluate(user: dict[str, Any] = Depends(get_current_user)):
     try:
         filled = evaluate_orders()
         return {"evaluate": filled, **sim_overview()}
@@ -401,7 +628,7 @@ class SimSellIn(BaseModel):
 
 
 @app.post("/api/sim/sell")
-def sim_sell(body: SimSellIn):
+def sim_sell(body: SimSellIn, user: dict[str, Any] = Depends(get_current_user)):
     try:
         price = body.price
         if price is None or price <= 0:
@@ -427,7 +654,7 @@ class SimResetIn(BaseModel):
 
 
 @app.post("/api/sim/reset")
-def sim_reset(body: SimResetIn | None = None):
+def sim_reset(body: SimResetIn | None = None, user: dict[str, Any] = Depends(get_current_user)):
     body = body or SimResetIn()
     try:
         return reset_sim(body.initial_capital)

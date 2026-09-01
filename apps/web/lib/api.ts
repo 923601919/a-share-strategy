@@ -1,26 +1,108 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000";
+const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
+const DEFAULT_TIMEOUT_MS = 30_000;
+const SCAN_POLL_MAX_MS = 5 * 60_000;
+const TOKEN_KEY = "ashare_access_token";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    let detail = text || res.statusText;
-    try {
-      const j = JSON.parse(text);
-      if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
-    } catch {
-      /* keep raw */
-    }
-    throw new Error(detail);
+export class ApiError extends Error {
+  kind: "network" | "timeout" | "http" | "business";
+  status?: number;
+  code?: string | null;
+
+  constructor(
+    message: string,
+    opts?: { kind?: ApiError["kind"]; status?: number; code?: string | null }
+  ) {
+    super(message);
+    this.name = "ApiError";
+    this.kind = opts?.kind || "http";
+    this.status = opts?.status;
+    this.code = opts?.code;
   }
-  return res.json() as Promise<T>;
+}
+
+export function getAccessToken(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return localStorage.getItem(TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+export function setAccessToken(token: string | null) {
+  if (typeof window === "undefined") return;
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
+function redirectToLogin() {
+  if (typeof window === "undefined") return;
+  const path = window.location.pathname || "";
+  if (path.startsWith("/login")) return;
+  const next = encodeURIComponent(path + window.location.search);
+  window.location.href = `/login?next=${next}`;
+}
+
+async function request<T>(
+  path: string,
+  init?: RequestInit & { timeoutMs?: number; skipAuthRedirect?: boolean }
+): Promise<T> {
+  const timeoutMs = init?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const skipAuthRedirect = init?.skipAuthRedirect;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(init?.headers as Record<string, string> | undefined),
+  };
+  if (API_KEY) headers["X-API-Key"] = API_KEY;
+  const token = getAccessToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers,
+      cache: "no-store",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let detail = text || res.statusText;
+      try {
+        const j = JSON.parse(text);
+        if (j?.detail) detail = typeof j.detail === "string" ? j.detail : JSON.stringify(j.detail);
+      } catch {
+        /* keep raw */
+      }
+      if (res.status === 401 && !skipAuthRedirect && !path.startsWith("/api/auth/")) {
+        setAccessToken(null);
+        redirectToLogin();
+      }
+      throw new ApiError(detail, { kind: "http", status: res.status });
+    }
+    return res.json() as Promise<T>;
+  } catch (e: unknown) {
+    if (e instanceof ApiError) throw e;
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new ApiError(`请求超时（${Math.round(timeoutMs / 1000)}s）`, { kind: "timeout" });
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/Failed to fetch|NetworkError|fetch/i.test(msg)) {
+      throw new ApiError(
+        `网络失败或 CORS 被拒（API=${API_BASE}）。请确认后端已启动且 CORS_ORIGINS 包含当前前端地址。`,
+        { kind: "network" }
+      );
+    }
+    throw new ApiError(msg, { kind: "network" });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export type ScanItem = {
@@ -68,7 +150,7 @@ export type ScanResult = {
 export type ScanJob = {
   job_id: string;
   kind: string;
-  status: "queued" | "running" | "done" | "error" | "cancelled" | string;
+  status: "queued" | "running" | "done" | "error" | "cancelled" | "lost" | string;
   stage: string;
   progress: number;
   message: string;
@@ -86,6 +168,7 @@ export type ScanBody = {
   session?: string;
   top_n?: number;
   mode?: "fenshi" | "leader_dip";
+  universe_policy?: "hot_only" | "quota" | "soft";
 };
 
 export function scan(body?: ScanBody) {
@@ -119,6 +202,8 @@ const ERROR_HINTS: Record<string, string> = {
   universe_failed: "板块成分池拉取失败（网络或数据源）。稍后重试。",
   no_quotes: "没有拿到真实行情报价。",
   cancelled: "扫描已取消。",
+  lost: "服务重启，扫描任务已失效，请重新扫描。",
+  scan_timeout: "扫描超时，请稍后重试或缩小扫描范围。",
 };
 
 export function explainScanError(code?: string | null, fallback?: string) {
@@ -126,37 +211,57 @@ export function explainScanError(code?: string | null, fallback?: string) {
   return fallback || "扫描失败";
 }
 
-/** 异步扫描：轮询进度，可中止。 */
+/** 异步扫描：轮询进度，可中止；总时长上限默认 5 分钟。 */
 export async function scanWithProgress(
   body: ScanBody | undefined,
   opts: {
     onProgress?: (job: ScanJob) => void;
     shouldStop?: () => boolean;
     intervalMs?: number;
+    maxMs?: number;
   } = {}
 ): Promise<ScanResult> {
   const started = await startScanJob(body);
   const interval = opts.intervalMs ?? 800;
+  const maxMs = opts.maxMs ?? SCAN_POLL_MAX_MS;
+  const t0 = Date.now();
   while (true) {
+    if (Date.now() - t0 > maxMs) {
+      try {
+        await cancelScanJob(started.job_id);
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(`扫描超时（>${Math.round(maxMs / 1000)}s），已请求取消`, {
+        kind: "timeout",
+        code: "scan_timeout",
+      });
+    }
     if (opts.shouldStop?.()) {
       try {
         await cancelScanJob(started.job_id);
       } catch {
         /* ignore */
       }
-      throw new Error(explainScanError("cancelled"));
+      throw new ApiError(explainScanError("cancelled"), { kind: "business", code: "cancelled" });
     }
     const job = await getScanJob(started.job_id);
     opts.onProgress?.(job);
     if (job.status === "done") {
-      if (!job.result) throw new Error("扫描完成但无结果");
+      if (!job.result) throw new ApiError("扫描完成但无结果", { kind: "business" });
       return job.result;
     }
-    if (job.status === "cancelled") {
-      throw new Error(explainScanError("cancelled"));
+    if (job.status === "cancelled" || job.status === "lost") {
+      throw new ApiError(explainScanError(job.status === "lost" ? "lost" : "cancelled"), {
+        kind: "business",
+        code: job.status,
+      });
     }
     if (job.status === "error") {
-      throw new Error(explainScanError(job.error_code, job.error || job.message || "扫描失败"));
+      throw new ApiError(explainScanError(job.error_code, job.error || job.message || "扫描失败"), {
+        kind: "business",
+        code: job.error_code,
+      });
     }
     await new Promise((r) => setTimeout(r, interval));
   }
@@ -243,6 +348,127 @@ export function getWatchlist(opts?: {
 
 export function getWatchlistStats() {
   return request<WatchlistStats>("/api/watchlist/stats");
+}
+
+export type WatchHistoryItem = {
+  id: number;
+  code: string;
+  name: string;
+  source?: string;
+  note?: string;
+  entry_price?: number | null;
+  entry_pct?: number | null;
+  entry_score?: number | null;
+  created_at?: string;
+  removed_at?: string | null;
+  exit_price?: number | null;
+  exit_return_pct?: number | null;
+  completion_reason?: string | null;
+  completion_snapshot?: Record<string, unknown> | string | null;
+  returns?: WatchTrackDay[];
+  t3_return_pct?: number | null;
+};
+
+export function getWatchlistHistory(limit = 100) {
+  // 纯本地库，但默认超时仍给足余量，避免与扫描等长任务抢 worker 时误杀
+  return request<{ items: WatchHistoryItem[]; stats: WatchlistStats }>(
+    `/api/watchlist/history?limit=${limit}`,
+    { timeoutMs: 60_000 }
+  );
+}
+
+export type WatchRefreshJob = {
+  job_id: string;
+  kind: string;
+  status: "queued" | "running" | "done" | "error" | "cancelled" | "lost" | string;
+  stage: string;
+  progress: number;
+  message: string;
+  error?: string | null;
+  error_code?: string | null;
+  result?: WatchlistResponse;
+};
+
+export function startWatchRefreshJob(opts?: { with_quotes?: boolean; with_risk?: boolean }) {
+  const q = new URLSearchParams();
+  if (opts?.with_quotes === false) q.set("with_quotes", "false");
+  if (opts?.with_risk === false) q.set("with_risk", "false");
+  const qs = q.toString();
+  return request<WatchRefreshJob>(`/api/watchlist/refresh/jobs${qs ? `?${qs}` : ""}`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+export function getWatchRefreshJob(jobId: string) {
+  return request<WatchRefreshJob>(`/api/watchlist/refresh/jobs/${jobId}`);
+}
+
+export function cancelWatchRefreshJob(jobId: string) {
+  return request<{ ok: boolean } & WatchRefreshJob>(`/api/watchlist/refresh/jobs/${jobId}/cancel`, {
+    method: "POST",
+    body: "{}",
+  });
+}
+
+/** 异步刷新收益/异动：轮询进度，可中止。 */
+export async function refreshWatchlistWithProgress(
+  opts: {
+    with_quotes?: boolean;
+    with_risk?: boolean;
+    onProgress?: (job: WatchRefreshJob) => void;
+    shouldStop?: () => boolean;
+    intervalMs?: number;
+    maxMs?: number;
+  } = {}
+): Promise<WatchlistResponse> {
+  const started = await startWatchRefreshJob({
+    with_quotes: opts.with_quotes !== false,
+    with_risk: opts.with_risk !== false,
+  });
+  const interval = opts.intervalMs ?? 600;
+  const maxMs = opts.maxMs ?? SCAN_POLL_MAX_MS;
+  const t0 = Date.now();
+  while (true) {
+    if (Date.now() - t0 > maxMs) {
+      try {
+        await cancelWatchRefreshJob(started.job_id);
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError(`刷新超时（>${Math.round(maxMs / 1000)}s），已请求取消`, {
+        kind: "timeout",
+        code: "watch_refresh_timeout",
+      });
+    }
+    if (opts.shouldStop?.()) {
+      try {
+        await cancelWatchRefreshJob(started.job_id);
+      } catch {
+        /* ignore */
+      }
+      throw new ApiError("已取消刷新", { kind: "business", code: "cancelled" });
+    }
+    const job = await getWatchRefreshJob(started.job_id);
+    opts.onProgress?.(job);
+    if (job.status === "done") {
+      if (!job.result) throw new ApiError("刷新完成但无结果", { kind: "business" });
+      return job.result;
+    }
+    if (job.status === "cancelled" || job.status === "lost") {
+      throw new ApiError(
+        job.status === "lost" ? "服务重启，刷新任务已失效" : "已取消刷新",
+        { kind: "business", code: job.status }
+      );
+    }
+    if (job.status === "error") {
+      throw new ApiError(job.error || job.message || "刷新失败", {
+        kind: "business",
+        code: job.error_code,
+      });
+    }
+    await new Promise((r) => setTimeout(r, interval));
+  }
 }
 
 export function addWatch(payload: {
@@ -365,6 +591,8 @@ export type SimPosition = {
   unrealized_pnl?: number;
   unrealized_pct?: number;
   quote_pct?: number;
+  t1_sellable?: boolean;
+  t1_lock_reason?: string | null;
 };
 
 export type SimOrder = {
@@ -447,6 +675,79 @@ export function resetSim(initial_capital?: number) {
     method: "POST",
     body: JSON.stringify({ initial_capital }),
   });
+}
+
+export type AuthUser = {
+  id: number;
+  username: string;
+  role: string;
+  created_at?: string;
+};
+
+export type AuthSession = {
+  access_token: string;
+  token_type: string;
+  user: AuthUser;
+};
+
+export function getAuthStatus() {
+  return request<{
+    auth_required: boolean;
+    bootstrap_available: boolean;
+    user_count: number;
+  }>("/api/auth/status", { skipAuthRedirect: true });
+}
+
+export function login(username: string, password: string) {
+  return request<AuthSession>("/api/auth/login", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+    skipAuthRedirect: true,
+  });
+}
+
+export function register(username: string, password: string, invite_code: string) {
+  return request<AuthSession>("/api/auth/register", {
+    method: "POST",
+    body: JSON.stringify({ username, password, invite_code }),
+    skipAuthRedirect: true,
+  });
+}
+
+export function bootstrapAdmin(username: string, password: string) {
+  return request<AuthSession>("/api/auth/bootstrap", {
+    method: "POST",
+    body: JSON.stringify({ username, password }),
+    skipAuthRedirect: true,
+  });
+}
+
+export function getMe() {
+  return request<AuthUser>("/api/auth/me");
+}
+
+export function createInvite(note = "") {
+  return request<{ code: string; created_at: string; note: string }>("/api/auth/invites", {
+    method: "POST",
+    body: JSON.stringify({ note }),
+  });
+}
+
+export function listInvites() {
+  return request<{
+    items: Array<{
+      code: string;
+      created_by: number | null;
+      created_at: string;
+      used_by: number | null;
+      used_at: string | null;
+      note: string;
+    }>;
+  }>("/api/auth/invites");
+}
+
+export function logout() {
+  setAccessToken(null);
 }
 
 export { API_BASE };
