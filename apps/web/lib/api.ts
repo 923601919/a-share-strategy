@@ -1,4 +1,5 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000";
+// 同源相对路径（空串）或绝对地址；?? 而非 ||，避免空串被回退成默认值
+const API_BASE = (process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000").replace(/\/+$/, "");
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 const DEFAULT_TIMEOUT_MS = 30_000;
 const SCAN_POLL_MAX_MS = 5 * 60_000;

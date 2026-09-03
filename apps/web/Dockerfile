@@ -6,8 +6,8 @@ COPY apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci
 
 COPY apps/web/ ./
-# 浏览器直连 API；SSH 隧道下 127.0.0.1:8000 即隧穿到服务器后端
-ARG NEXT_PUBLIC_API_BASE=http://127.0.0.1:8000
+# 经 Nginx 反代同源访问 API：空串=同源相对路径（任意 IP/域名通用，零 CORS）
+ARG NEXT_PUBLIC_API_BASE=""
 ENV NEXT_PUBLIC_API_BASE=$NEXT_PUBLIC_API_BASE
 RUN npm run build
 
