@@ -135,6 +135,60 @@ class Settings(BaseSettings):
     ld_tail_score: float = 10.0
     leader_dip_hot_board_bonus: float = 8.0
 
+    # ===== 选股层（耀式漏斗：情绪 / 板块生命周期 / 龙头分层）=====
+    # 情绪温度计：默认提示级（不改硬闸门）；soft_adjust 仅修正「指数横盘但千股下跌 / 亢奋日浅回调」两类反例
+    sentiment_enabled: bool = True
+    sentiment_as_gate: bool = False  # True 时冰点对进攻型升级为硬暂停（需影子验证后再开）
+    sentiment_soft_adjust: bool = True
+    sentiment_zt_ice: int = 30  # 涨停家数低于此 + 晋级弱 + 炸板高 → 冰点/退潮
+    sentiment_zt_euphoria: int = 80
+    sentiment_lianban_euphoria: int = 5
+    sentiment_promotion_ice: float = 0.20  # 晋级率
+    sentiment_zhaban_ice: float = 0.40  # 炸板率
+    sentiment_down_ice: int = 3500  # 下跌家数代理（缺涨停数据时）
+    # 板块生命周期：乘在热门加分上。历史不足 N 日时系数取 1.0
+    sector_life_enabled: bool = True
+    sector_life_lookback: int = 5
+    sector_life_min_history: int = 5
+    sector_life_first_day: float = 0.6
+    sector_life_day2: float = 1.0
+    sector_life_persistent: float = 1.2
+    sector_hot_board_bonus: float = 8.0  # 进攻型热门基础加分（低吸/软加权仍用各自 bonus）
+    sector_first_day_attack_penalty: float = 5.0  # 首日板块进攻型额外降权
+    # 龙头分层
+    leader_layer_enabled: bool = True
+    leader_zt_lookback: int = 10
+    leader_zt_min_count: int = 2
+    leader_lianban_min: int = 2
+    leader_zt_bonus: float = 10.0
+    leader_board_top_n: int = 3
+    leader_board_rank_bonus: float = 5.0
+    leader_ths_bonus: float = 5.0
+    follower_penalty: float = 10.0  # 连续活跃板块里的无龙头特征补涨票
+    # 套牢盘代理（提示级；进攻型降权）
+    trapped_enabled: bool = True
+    trapped_lookback: int = 60
+    trapped_warn_ratio: float = 0.40
+    trapped_penalty: float = 8.0
+    # 企稳次日确认
+    dip_confirm_bonus: float = 8.0
+    # 炸板 / 逐波量能
+    wave_vol_enabled: bool = True
+    wave_vol_bonus: float = 8.0
+    wave_vol_penalty: float = 10.0
+    zhaban_enabled: bool = True
+    zhaban_benign_bonus: float = 8.0
+    zhaban_weak_penalty: float = 12.0
+    # 涨停/大涨票次日铁律
+    iron_rule_enabled: bool = True
+    iron_rule_big_pct: float = 7.0  # 收盘涨幅达此视为大涨票
+    iron_rule_high_throw_pct: float = 6.0
+    iron_rule_weak_open_pct: float = -2.0
+    iron_rule_strong_open_pct: float = 3.0
+    iron_rule_seal_deadline: str = "10:30"
+    # 监管日历：临近出监管且无新异动 → 观察池而非一刀切 block
+    regulatory_watch_days: int = 3
+
     # ===== 大盘环境闸门 =====
     # 指数暴跌日普跌，逆势拉升分时次日易低开补跌，需整体降级/观望
     market_env_enabled: bool = True
@@ -152,7 +206,7 @@ class Settings(BaseSettings):
     daily_cache_intraday_ttl: float = 1800.0  # 盘中日线缓存秒数（最后一根K会变）
 
     # 策略/软件版本（复盘可回溯）
-    strategy_version: str = "2026.09.02-macro"
+    strategy_version: str = "2026.09.03-funnel"
     scan_use_isolated: bool = True  # 危险行情路径走子进程（全市场快照）
     sector_universe_use_isolated: bool = False  # 新浪板块走子进程易超时，默认进程内
     # 超时后线程可能空转：热点路径优先子进程硬杀

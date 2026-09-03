@@ -14,14 +14,24 @@ from providers import market as mkt
 from rules.fenshi import (
     apply_chase_penalty,
     apply_day_vol_and_false_push,
+    apply_zhaban,
     day_volume_health,
     detect_false_push,
+    detect_zhaban,
     in_attack_window,
     score_leader_dip,
     score_offensive_fenshi,
     session_allowed,
 )
 from rules.risk import anomaly_30d_pct, is_excluded_board, risk_flags
+from rules.selection import (
+    apply_selection_adjustments,
+    best_sector_life,
+    board_rank_top_codes,
+    finalize_trapped_and_dip,
+    sector_lifecycle_map,
+)
+from rules.sentiment import classify_sentiment
 
 
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
@@ -109,6 +119,26 @@ def _short_minute_reason(minute, minute_err, *, now: datetime | None = None) -> 
     return "分时数据不足，使用盘口代理打分"
 
 
+def _classify_from_breadth(breadth: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not breadth:
+        return None
+    return classify_sentiment(
+        zt_count=breadth.get("zt_count"),
+        dt_count=breadth.get("dt_count"),
+        zhaban_rate=breadth.get("zhaban_rate"),
+        max_lianban=breadth.get("max_lianban"),
+        promotion_rate=breadth.get("promotion_rate"),
+        n_up=breadth.get("n_up"),
+        n_down=breadth.get("n_down"),
+        zt_ice=settings.sentiment_zt_ice,
+        zt_euphoria=settings.sentiment_zt_euphoria,
+        lianban_euphoria=settings.sentiment_lianban_euphoria,
+        promotion_ice=settings.sentiment_promotion_ice,
+        zhaban_ice=settings.sentiment_zhaban_ice,
+        down_ice=settings.sentiment_down_ice,
+    )
+
+
 def _market_env(
     *, force_index: str | None = None
 ) -> dict[str, Any]:
@@ -117,10 +147,24 @@ def _market_env(
     warn：上证跌幅达 warn_pct -> 结果分数折减 + 前端风险横幅。
     block：上证跌幅达 block_pct -> 进攻型观望（直接空结果）。
     拉取失败静默降级为 normal（不阻塞扫描，note 里标注）。
+    情绪温度计默认只作提示层；硬闸门仍由指数决定（sentiment_as_gate 可升级）。
     """
     ref = force_index or settings.market_env_ref_index
+    sentiment = None
+    if settings.sentiment_enabled:
+        try:
+            sentiment = _classify_from_breadth(mkt.fetch_market_breadth())
+        except Exception:
+            sentiment = None
+
     if not settings.market_env_enabled or settings.demo_mode:
-        return {"level": "normal", "ref_index": ref, "pct": None, "note": "演示模式未接入大盘"}
+        return {
+            "level": "normal",
+            "ref_index": ref,
+            "pct": None,
+            "note": "演示模式未接入大盘",
+            "sentiment": sentiment,
+        }
     try:
         snap = mkt.fetch_index_snapshot([ref])
     except Exception:
@@ -128,7 +172,13 @@ def _market_env(
     idx = snap.get(ref) or {}
     pct = idx.get("pct")
     if pct is None:
-        return {"level": "normal", "ref_index": ref, "pct": None, "note": "大盘快照不可用，跳过环境闸门"}
+        return {
+            "level": "normal",
+            "ref_index": ref,
+            "pct": None,
+            "note": "大盘快照不可用，跳过环境闸门",
+            "sentiment": sentiment,
+        }
     level = "normal"
     if pct <= settings.market_env_block_pct:
         level = "block"
@@ -140,6 +190,7 @@ def _market_env(
         "ref_name": idx.get("name"),
         "pct": round(float(pct), 2),
         "note": "",
+        "sentiment": sentiment,
     }
 
 
@@ -357,12 +408,103 @@ def _apply_quota_top(
     return picked[:top_n]
 
 
+def _build_sel_ctx(
+    *,
+    hot_boards: list[dict[str, Any]],
+    universe_sectors: list[dict[str, Any]],
+    board_tags: dict[str, list[str]],
+    rows: list[dict[str, Any]],
+    spot: Any,
+) -> dict[str, Any]:
+    """板块生命周期 + 龙头分层上下文（失败降级为空，不阻断扫描）。"""
+    today = datetime.now().date().isoformat()
+    life_map: dict[str, dict[str, Any]] = {}
+    try:
+        from db import list_confirmed_dip_codes, list_sector_history, upsert_sector_daily
+
+        board_rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for b in list(universe_sectors) + list(hot_boards):
+            name = str(b.get("name") or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            board_rows.append(b)
+        upsert_sector_daily(today, board_rows)
+        hist_rows = list_sector_history(settings.sector_life_lookback + 3)
+        by_date: dict[str, set[str]] = {}
+        up_by_date: dict[str, dict[str, int]] = {}
+        for r in hist_rows:
+            d = str(r.get("trade_date") or "")
+            nm = str(r.get("name") or "")
+            if not d or not nm:
+                continue
+            by_date.setdefault(d, set()).add(nm)
+            if r.get("up_count") is not None:
+                up_by_date.setdefault(d, {})[nm] = int(r.get("up_count") or 0)
+        dated = list(by_date.items())
+        current_names = list(seen)
+        dates_sorted = sorted(by_date.keys(), reverse=True)
+        today_up = {
+            str(b.get("name")): int(b.get("up_count") or 0)
+            for b in hot_boards
+            if b.get("name") and b.get("up_count") is not None
+        }
+        prev_date = None
+        if dates_sorted:
+            prev_date = dates_sorted[1] if dates_sorted[0] == today and len(dates_sorted) > 1 else (
+                dates_sorted[0] if dates_sorted[0] != today else None
+            )
+        life_map = sector_lifecycle_map(
+            current_names,
+            dated,
+            today=today,
+            min_history_dates=settings.sector_life_min_history,
+            first_day=settings.sector_life_first_day,
+            day2=settings.sector_life_day2,
+            persistent=settings.sector_life_persistent,
+            up_count_by_name=today_up,
+            prev_up_count_by_name=up_by_date.get(prev_date or "") or {},
+        )
+        for s in universe_sectors:
+            info = life_map.get(str(s.get("name") or ""))
+            if info:
+                s["consecutive"] = info.get("consecutive")
+                s["life_coeff"] = info.get("coefficient")
+                s["life_note"] = info.get("note")
+        confirmed = list_confirmed_dip_codes()
+    except Exception:
+        confirmed = set()
+
+    pct_map: dict[str, float] = {}
+    try:
+        if spot is not None and not getattr(spot, "empty", True):
+            for rec in spot.to_dict(orient="records"):
+                pct_map[str(rec.get("code") or "").zfill(6)] = float(rec.get("pct") or 0)
+    except Exception:
+        pass
+    for r in rows:
+        pct_map[str(r.get("code") or "").zfill(6)] = float(r.get("pct") or 0)
+    try:
+        top3 = board_rank_top_codes(pct_map, board_tags, top_n=settings.leader_board_top_n)
+    except Exception:
+        top3 = set()
+    leader_names = {str(b.get("leader") or "").strip() for b in hot_boards if str(b.get("leader") or "").strip()}
+    return {
+        "life_map": life_map,
+        "board_top3": top3,
+        "leader_names": leader_names,
+        "confirmed_dip": confirmed,
+    }
+
+
 def _enrich_one(
     row: dict[str, Any],
     board_tags: dict[str, list[str]],
     *,
     mode: ScanMode = "fenshi",
     universe_policy: UniversePolicy = "hot_only",
+    sel_ctx: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     code = str(row["code"]).zfill(6)
     name = str(row["name"])
@@ -380,7 +522,7 @@ def _enrich_one(
                 minute_err = e
                 minute = None
             try:
-                daily = mkt.fetch_daily(code, limit=40)
+                daily = mkt.fetch_daily(code, limit=60)
             except Exception:
                 daily = None
     except Exception as e:
@@ -444,6 +586,20 @@ def _enrich_one(
                 day_low=float(row.get("low") or 0),
                 vwap=fenshi.get("vwap"),
             )
+        if settings.zhaban_enabled:
+            pre = float(row.get("pre_close") or 0)
+            if pre <= 0 and daily is not None and "close" in getattr(daily, "columns", []):
+                try:
+                    closes = [float(x or 0) for x in list(daily["close"])]
+                    if len(closes) >= 2:
+                        pre = closes[-2] if closes[-2] > 0 else closes[-1]
+                    elif closes:
+                        pre = closes[-1]
+                except Exception:
+                    pre = 0.0
+            if pre > 0:
+                zb = detect_zhaban(minute, pre_close=pre, code=code, name=name)
+                fenshi = apply_zhaban(fenshi, zb)
 
     risk = risk_flags(
         anom["pct_from_low"],
@@ -452,6 +608,10 @@ def _enrich_one(
         open_price=float(row.get("open") or 0),
         warn=settings.anomaly_warn_pct,
         block=settings.anomaly_block_pct,
+        days_to_regulatory_exit=anom.get("days_to_regulatory_exit"),
+        new_anomaly_recent=bool(anom.get("new_anomaly_recent")),
+        regulatory_window_end=anom.get("regulatory_window_end"),
+        watch_days=settings.regulatory_watch_days,
     )
     if risk["level"] == "block":
         return None
@@ -461,15 +621,50 @@ def _enrich_one(
     in_hot = bool(tags)
     if tags:
         reasons.insert(0, f"强势板块: {', '.join(tags[:2])}")
-        if mode == "leader_dip" or universe_policy == "soft":
-            bonus = (
-                settings.soft_hot_board_bonus
-                if universe_policy == "soft"
-                else settings.leader_dip_hot_board_bonus
-            )
-            fenshi["score"] = min(settings.fenshi_score_cap, float(fenshi.get("score") or 0) + bonus)
-            if universe_policy == "soft" and mode == "fenshi":
-                reasons.append(f"热门板块加权+{bonus:g}")
+
+    ctx = sel_ctx or {}
+    life = best_sector_life(tags, ctx.get("life_map") or {}) if settings.sector_life_enabled else None
+    hot_base = 0.0
+    if tags:
+        if universe_policy == "soft":
+            hot_base = settings.soft_hot_board_bonus
+        elif mode == "leader_dip":
+            hot_base = settings.leader_dip_hot_board_bonus
+        elif settings.sector_life_enabled:
+            hot_base = settings.sector_hot_board_bonus
+    adj = apply_selection_adjustments(
+        score=float(fenshi.get("score") or 0),
+        reasons=reasons,
+        code=code,
+        name=name,
+        pct=float(row.get("pct") or 0),
+        daily=daily,
+        tags=tags,
+        mode=mode,
+        score_cap=settings.fenshi_score_cap,
+        life=life,
+        in_board_top=code in (ctx.get("board_top3") or set()),
+        is_ths_leader=name in (ctx.get("leader_names") or set()),
+        confirmed_dip=code in (ctx.get("confirmed_dip") or set()),
+        hot_bonus_base=hot_base,
+        zt_lookback=settings.leader_zt_lookback,
+        zt_min_count=settings.leader_zt_min_count,
+        lianban_min=settings.leader_lianban_min,
+        zt_bonus=settings.leader_zt_bonus,
+        rank_bonus=settings.leader_board_rank_bonus,
+        ths_bonus=settings.leader_ths_bonus,
+        follower_penalty=settings.follower_penalty,
+        first_day_attack_penalty=settings.sector_first_day_attack_penalty,
+        trapped_ratio_warn=settings.trapped_warn_ratio,
+        trapped_penalty=settings.trapped_penalty,
+        trapped_lookback=settings.trapped_lookback,
+        dip_confirm_bonus=settings.dip_confirm_bonus,
+        leader_layer_enabled=settings.leader_layer_enabled,
+        trapped_enabled=settings.trapped_enabled,
+    )
+    adj = finalize_trapped_and_dip(adj, price=float(row.get("price") or 0), daily=daily)
+    fenshi["score"] = adj["score"]
+    reasons = list(adj.get("reasons") or reasons)
 
     # 进攻型分时：非回踩再攻/强势推升形态降权
     if (
@@ -493,10 +688,19 @@ def _enrich_one(
         "in_hot_board": in_hot,
         "board_tags": tags,
         "reasons": reasons,
+        "selection": {
+            "tags": adj.get("tags") or [],
+            "zt": adj.get("zt") or {},
+            "trapped_ratio": adj.get("trapped_ratio"),
+            "life": adj.get("life"),
+            "coeff": adj.get("coeff"),
+        },
         "risk": {
             **risk,
             "anomaly_pct": anom["pct_from_low"],
             "ma5": anom.get("ma5"),
+            "days_to_regulatory_exit": anom.get("days_to_regulatory_exit"),
+            "regulatory_window_end": anom.get("regulatory_window_end"),
         },
         "fenshi": {
             "above_vwap": fenshi.get("above_vwap"),
@@ -513,6 +717,8 @@ def _enrich_one(
             "day_position": fenshi.get("day_position"),
             "vwap_deviation": fenshi.get("vwap_deviation"),
             "chase_penalty": fenshi.get("chase_penalty"),
+            "wave_volume": fenshi.get("wave_volume"),
+            "zhaban": fenshi.get("zhaban"),
         },
     }
 
@@ -631,13 +837,29 @@ def run_scan(
         mode_label += "·软加权测试"
     session_note = f"{mode_label} · {session_note}"
 
-    # 大盘环境闸门：指数暴跌日整体降级/观望
+    # 大盘环境闸门：指数暴跌日整体降级/观望；情绪默认提示级
     market_env = _market_env()
-    if market_env.get("level") == "block":
-        session_note += (
-            f" · 大盘环境观望（{market_env.get('ref_name') or market_env.get('ref_index')}"
-            f" {market_env.get('pct'):+.2f}% ≤ {settings.market_env_block_pct}%，进攻型暂停）"
-        )
+    sent = market_env.get("sentiment") or {}
+    ice = bool(sent.get("ice"))
+    euphoria = bool(sent.get("euphoria"))
+    if sent.get("label"):
+        temp = sent.get("temperature")
+        extra = f"{temp:g}" if isinstance(temp, (int, float)) else ""
+        session_note += f" · 情绪{sent.get('label')}" + (f" {extra}" if extra else "")
+        if sent.get("hint"):
+            session_note += f"（{sent.get('hint')}）"
+
+    block_scan = market_env.get("level") == "block"
+    if settings.sentiment_as_gate and ice and mode == "fenshi":
+        block_scan = True
+        session_note += " · 情绪冰点硬闸门，进攻型暂停"
+
+    if block_scan:
+        if market_env.get("level") == "block" and market_env.get("pct") is not None:
+            session_note += (
+                f" · 大盘环境观望（{market_env.get('ref_name') or market_env.get('ref_index')}"
+                f" {market_env.get('pct'):+.2f}% ≤ {settings.market_env_block_pct}%，进攻型暂停）"
+            )
         payload = _empty_scan_payload(
             session_note=session_note,
             spot_source="skipped",
@@ -655,15 +877,24 @@ def run_scan(
         payload["timings"] = timings
         return payload
     elif market_env.get("level") == "warn":
+        skip_haircut = bool(settings.sentiment_soft_adjust and euphoria)
         session_note += (
             f" · 大盘偏弱（{market_env.get('ref_name') or market_env.get('ref_index')}"
-            f" {market_env.get('pct'):+.2f}%，分数已折减至 {settings.market_env_score_factor:g}）"
+            f" {market_env.get('pct'):+.2f}%"
+            + (
+                "，情绪亢奋未折分"
+                if skip_haircut
+                else f"，分数已折减至 {settings.market_env_score_factor:g}"
+            )
+            + "）"
         )
     elif market_env.get("pct") is not None:
         session_note += (
             f" · 大盘（{market_env.get('ref_name') or market_env.get('ref_index')}"
             f" {market_env.get('pct'):+.2f}%）"
         )
+        if settings.sentiment_soft_adjust and ice and mode == "fenshi":
+            session_note += f" · 情绪冰点提示级折分×{settings.market_env_score_factor:g}"
 
     hot_boards: list[dict[str, Any]] = []
     universe_sectors: list[dict[str, Any]] = []
@@ -849,6 +1080,14 @@ def run_scan(
                 if code in universe_codes and code not in board_tags:
                     board_tags[code] = board_tags.get(code) or ["强势板块"]
 
+        sel_ctx = _build_sel_ctx(
+            hot_boards=hot_boards,
+            universe_sectors=universe_sectors,
+            board_tags=board_tags,
+            rows=rows,
+            spot=spot,
+        )
+
         results: list[dict[str, Any]] = []
         timed_out = 0
         total = max(len(rows), 1)
@@ -865,6 +1104,7 @@ def run_scan(
                 board_tags,
                 mode=mode,
                 universe_policy=universe_policy,
+                sel_ctx=sel_ctx,
             )
             for r in rows
         ]
@@ -902,8 +1142,16 @@ def run_scan(
         if timed_out:
             session_note += f" · {timed_out}只分时超时已跳过"
 
-        # 大盘偏弱：对进攻型分数整体折减（龙头低吸是低吸逻辑，不做折减）
-        if market_env.get("level") == "warn" and mode == "fenshi":
+        # 大盘偏弱 / 情绪冰点：对进攻型分数整体折减（龙头低吸不做折减）
+        apply_factor = mode == "fenshi" and (
+            (market_env.get("level") == "warn" and not (settings.sentiment_soft_adjust and euphoria))
+            or (
+                settings.sentiment_soft_adjust
+                and ice
+                and market_env.get("level") == "normal"
+            )
+        )
+        if apply_factor:
             factor = float(settings.market_env_score_factor)
             for x in results:
                 x["score"] = round(float(x.get("score") or 0) * factor, 1)
@@ -1087,7 +1335,7 @@ def watchlist_quotes(
 
     def _risk_one(base: dict[str, Any]) -> dict[str, Any]:
         try:
-            daily = mkt.fetch_daily(base["code"], limit=40)
+            daily = mkt.fetch_daily(base["code"], limit=60)
             anom = anomaly_30d_pct(daily)
             risk = risk_flags(
                 anom["pct_from_low"],
@@ -1096,6 +1344,10 @@ def watchlist_quotes(
                 open_price=base["open"] or anom.get("last_open"),
                 warn=settings.anomaly_warn_pct,
                 block=settings.anomaly_block_pct,
+                days_to_regulatory_exit=anom.get("days_to_regulatory_exit"),
+                new_anomaly_recent=bool(anom.get("new_anomaly_recent")),
+                regulatory_window_end=anom.get("regulatory_window_end"),
+                watch_days=settings.regulatory_watch_days,
             )
             base["risk"] = {**risk, "anomaly_pct": anom["pct_from_low"], "ma5": anom.get("ma5")}
         except Exception as e:

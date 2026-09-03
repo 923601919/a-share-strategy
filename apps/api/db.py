@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from config import settings
-from user_ctx import require_user_id
+from user_ctx import get_user_id, require_user_id
 
 
 def _connect() -> sqlite3.Connection:
@@ -204,6 +204,15 @@ def init_db() -> None:
                 year INTEGER PRIMARY KEY,
                 dates TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sector_daily (
+                trade_date TEXT NOT NULL,
+                name TEXT NOT NULL,
+                pct REAL,
+                up_count INTEGER,
+                leader TEXT,
+                PRIMARY KEY (trade_date, name)
             );
             """
         )
@@ -969,6 +978,76 @@ def list_daily_reviews(limit: int = 30) -> list[dict[str, Any]]:
             (uid, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def upsert_sector_daily(trade_date: str, boards: list[dict[str, Any]]) -> None:
+    """全市场板块日榜（无用户隔离，供生命周期计算）。"""
+    if not trade_date or not boards:
+        return
+    with get_db() as conn:
+        for b in boards:
+            name = str(b.get("name") or "").strip()
+            if not name:
+                continue
+            conn.execute(
+                """
+                INSERT INTO sector_daily(trade_date, name, pct, up_count, leader)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(trade_date, name) DO UPDATE SET
+                    pct=excluded.pct,
+                    up_count=excluded.up_count,
+                    leader=excluded.leader
+                """,
+                (
+                    trade_date,
+                    name,
+                    float(b.get("pct") or 0),
+                    int(b.get("up_count") or 0) if b.get("up_count") is not None else None,
+                    str(b.get("leader") or "") or None,
+                ),
+            )
+
+
+def list_sector_history(lookback_dates: int = 8) -> list[dict[str, Any]]:
+    with get_db() as conn:
+        dates = conn.execute(
+            """
+            SELECT DISTINCT trade_date FROM sector_daily
+            ORDER BY trade_date DESC LIMIT ?
+            """,
+            (lookback_dates,),
+        ).fetchall()
+        if not dates:
+            return []
+        date_list = [str(r["trade_date"]) for r in dates]
+        placeholders = ",".join("?" * len(date_list))
+        rows = conn.execute(
+            f"SELECT trade_date, name, pct, up_count, leader FROM sector_daily WHERE trade_date IN ({placeholders})",
+            date_list,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_confirmed_dip_codes() -> set[str]:
+    """T+1 收盘高于入池价的龙头低吸票，作为企稳确认集合。"""
+    uid = get_user_id()
+    if uid is None:
+        return set()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT t.code
+            FROM watch_tracks t
+            JOIN watch_track_returns r ON r.track_id = t.id
+            WHERE t.user_id=?
+              AND IFNULL(t.source,'') IN ('longtou', 'leader_dip')
+              AND r.day_offset = 1
+              AND r.return_pct IS NOT NULL
+              AND r.return_pct > 0
+            """,
+            (uid,),
+        ).fetchall()
+    return {str(r["code"]).zfill(6) for r in rows}
 
 
 # ---------- 模拟盘 ----------

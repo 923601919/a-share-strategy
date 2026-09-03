@@ -116,12 +116,21 @@ export type ScanItem = {
   score: number;
   in_hot_board: boolean;
   reasons: string[];
+  selection?: {
+    tags?: string[];
+    zt?: { zt_count?: number; max_lianban?: number; leader_candidate?: boolean };
+    trapped_ratio?: number | null;
+    life?: { name?: string; consecutive?: number; coefficient?: number; note?: string } | null;
+    coeff?: number;
+  };
   risk: {
     level: string;
     messages: string[];
     anomaly_progress?: number;
     anomaly_pct?: number;
     ma5?: number;
+    days_to_regulatory_exit?: number | null;
+    regulatory_window_end?: string | null;
   };
   fenshi: Record<string, unknown>;
 };
@@ -132,6 +141,15 @@ export type MarketEnv = {
   ref_name?: string;
   pct?: number | null;
   note?: string;
+  sentiment?: {
+    phase?: string;
+    label?: string;
+    hint?: string;
+    temperature?: number;
+    ice?: boolean;
+    euphoria?: boolean;
+    metrics?: Record<string, number | null>;
+  } | null;
 };
 
 export type ScanResult = {
@@ -146,7 +164,7 @@ export type ScanResult = {
     strong_push_ok?: number;
     universe_size?: number;
   };
-  universe_sectors?: { name: string; pct: number; type?: string; members?: number }[];
+  universe_sectors?: { name: string; pct: number; type?: string; members?: number; consecutive?: number; life_coeff?: number; life_note?: string }[];
   hot_boards: { name: string; pct: number; up_count?: number; leader?: string }[];
   params: Record<string, unknown>;
   count: number;
@@ -609,6 +627,7 @@ export type ConditionOrder = {
   price_hint?: number;
   window?: string;
   reason?: string;
+  playbook?: string;
 };
 
 export type ReviewResult = {
@@ -645,8 +664,14 @@ export type ReviewResult = {
     day_return_pct?: number | null;
     entry_score?: number;
     fenshi?: Record<string, unknown>;
-    risk?: { level?: string; messages?: string[]; anomaly_pct?: number };
-    daily?: { ma5?: number; pct_from_low?: number };
+    risk?: {
+      level?: string;
+      messages?: string[];
+      anomaly_pct?: number;
+      days_to_regulatory_exit?: number | null;
+      regulatory_window_end?: string | null;
+    };
+    daily?: { ma5?: number; pct_from_low?: number; days_to_regulatory_exit?: number; regulatory_window_end?: string };
   }[];
   orders: ConditionOrder[];
   next_day_checklist: string[];

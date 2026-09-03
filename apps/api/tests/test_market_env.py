@@ -19,12 +19,15 @@ def _patch_index(pct):
     scan.mkt.fetch_index_snapshot = lambda codes=None: {
         "sh000001": {"name": "上证指数", "pct": pct, "price": 3000.0}
     }
+    scan.mkt.fetch_market_breadth = lambda **kw: {}
     return scan
 
 
 def _reset():
     scan.settings.demo_mode = False
     scan.settings.market_env_enabled = True
+    scan.settings.sentiment_enabled = True
+    scan.mkt.fetch_market_breadth = lambda **kw: {}
 
 
 def test_normal_market():

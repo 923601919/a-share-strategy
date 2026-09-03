@@ -75,14 +75,15 @@ export default function AppNav() {
   return (
     <nav className="nav">
       <div className="brand">
-        分时<span>雷达</span>
+        <span className="brand-mark">分</span>
+        <span>分时雷达</span>
       </div>
       {LINKS.map((l) => (
         <Link key={l.href} href={l.href} className={pathname === l.href ? "active" : undefined}>
           {l.label}
         </Link>
       ))}
-      <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 10 }}>
+      <div className="nav-right">
         {user && (
           <span className="muted" style={{ fontSize: 13 }}>
             {user.username}

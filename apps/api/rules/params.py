@@ -77,6 +77,12 @@ class StrategyParams:
     ld_tail_min_bars: int = 6
     ld_tail_score: float = 10.0
     leader_dip_hot_board_bonus: float = 8.0
+    # 逐波量能 / 炸板（进攻型分时增量）
+    wave_vol_bonus: float = 8.0
+    wave_vol_penalty: float = 10.0
+    wave_vol_enabled: bool = True
+    zhaban_benign_bonus: float = 8.0
+    zhaban_weak_penalty: float = 12.0
 
     @classmethod
     def from_settings(cls) -> "StrategyParams":

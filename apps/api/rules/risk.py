@@ -27,23 +27,61 @@ def is_excluded_board(
 
 def anomaly_30d_pct(daily: pd.DataFrame) -> dict[str, Any]:
     """近约 30 个交易日最大涨幅进度（相对区间最低收盘）。"""
+    empty = {
+        "pct_from_low": 0.0,
+        "ma5": None,
+        "last_close": None,
+        "last_open": None,
+        "bars_from_low": None,
+        "days_to_regulatory_exit": None,
+        "regulatory_window_end": None,
+        "new_anomaly_recent": False,
+        "low_date": None,
+    }
     if daily is None or daily.empty or "close" not in daily.columns:
-        return {"pct_from_low": 0.0, "ma5": None, "last_close": None, "last_open": None}
+        return empty
 
-    df = daily.dropna(subset=["close"]).tail(30)
+    df = daily.dropna(subset=["close"]).tail(30).copy()
     if df.empty:
-        return {"pct_from_low": 0.0, "ma5": None, "last_close": None, "last_open": None}
+        return empty
 
-    low = float(df["close"].min())
-    last = float(df["close"].iloc[-1])
+    close = pd.to_numeric(df["close"], errors="coerce")
+    low = float(close.min())
+    last = float(close.iloc[-1])
     pct = (last / low - 1.0) * 100 if low > 0 else 0.0
-    ma5 = float(df["close"].tail(5).mean()) if len(df) >= 5 else float(df["close"].mean())
+    ma5 = float(close.tail(5).mean()) if len(df) >= 5 else float(close.mean())
     last_open = float(df["open"].iloc[-1]) if "open" in df.columns else last
+
+    low_pos = int(close.argmin())
+    bars_from_low = max(len(df) - 1 - low_pos, 0)
+    days_to_exit = max(30 - bars_from_low, 0)
+    last5_high = float(close.tail(5).max()) if len(df) else last
+    window_high = float(close.max())
+    new_anomaly = bool(window_high > 0 and last5_high >= window_high * 0.995 and bars_from_low >= 5)
+
+    low_date = None
+    if "date" in df.columns:
+        try:
+            low_date = str(pd.to_datetime(df["date"].iloc[low_pos]).date())
+        except Exception:
+            low_date = None
+
+    window_end = None
+    if low_date:
+        from rules.selection import estimated_window_end
+
+        window_end = estimated_window_end(low_date, days_to_exit)
+
     return {
         "pct_from_low": round(pct, 2),
         "ma5": round(ma5, 3),
         "last_close": round(last, 3),
         "last_open": round(last_open, 3),
+        "bars_from_low": bars_from_low,
+        "days_to_regulatory_exit": days_to_exit,
+        "regulatory_window_end": window_end,
+        "new_anomaly_recent": new_anomaly,
+        "low_date": low_date,
     }
 
 
@@ -55,15 +93,34 @@ def risk_flags(
     open_price: float | None = None,
     warn: float = 180.0,
     block: float = 195.0,
+    days_to_regulatory_exit: int | None = None,
+    new_anomaly_recent: bool = False,
+    regulatory_window_end: str | None = None,
+    watch_days: int = 3,
 ) -> dict[str, Any]:
     level = "ok"
     messages: list[str] = []
     if anomaly_pct >= block:
-        level = "block"
-        messages.append(f"近30日从低点涨幅{anomaly_pct:.1f}%接近/超过200%异动红线")
+        near_exit = (
+            days_to_regulatory_exit is not None
+            and days_to_regulatory_exit <= watch_days
+            and not new_anomaly_recent
+        )
+        if near_exit:
+            level = "watch"
+            end_txt = f"，预计出监管 {regulatory_window_end}" if regulatory_window_end else ""
+            messages.append(
+                f"近30日从低点涨幅{anomaly_pct:.1f}%临近出监管（剩{days_to_regulatory_exit}日{end_txt}），观察而非一刀切"
+            )
+        else:
+            level = "block"
+            messages.append(f"近30日从低点涨幅{anomaly_pct:.1f}%接近/超过200%异动红线")
     elif anomaly_pct >= warn:
         level = "warn"
-        messages.append(f"近30日从低点涨幅{anomaly_pct:.1f}%，接近异动红线")
+        extra = ""
+        if days_to_regulatory_exit is not None:
+            extra = f"，出监管约剩{days_to_regulatory_exit}日"
+        messages.append(f"近30日从低点涨幅{anomaly_pct:.1f}%，接近异动红线{extra}")
 
     below_ma5 = False
     if price is not None and ma5 is not None and ma5 > 0:
@@ -81,4 +138,6 @@ def risk_flags(
         "below_ma5": below_ma5,
         "auction_sell_hint": auction_sell,
         "anomaly_progress": round(min(anomaly_pct / 200.0 * 100, 100), 1),
+        "days_to_regulatory_exit": days_to_regulatory_exit,
+        "regulatory_window_end": regulatory_window_end,
     }

@@ -11,10 +11,13 @@ from db import (
     list_daily_reviews,
     list_watchlist,
     save_daily_review,
+    upsert_sector_daily,
 )
 from providers import akshare_client as mkt
 from rules.fenshi import score_offensive_fenshi
 from rules.risk import anomaly_30d_pct, risk_flags
+from rules.selection import is_limit_up
+from rules.sentiment import classify_sentiment
 from services.sim import redesign_all_open_orders
 from services.track import enrich_watch_item
 
@@ -30,6 +33,7 @@ def _build_orders_for_watch(
     *,
     macro_weak: bool = False,
     macro_reason: str = "",
+    sentiment_phase: str | None = None,
 ) -> list[dict[str, Any]]:
     """基于进攻型分时 + 五日线/异动红线，生成次日条件单。"""
     code = str(item["code"]).zfill(6)
@@ -41,6 +45,9 @@ def _build_orders_for_watch(
     fenshi = quote.get("fenshi") or {}
     source = str(item.get("source") or "manual")
     orders: list[dict[str, Any]] = []
+    pct = float(quote.get("pct") if quote.get("pct") is not None else 0)
+    pre_close = float(quote.get("pre_close") or 0)
+    euphoria = sentiment_phase == "euphoria"
 
     # ---- 宏观偏弱：竞价优先卖出（作者纪律）----
     if macro_weak:
@@ -58,6 +65,65 @@ def _build_orders_for_watch(
                 "reason": "宏观偏弱先控回撤；有赚可走、破位必走",
             }
         )
+
+    # ---- 昨日涨停/大涨票次日铁律（优先于固定止盈）----
+    if settings.iron_rule_enabled and price > 0:
+        big = pct >= settings.iron_rule_big_pct or is_limit_up(
+            code, pct, name=name, pre_close=pre_close or None, price=price
+        )
+        if big:
+            weak_open = price * (1 + settings.iron_rule_weak_open_pct / 100.0)
+            half_px = price * (1 + settings.iron_rule_high_throw_pct / 100.0)
+            seal_by = "11:00" if euphoria else settings.iron_rule_seal_deadline
+            orders.append(
+                {
+                    "side": "sell",
+                    "priority": 0,
+                    "code": code,
+                    "name": name,
+                    "title": "铁律·竞价弱直接卖",
+                    "trigger": f"次日低开超过{abs(settings.iron_rule_weak_open_pct):g}%（开盘 < {weak_open:.2f}）或竞价量异常",
+                    "action": "09:15-09:25 竞价直接卖出，卖飞不追",
+                    "price_hint": round(weak_open, 3),
+                    "window": "09:15-09:30",
+                    "reason": f"收盘涨幅{pct:.1f}%属大涨/涨停票，竞价弱无条件出局",
+                    "playbook": "limit_up_next_day",
+                }
+            )
+            orders.append(
+                {
+                    "side": "sell",
+                    "priority": 1,
+                    "code": code,
+                    "name": name,
+                    "title": f"铁律·冲高+{settings.iron_rule_high_throw_pct:g}%至少卖一半",
+                    "trigger": f"盘中涨幅触及 +{settings.iron_rule_high_throw_pct:g}%（约 {half_px:.2f}）",
+                    "action": "至少卖出 1/2，剩余按封板情况处理",
+                    "price_hint": round(half_px, 3),
+                    "window": "全天",
+                    "reason": "大涨票次日高抛线，固定止盈作兜底",
+                    "playbook": "limit_up_next_day",
+                }
+            )
+            orders.append(
+                {
+                    "side": "sell",
+                    "priority": 1,
+                    "code": code,
+                    "name": name,
+                    "title": f"铁律·{seal_by}前不封板清仓",
+                    "trigger": f"高开冲高不回封，或 {seal_by} 前不能封板",
+                    "action": "全部出局",
+                    "price_hint": price,
+                    "window": f"09:30-{seal_by}",
+                    "reason": (
+                        "情绪亢奋放宽封板时限"
+                        if euphoria
+                        else "打板/大涨票次日必须走连板剧本，否则兑现"
+                    ),
+                    "playbook": "limit_up_next_day",
+                }
+            )
 
     # ---- 卖：保护与兑现 ----
     if ma5 and ma5 > 0:
@@ -176,7 +242,7 @@ def _analyze_one_code(code: str, name: str, price: float, entry_price: float | N
     risk: dict[str, Any] = {"level": "ok", "messages": []}
 
     try:
-        daily = None if settings.demo_mode else mkt.fetch_daily(code, limit=40)
+        daily = None if settings.demo_mode else mkt.fetch_daily(code, limit=60)
         if daily is not None:
             daily_info = anomaly_30d_pct(daily)
             risk = risk_flags(
@@ -186,6 +252,10 @@ def _analyze_one_code(code: str, name: str, price: float, entry_price: float | N
                 open_price=daily_info.get("last_open"),
                 warn=settings.anomaly_warn_pct,
                 block=settings.anomaly_block_pct,
+                days_to_regulatory_exit=daily_info.get("days_to_regulatory_exit"),
+                new_anomaly_recent=bool(daily_info.get("new_anomaly_recent")),
+                regulatory_window_end=daily_info.get("regulatory_window_end"),
+                watch_days=settings.regulatory_watch_days,
             )
     except Exception as e:
         risk = {"level": "ok", "messages": [f"日线拉取失败: {e}"]}
@@ -252,11 +322,33 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
 
     macro_weak = bool(global_macro.get("weak"))
     macro_reason = str(global_macro.get("weak_reason") or "")
+    sentiment_phase: str | None = None
+    if not settings.demo_mode:
+        try:
+            br = mkt.fetch_market_breadth()
+            sent = classify_sentiment(
+                zt_count=br.get("zt_count"),
+                dt_count=br.get("dt_count"),
+                zhaban_rate=br.get("zhaban_rate"),
+                max_lianban=br.get("max_lianban"),
+                promotion_rate=br.get("promotion_rate"),
+                n_up=br.get("n_up"),
+                n_down=br.get("n_down"),
+            )
+            sentiment_phase = str(sent.get("phase") or "") or None
+            if sent.get("label"):
+                notes.append(f"情绪{sent.get('label')} 温度{sent.get('temperature')}")
+        except Exception:
+            sentiment_phase = None
 
     # 1) 板块
     try:
         boards = mkt.fetch_concept_boards_top(12)
         notes.append(f"强势行业参考 {len(boards)} 个")
+        try:
+            upsert_sector_daily(trade_date, boards)
+        except Exception:
+            pass
     except Exception as e:
         notes.append(f"板块拉取失败: {e}")
         boards = []
@@ -298,6 +390,8 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
 
         quote_for_order = {
             "price": price,
+            "pct": float(row.get("pct") or 0),
+            "pre_close": float(row.get("pre_close") or 0),
             "fenshi": analyzed.get("fenshi") or {},
         }
         stock_orders = _build_orders_for_watch(
@@ -306,6 +400,7 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
             analyzed.get("daily") or {},
             macro_weak=macro_weak,
             macro_reason=macro_reason,
+            sentiment_phase=sentiment_phase,
         )
         orders.extend(stock_orders)
         watch_reviews.append(
@@ -433,7 +528,7 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
         "watch_reviews": watch_reviews,
         "orders": uniq_orders,
         "sim": sim_block,
-        "next_day_checklist": _next_day_checklist(macro_weak=macro_weak),
+        "next_day_checklist": _next_day_checklist(macro_weak=macro_weak, sentiment_phase=sentiment_phase),
     }
 
     if persist:
@@ -442,18 +537,23 @@ def run_daily_review(*, trade_date: str | None = None, persist: bool = True) -> 
     return payload
 
 
-def _next_day_checklist(*, macro_weak: bool = False) -> list[str]:
+def _next_day_checklist(*, macro_weak: bool = False, sentiment_phase: str | None = None) -> list[str]:
     items = [
         "09:15-09:25 看竞价：开盘能否站上五日线",
     ]
     if macro_weak:
         items.append("⚠ 外盘偏弱：竞价阶段优先处理卖单，能走先走、不恋战")
+    if sentiment_phase == "ice":
+        items.append("情绪冰点：进攻型收缩，只做龙头低吸/超跌回流")
+    elif sentiment_phase == "euphoria":
+        items.append("情绪亢奋：竞价弱势卖出可放宽，主线龙头优先")
     items.extend(
         [
-            "重点卖单优先执行（跌破五日线/异动红线/外盘弱竞价卖）",
+            "重点卖单优先执行（铁律/跌破五日线/异动红线/外盘弱竞价卖）",
+            "昨日涨停或收盘≥7%：竞价弱直接卖；冲高+6%至少卖一半；10:30前不封板清仓",
             "10:15-10:40 只做回踩均价后放量再攻的买单",
-            "模拟盘按来源止盈：进攻分时+8%/龙头低吸+5%，触及即卖",
-            "涨幅已达/超过6%的短线票次日谨慎追高",
+            "模拟盘按来源止盈：进攻分时+8%/龙头低吸+5%，触及即卖（铁律优先）",
+            "只做总龙/老龙头，补涨杂毛不追",
             "无形态宁空仓",
         ]
     )

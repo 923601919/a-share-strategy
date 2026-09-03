@@ -29,19 +29,21 @@ const TAB_DEFAULTS: Record<UiTab, ModeFormState> = {
 
 const TAB_META: Record<
   UiTab,
-  { title: string; desc: string; mode: ScanMode; policy: UniversePolicy; test?: boolean }
+  { title: string; desc: string; mode: ScanMode; policy: UniversePolicy; test?: boolean; tabLabel: string }
 > = {
   fenshi: {
     title: "进攻型分时扫描",
     desc: "强势板块成分内选股 + 回踩均价放量再攻 / 强势推升。默认涨幅 2% ~ <6%。",
     mode: "fenshi",
     policy: "hot_only",
+    tabLabel: "进攻型分时",
   },
   leader_dip: {
     title: "龙头低吸扫描",
     desc: "强势板块龙头，水下/平盘贴近 MA5 低吸。默认涨幅 -3% ~ +2%。",
     mode: "leader_dip",
     policy: "hot_only",
+    tabLabel: "龙头低吸",
   },
   fenshi_quota: {
     title: "测试·配额制",
@@ -49,6 +51,7 @@ const TAB_META: Record<
     mode: "fenshi",
     policy: "quota",
     test: true,
+    tabLabel: "测试·配额",
   },
   fenshi_soft: {
     title: "测试·软加权",
@@ -56,6 +59,7 @@ const TAB_META: Record<
     mode: "fenshi",
     policy: "soft",
     test: true,
+    tabLabel: "测试·软加权",
   },
 };
 
@@ -250,29 +254,38 @@ export default function HomePage() {
 
   return (
     <>
+      {/* ==================== 1. 扫描配置卡 ==================== */}
       <section className="panel">
-        <h1 style={{ margin: "0 0 8px", fontSize: 20 }}>{meta.title}</h1>
-        <p className="muted" style={{ marginTop: 0 }}>
-          {meta.desc}
-        </p>
-        <div className="row" style={{ marginBottom: 12, flexWrap: "wrap" }}>
+        <div className="panel-head">
+          <div>
+            <h1 className="panel-title">
+              {meta.title}
+              {meta.test ? <span className="pill" style={{ background: "#fff7ed", color: "#c2410c", borderColor: "rgba(234,88,12,0.3)" }}>测试</span> : null}
+            </h1>
+            <p className="panel-sub">{meta.desc}</p>
+          </div>
+        </div>
+
+        <div className="section-h">
+          <span>选择策略</span>
+        </div>
+        <div className="tabs mb-16" role="tablist">
           {tabs.map((id) => (
             <button
               key={id}
-              className={tab === id ? "" : "secondary"}
+              role="tab"
+              className={tab === id ? "active" : ""}
               onClick={() => onTabChange(id)}
             >
-              {id === "fenshi"
-                ? "进攻型分时"
-                : id === "leader_dip"
-                  ? "龙头低吸"
-                  : id === "fenshi_quota"
-                    ? "测试·配额"
-                    : "测试·软加权"}
+              {TAB_META[id].tabLabel}
             </button>
           ))}
         </div>
-        <div className="row">
+
+        <div className="section-h">
+          <span>扫描参数</span>
+        </div>
+        <div className="grid-4">
           <label>
             成交额下限（亿）
             <input
@@ -283,7 +296,7 @@ export default function HomePage() {
             />
           </label>
           <label>
-            涨幅下限%
+            涨幅下限 %
             <input
               type="number"
               step="0.1"
@@ -309,7 +322,9 @@ export default function HomePage() {
               <option value="any">不限</option>
             </select>
           </label>
-          <label>
+        </div>
+        <div className="row" style={{ marginTop: 16, alignItems: "center" }}>
+          <label style={{ flex: "0 0 200px" }}>
             返回条数
             <input
               type="number"
@@ -317,7 +332,7 @@ export default function HomePage() {
               onChange={(e) => setTopN(Number(e.target.value))}
             />
           </label>
-          <button onClick={onScan} disabled={loading}>
+          <button onClick={onScan} disabled={loading} style={{ minWidth: 120 }}>
             {loading ? "扫描中…" : "立即扫描"}
           </button>
           {loading ? (
@@ -325,119 +340,203 @@ export default function HomePage() {
               取消
             </button>
           ) : null}
+          {loading && progress ? (
+            <div style={{ flex: 1, minWidth: 200 }}>
+              <div className="muted-sm" style={{ marginBottom: 4 }}>
+                {progress.message || progress.stage} · {pct}%
+              </div>
+              <div className="progress">
+                <i style={{ width: `${Math.min(Math.max(pct, 2), 100)}%` }} />
+              </div>
+            </div>
+          ) : null}
         </div>
-        {loading && progress ? (
-          <div style={{ marginTop: 12 }}>
-            <div className="muted" style={{ marginBottom: 6 }}>
-              {progress.message || progress.stage} · {pct}%
-            </div>
-            <div className="bar">
-              <i style={{ width: `${Math.min(Math.max(pct, 2), 100)}%` }} />
-            </div>
-          </div>
-        ) : null}
-        {msg ? <p className="good">{msg}</p> : null}
+
+        {msg ? <div className="banner ok mt-12">{msg}</div> : null}
         {error ? (
-          <p className="err">
-            {errorKind === "session" ? "时段限制：" : null}
-            {errorKind === "data" ? "数据提示：" : null}
-            {errorKind === "network" ? "请求异常：" : null}
-            {error}
-          </p>
+          <div
+            className={
+              errorKind === "session" ? "banner warn mt-12" :
+              errorKind === "data" ? "banner info mt-12" :
+              errorKind === "network" ? "banner err mt-12" : "banner info mt-12"
+            }
+          >
+            <span className="banner-icon">!</span>
+            <span>
+              {errorKind === "session" ? "时段限制：" :
+                errorKind === "data" ? "数据提示：" :
+                errorKind === "network" ? "请求异常：" : ""}
+              {error}
+            </span>
+          </div>
         ) : null}
       </section>
 
+      {/* ==================== 2. 结果概览 ==================== */}
       {data ? (
-        <>
-          <section className="panel">
-            <div className="muted">{data.session_note}</div>
-            {data.market_env && data.market_env.pct != null ? (
-              <div
-                className="row"
-                style={{
-                  marginTop: 8,
-                  padding: "8px 12px",
-                  borderRadius: 8,
-                  background:
-                    data.market_env.level === "warn"
-                      ? "rgba(230,184,77,0.12)"
-                      : data.market_env.level === "block"
-                        ? "rgba(232,93,93,0.12)"
-                        : "rgba(139,155,176,0.08)",
-                  border: "1px solid var(--line)",
-                }}
-              >
-                <strong>大盘环境</strong>
-                <span>
-                  {data.market_env.ref_name || data.market_env.ref_index}{" "}
-                  <span
-                    className={
-                      data.market_env.pct > 0 ? "up" : data.market_env.pct < 0 ? "down" : ""
-                    }
-                  >
-                    {data.market_env.pct > 0 ? "+" : ""}
-                    {data.market_env.pct}%
-                  </span>
+        <section className="panel">
+          <div className="panel-head">
+            <div>
+              <h2 className="panel-title">本次扫描概览</h2>
+              <p className="panel-sub">{data.session_note || "—"}</p>
+            </div>
+            <div className="muted-sm">
+              策略 {String(data.params?.strategy_version || "")} · 池策略 {String(data.params?.universe_policy || "")}
+            </div>
+          </div>
+
+          {/* 大盘环境横幅 */}
+          {data.market_env && data.market_env.pct != null ? (
+            <div
+              className={
+                data.market_env.level === "warn" ? "banner warn" :
+                data.market_env.level === "block" ? "banner err" :
+                "banner info"
+              }
+            >
+              <span className="banner-icon">
+                {data.market_env.level === "block" ? "×" :
+                  data.market_env.level === "warn" ? "!" : "·"}
+              </span>
+              <span style={{ flex: 1 }}>
+                <strong>大盘环境 · {data.market_env.ref_name || data.market_env.ref_index}</strong>
+                &nbsp;
+                <span className={`num ${data.market_env.pct > 0 ? "up" : data.market_env.pct < 0 ? "down" : ""}`}>
+                  {data.market_env.pct > 0 ? "+" : ""}
+                  {Number(data.market_env.pct).toFixed(2)}%
                 </span>
                 {data.market_env.level === "warn" ? (
-                  <span className="muted">大盘偏弱，进攻型分数已折减</span>
+                  <span className="muted-sm" style={{ marginLeft: 8 }}>
+                    · 大盘偏弱，进攻型分数已折减
+                  </span>
                 ) : null}
-              </div>
-            ) : null}
-            <div className="muted" style={{ marginTop: 6 }}>
-              数据源 spot={data.data_source?.spot ?? "?"} · 候选池{" "}
-              {data.data_source?.universe_size ?? "?"} · 分时确认{" "}
-              {data.data_source?.fenshi_ok ?? 0}/{data.data_source?.candidates ?? "?"} · 回踩再攻{" "}
-              {data.data_source?.reattack_ok ?? 0} · 强势推升{" "}
-              {data.data_source?.strong_push_ok ?? 0} · 命中 {data.count} 只
-              {data.timings?.total_ms != null ? ` · 耗时 ${Math.round(data.timings.total_ms)}ms` : ""}
-              {data.params?.strategy_version
-                ? ` · 策略 ${String(data.params.strategy_version)}`
-                : ""}
-              {data.params?.universe_policy
-                ? ` · 池策略 ${String(data.params.universe_policy)}`
-                : ""}
+                {data.market_env.level === "block" ? (
+                  <span className="muted-sm" style={{ marginLeft: 8 }}>
+                    · 大盘急跌，建议观望
+                  </span>
+                ) : null}
+              </span>
             </div>
-            <h3 style={{ marginBottom: 8 }}>强势板块（候选池来源）</h3>
-            <div className="chips">
-              {(data.universe_sectors || data.hot_boards || []).slice(0, 12).map((b) => {
-                const type = "type" in b ? (b as { type?: string }).type : undefined;
-                return (
-                  <div className="chip" key={`${b.name}-${type ?? ""}`}>
-                    {b.name} {b.pct?.toFixed?.(2) ?? b.pct}%
-                    {type ? ` (${type})` : ""}
-                  </div>
-                );
-              })}
-            </div>
-            <h3 style={{ marginTop: 12, marginBottom: 8 }}>同花顺行业参考</h3>
-            <div className="chips">
-              {(data.hot_boards || []).slice(0, 8).map((b) => (
-                <div className="chip" key={`ref-${b.name}`}>
-                  {b.name} {b.pct?.toFixed?.(2) ?? b.pct}%
-                </div>
-              ))}
-            </div>
-          </section>
+          ) : null}
 
-          <section className="panel">
-            {msg ? <p className="good">{msg}</p> : null}
+          {/* KPI 数字 */}
+          <div className="grid-4 mt-16">
+            <div className="kpi">
+              <span className="kpi-label">命中</span>
+              <span className={`kpi-value ${data.count > 0 ? "" : "muted"}`}>
+                {data.count ?? 0}<span className="kpi-sub" style={{ marginLeft: 4 }}>只</span>
+              </span>
+              <span className="kpi-sub">候选池 {data.data_source?.universe_size ?? "—"}</span>
+            </div>
+            <div className="kpi">
+              <span className="kpi-label">分时确认</span>
+              <span className="kpi-value">
+                {data.data_source?.fenshi_ok ?? 0}<span className="kpi-sub" style={{ marginLeft: 2 }}>/</span>
+                <span className="kpi-sub">{data.data_source?.candidates ?? "—"}</span>
+              </span>
+              <span className="kpi-sub">
+                代理 {data.items.filter((it) => Boolean((it.fenshi as { proxy?: boolean } | undefined)?.proxy)).length}
+              </span>
+            </div>
+            <div className="kpi">
+              <span className="kpi-label">回踩再攻 / 强势推升</span>
+              <span className="kpi-value">
+                {data.data_source?.reattack_ok ?? 0}
+                <span className="kpi-sub"> / {data.data_source?.strong_push_ok ?? 0}</span>
+              </span>
+              <span className="kpi-sub">命中形态</span>
+            </div>
+            <div className="kpi">
+              <span className="kpi-label">耗时</span>
+              <span className="kpi-value num">
+                {data.timings?.total_ms != null ? `${(data.timings.total_ms / 1000).toFixed(1)}` : "—"}
+                <span className="kpi-sub" style={{ marginLeft: 2 }}>s</span>
+              </span>
+              <span className="kpi-sub truncate-1">数据源 {data.data_source?.spot ?? "—"}</span>
+            </div>
+          </div>
+
+          {/* 板块 chips */}
+          <div className="section-h" style={{ marginTop: 20 }}>
+            <span>强势板块（候选池来源）</span>
+            <span className="muted-sm">前 12</span>
+          </div>
+          <div className="chips">
+            {(data.universe_sectors || data.hot_boards || []).slice(0, 12).map((b) => {
+              const type = "type" in b ? (b as { type?: string }).type : undefined;
+              const life = "life_note" in b ? (b as { life_note?: string; consecutive?: number }).life_note : undefined;
+              const n = "consecutive" in b ? (b as { consecutive?: number }).consecutive : undefined;
+              const pctVal = Number(b.pct ?? 0);
+              return (
+                <div className="chip" key={`${b.name}-${type ?? ""}`}>
+                  <strong>{b.name}</strong>
+                  <span className={`pct ${pctVal > 0 ? "up" : pctVal < 0 ? "down" : ""}`}>
+                    {pctVal > 0 ? "+" : ""}
+                    {pctVal.toFixed(2)}%
+                  </span>
+                  {type ? <span className="muted-sm">· {type}</span> : null}
+                  {n && n > 1 ? <span className="muted-sm">· {n}日</span> : null}
+                  {life ? <span className="muted-sm">· {life}</span> : null}
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="section-h">
+            <span>同花顺行业参考</span>
+            <span className="muted-sm">前 8</span>
+          </div>
+          <div className="chips">
+            {(data.hot_boards || []).slice(0, 8).map((b) => {
+              const pctVal = Number(b.pct ?? 0);
+              return (
+                <div className="chip" key={`ref-${b.name}`}>
+                  <strong>{b.name}</strong>
+                  <span className={`pct ${pctVal > 0 ? "up" : pctVal < 0 ? "down" : ""}`}>
+                    {pctVal > 0 ? "+" : ""}
+                    {pctVal.toFixed(2)}%
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      ) : null}
+
+      {/* ==================== 3. 命中结果表 ==================== */}
+      {data ? (
+        <section className="panel">
+          <div className="panel-head">
+            <h2 className="panel-title">
+              命中结果
+              <span className="muted-sm" style={{ marginLeft: 8, fontWeight: 400 }}>
+                {data.count} 只
+              </span>
+            </h2>
+            <div className="muted-sm truncate-1">
+              数据源 {data.data_source?.spot ?? "—"}
+            </div>
+          </div>
+
+          {msg ? <div className="banner ok mb-12">{msg}</div> : null}
+
+          <div className="table-wrap">
             <table>
               <thead>
                 <tr>
                   <th>代码</th>
                   <th>名称</th>
-                  <th>涨幅</th>
-                  <th>得分</th>
-                  <th>日内位置</th>
-                  <th>量比</th>
-                  <th>异动</th>
+                  <th style={{ textAlign: "right" }}>涨幅</th>
+                  <th style={{ textAlign: "right" }}>得分</th>
+                  <th style={{ textAlign: "right" }}>日内位置</th>
+                  <th style={{ textAlign: "right" }}>量比</th>
+                  <th>异动 / 监管</th>
                   <th>原因</th>
-                  <th></th>
+                  <th style={{ textAlign: "right" }}></th>
                 </tr>
               </thead>
               <tbody>
-                {data.items.map((it) => {
+                {data.items.map((it, idx) => {
                   const proxy = Boolean((it.fenshi as { proxy?: boolean })?.proxy);
                   const fenshi = (it.fenshi ?? {}) as {
                     proxy?: boolean;
@@ -447,9 +546,12 @@ export default function HomePage() {
                   };
                   const pos = fenshi.day_position;
                   const chase = Boolean((fenshi.chase_penalty ?? 0) > 0);
+                  const isTop = idx === 0;
+                  const rowCls = chase ? "row-chase" : isTop ? "row-top" : "";
+                  const pctNum = Number(it.pct ?? 0);
                   return (
-                    <tr key={it.code}>
-                      <td>
+                    <tr key={it.code} className={rowCls}>
+                      <td className="num">
                         <a
                           href={`https://quote.eastmoney.com/${it.code.startsWith("6") ? "sh" : "sz"}${it.code}.html`}
                           target="_blank"
@@ -459,45 +561,72 @@ export default function HomePage() {
                         </a>
                       </td>
                       <td>
-                        {it.name}
-                        {it.in_hot_board ? (
-                          <div className="muted">热门板块</div>
-                        ) : meta.test ? (
-                          <div className="muted">非主线</div>
+                        <div className="cell-strong">
+                          {it.name}
+                          {it.in_hot_board ? (
+                            <span className="pill hot" style={{ marginLeft: 6 }}>热门板块</span>
+                          ) : meta.test ? (
+                            <span className="pill" style={{ marginLeft: 6 }}>非主线</span>
+                          ) : null}
+                        </div>
+                        {(it.selection?.tags || []).length > 0 ? (
+                          <div className="cell-sub">{(it.selection?.tags || []).join(" · ")}</div>
                         ) : null}
-                        {proxy ? <div className="muted">代理分</div> : null}
+                        {proxy ? <div className="cell-sub">代理分</div> : null}
                       </td>
-                      <td className={it.pct > 0 ? "up" : it.pct < 0 ? "down" : ""}>
-                        {it.pct}%
+                      <td className={`num ${pctNum > 0 ? "up" : pctNum < 0 ? "down" : ""}`} style={{ textAlign: "right" }}>
+                        {pctNum > 0 ? "+" : ""}
+                        {pctNum.toFixed(2)}%
                       </td>
-                      <td>{it.score}</td>
-                      <td className={chase ? "down" : ""}>
+                      <td className="num cell-strong" style={{ textAlign: "right" }}>
+                        {it.score}
+                      </td>
+                      <td style={{ textAlign: "right" }}>
                         {pos != null ? (
-                          <>
-                            {(pos * 100).toFixed(0)}%
+                          <div>
+                            <span className={chase ? "down num cell-strong" : "num cell-strong"}>
+                              {(Number(pos) * 100).toFixed(0)}%
+                            </span>
                             {chase && fenshi.chase_penalty ? (
-                              <div className="muted">追高-{fenshi.chase_penalty}</div>
+                              <div>
+                                <span className="pill chase" style={{ fontSize: 11 }}>
+                                  追高 -{fenshi.chase_penalty}
+                                </span>
+                              </div>
                             ) : null}
-                          </>
+                          </div>
                         ) : (
-                          "-"
+                          <span className="muted">-</span>
                         )}
                       </td>
-                      <td>{it.volume_ratio}</td>
+                      <td className="num muted" style={{ textAlign: "right" }}>
+                        {it.volume_ratio ?? "-"}
+                      </td>
                       <td>
                         <span className={`pill ${it.risk?.level || "ok"}`}>
                           {it.risk?.anomaly_pct ?? "-"}%
                         </span>
-                        <div className="bar" style={{ marginTop: 6 }}>
+                        <div className="bar" style={{ marginTop: 4, width: 80 }}>
                           <i
                             style={{
-                              width: `${Math.min(it.risk?.anomaly_progress || 0, 100)}%`,
+                              width: `${Math.min(Number(it.risk?.anomaly_progress || 0), 100)}%`,
                             }}
                           />
                         </div>
+                        {it.risk?.days_to_regulatory_exit != null &&
+                        it.risk.days_to_regulatory_exit <= 5 ? (
+                          <div className="cell-sub">
+                            出监管约{it.risk.days_to_regulatory_exit}日
+                            {it.risk.regulatory_window_end
+                              ? ` (${it.risk.regulatory_window_end})`
+                              : ""}
+                          </div>
+                        ) : null}
                       </td>
-                      <td className="muted">{(it.reasons || []).join("；")}</td>
-                      <td>
+                      <td className="muted" style={{ maxWidth: 360 }}>
+                        <div className="truncate-2">{(it.reasons || []).join("；")}</div>
+                      </td>
+                      <td style={{ textAlign: "right" }}>
                         <button
                           className="secondary"
                           disabled={addingCode === it.code}
@@ -511,8 +640,8 @@ export default function HomePage() {
                 })}
               </tbody>
             </table>
-          </section>
-        </>
+          </div>
+        </section>
       ) : null}
     </>
   );

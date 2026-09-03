@@ -576,6 +576,181 @@ def score_leader_dip(
     }
 
 
+def _local_extrema(values: list[float], *, order: int = 3) -> tuple[list[int], list[int]]:
+    """简单局部峰/谷：比左右 order 根都高/低。"""
+    n = len(values)
+    peaks: list[int] = []
+    troughs: list[int] = []
+    if n < order * 2 + 1:
+        return peaks, troughs
+    for i in range(order, n - order):
+        window = values[i - order : i + order + 1]
+        v = values[i]
+        if v >= max(window) and v > values[i - 1] and v >= values[i + 1]:
+            peaks.append(i)
+        if v <= min(window) and v < values[i - 1] and v <= values[i + 1]:
+            troughs.append(i)
+    return peaks, troughs
+
+
+def detect_wave_volume(minute: pd.DataFrame | None, *, min_waves: int = 2) -> dict[str, Any]:
+    """上攻段量能峰递增、回调段缩量 = 健康；价新高量不增 = 背离。"""
+    out = {"healthy": False, "divergence": False, "n_up": 0, "message": "波段不足"}
+    if minute is None or len(minute) < 20 or "close" not in minute.columns:
+        return out
+    df = minute.dropna(subset=["close"]).reset_index(drop=True)
+    closes = pd.to_numeric(df["close"], errors="coerce").ffill().astype(float).tolist()
+    if "volume" in df.columns:
+        vols = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(float).tolist()
+    elif "amount" in df.columns:
+        vols = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(float).tolist()
+    else:
+        return out
+    peaks, troughs = _local_extrema(closes, order=3)
+    if len(peaks) < min_waves or len(troughs) < 1:
+        return out
+
+    # 交错取 trough -> peak 为上攻
+    turning = sorted([(i, "t") for i in troughs] + [(i, "p") for i in peaks])
+    up_vol_peaks: list[float] = []
+    down_vols: list[float] = []
+    up_price_peaks: list[float] = []
+    prev_i, prev_k = turning[0]
+    for i, k in turning[1:]:
+        if i <= prev_i:
+            prev_i, prev_k = i, k
+            continue
+        seg_vol = vols[prev_i : i + 1]
+        peak_vol = max(seg_vol) if seg_vol else 0.0
+        mean_vol = (sum(seg_vol) / len(seg_vol)) if seg_vol else 0.0
+        if prev_k == "t" and k == "p":
+            up_vol_peaks.append(peak_vol)
+            up_price_peaks.append(closes[i])
+        elif prev_k == "p" and k == "t":
+            down_vols.append(mean_vol)
+        prev_i, prev_k = i, k
+
+    n_up = len(up_vol_peaks)
+    out["n_up"] = n_up
+    if n_up < min_waves:
+        return out
+
+    expanding = all(
+        up_vol_peaks[i] >= up_vol_peaks[i - 1] * 0.95 for i in range(1, len(up_vol_peaks))
+    )
+    price_new_high = all(
+        up_price_peaks[i] >= up_price_peaks[i - 1] for i in range(1, len(up_price_peaks))
+    )
+    shrink_ok = True
+    if down_vols and up_vol_peaks:
+        # 末段回调均量应低于最近上攻峰
+        shrink_ok = down_vols[-1] <= up_vol_peaks[-1] * 0.85
+
+    if expanding and price_new_high and shrink_ok:
+        out["healthy"] = True
+        out["message"] = f"{n_up}浪放量"
+    elif price_new_high and not expanding:
+        out["divergence"] = True
+        out["message"] = "价新高量不增"
+    else:
+        out["message"] = f"{n_up}浪结构一般"
+    return out
+
+
+def detect_zhaban(
+    minute: pd.DataFrame | None,
+    *,
+    pre_close: float,
+    code: str = "",
+    name: str = "",
+    now_hm: str | None = None,
+) -> dict[str, Any]:
+    """日内触及涨停后开板：开板缩量+回封放量=良性；持续放量不回封/尾盘炸板=弱势。"""
+    from rules.selection import limit_pct_for_code
+
+    out = {
+        "touched": False,
+        "opened": False,
+        "resealed": False,
+        "quality": None,
+        "message": "",
+    }
+    if minute is None or minute.empty or pre_close <= 0 or "close" not in minute.columns:
+        return out
+    lim = limit_pct_for_code(code, name)
+    limit_price = round(pre_close * (1 + lim / 100.0) + 1e-9, 2)
+    df = minute.dropna(subset=["close"]).reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df["high"], errors="coerce") if "high" in df.columns else close
+    vol = (
+        pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+        if "volume" in df.columns
+        else pd.Series(1.0, index=df.index)
+    )
+    touched_mask = (high >= limit_price * 0.999) | (close >= limit_price * 0.999)
+    if not bool(touched_mask.any()):
+        return out
+    out["touched"] = True
+    first = int(touched_mask.to_numpy().nonzero()[0][0])
+    after = df.iloc[first:]
+    after_close = close.iloc[first:]
+    opened_mask = after_close < limit_price * 0.997
+    out["opened"] = bool(opened_mask.any())
+    if not out["opened"]:
+        out["quality"] = "sealed"
+        out["message"] = "封板未开"
+        return out
+
+    open_idx = int(opened_mask.to_numpy().nonzero()[0][0])
+    open_global = first + open_idx
+    reseal_mask = close.iloc[open_global:] >= limit_price * 0.999
+    out["resealed"] = bool(reseal_mask.any())
+
+    open_vol = float(vol.iloc[open_global : open_global + 5].mean() or 0)
+    pre_vol = float(vol.iloc[max(0, first - 5) : first + 1].mean() or 1)
+    hm = _hm(now_hm)
+    late = hm >= 1430
+
+    if out["resealed"]:
+        reseal_i = open_global + int(reseal_mask.to_numpy().nonzero()[0][0])
+        reseal_vol = float(vol.iloc[reseal_i : reseal_i + 4].mean() or 0)
+        shrink_open = open_vol <= pre_vol * 1.05
+        if shrink_open and reseal_vol >= open_vol * 1.1:
+            out["quality"] = "benign"
+            out["message"] = "炸板后补量回封"
+        else:
+            out["quality"] = "weak"
+            out["message"] = "炸板回封质量一般"
+    elif late:
+        out["quality"] = "weak"
+        out["message"] = "尾盘炸板未回封"
+    else:
+        dump = open_vol >= pre_vol * 1.3
+        out["quality"] = "weak" if dump else "open"
+        out["message"] = "炸板后持续放量未回封" if dump else "炸板未回封"
+    return out
+
+
+def apply_zhaban(fenshi: dict[str, Any], zhaban: dict[str, Any], *, p: StrategyParams | None = None) -> dict[str, Any]:
+    pp = _P(p)
+    out = dict(fenshi)
+    reasons = list(out.get("reasons") or [])
+    score = float(out.get("score") or 0)
+    q = zhaban.get("quality")
+    if q == "benign":
+        score = min(pp.fenshi_score_cap, score + pp.zhaban_benign_bonus)
+        reasons.append(f"{zhaban.get('message')}+{pp.zhaban_benign_bonus:g}")
+    elif q == "weak":
+        score = max(0.0, score - pp.zhaban_weak_penalty)
+        reasons.append(f"{zhaban.get('message')}-{pp.zhaban_weak_penalty:g}")
+    elif zhaban.get("message"):
+        reasons.append(str(zhaban["message"]))
+    out["score"] = round(min(score, pp.fenshi_score_cap), 1)
+    out["reasons"] = reasons
+    out["zhaban"] = zhaban
+    return out
+
+
 def score_offensive_fenshi(
     minute: pd.DataFrame, lookback: int = 30, p: StrategyParams | None = None
 ) -> dict[str, Any]:
@@ -649,6 +824,15 @@ def score_offensive_fenshi(
         score = min(pp.fenshi_score_cap, score + pp.attack_window_bonus)
         reasons.insert(0, "核心买点窗口(10:15-10:40)")
 
+    wave = detect_wave_volume(df)
+    if pp.wave_vol_enabled:
+        if wave.get("healthy"):
+            score = min(pp.fenshi_score_cap, score + pp.wave_vol_bonus)
+            reasons.append(f"逐波放量({wave.get('message')})+{pp.wave_vol_bonus:g}")
+        elif wave.get("divergence"):
+            score = max(0.0, score - pp.wave_vol_penalty)
+            reasons.append(f"量能背离({wave.get('message')})-{pp.wave_vol_penalty:g}")
+
     return {
         "score": round(min(score, pp.fenshi_score_cap), 1),
         "above_vwap": pat["above_vwap"] or push["above_vwap"],
@@ -660,4 +844,5 @@ def score_offensive_fenshi(
         "vwap": round(last_vwap, 3),
         "last": round(last, 3),
         "reasons": reasons,
+        "wave_volume": wave,
     }

@@ -75,7 +75,7 @@ export default function ReviewPage() {
           <div>
             <h1 style={{ margin: "0 0 6px", fontSize: 20 }}>收盘复盘</h1>
             <p className="muted" style={{ margin: 0 }}>
-              复盘当日自选/板块，并生成次日买卖条件单（竞价破五日线卖、回踩再攻买）。
+              复盘当日自选/板块，并生成次日买卖条件单（涨停铁律、竞价破五日线卖、回踩再攻买）。
             </p>
           </div>
           <button onClick={onRun} disabled={loading}>
@@ -204,6 +204,10 @@ export default function ReviewPage() {
                         <span className={`pill ${w.risk?.level || "ok"}`}>
                           {w.risk?.anomaly_pct ?? w.daily?.pct_from_low ?? "-"}%
                         </span>
+                        {w.risk?.days_to_regulatory_exit != null &&
+                        w.risk.days_to_regulatory_exit <= 5 ? (
+                          <div className="muted">出监管约{w.risk.days_to_regulatory_exit}日</div>
+                        ) : null}
                       </td>
                     </tr>
                   ))
@@ -267,7 +271,12 @@ export default function ReviewPage() {
                         {o.name}
                         <div className="muted">{o.code}</div>
                       </td>
-                      <td>{o.title}</td>
+                      <td>
+                        {o.title}
+                        {o.playbook === "limit_up_next_day" ? (
+                          <div className="muted">次日铁律</div>
+                        ) : null}
+                      </td>
                       <td className="muted">{o.trigger}</td>
                       <td>{o.price_hint ?? "-"}</td>
                       <td>{o.window ?? "-"}</td>

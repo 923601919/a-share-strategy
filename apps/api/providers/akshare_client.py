@@ -943,3 +943,125 @@ def fetch_hot_sector_universe_bundle(
         "sectors": uni.get("sectors") or [],
         "code_tags": uni.get("code_tags") or {},
     }
+
+
+def _pick_col(df: pd.DataFrame, *needles: str) -> str | None:
+    cols = [str(c) for c in df.columns]
+    for n in needles:
+        for c in cols:
+            if n in c:
+                return c
+    return None
+
+
+def _df_max(df: pd.DataFrame, *needles: str) -> float | None:
+    col = _pick_col(df, *needles)
+    if not col or df.empty:
+        return None
+    try:
+        v = float(pd.to_numeric(df[col], errors="coerce").max())
+        return v if v == v else None
+    except Exception:
+        return None
+
+
+def fetch_market_breadth() -> dict[str, Any]:
+    """市场广度：涨跌家数 / 涨停 / 炸板 / 连板 / 昨日涨停晋级。字段名按本地 akshare 适配。
+
+    任一子接口失败则该项为 None，由上层降级判定。
+    """
+    import akshare as ak
+
+    today = datetime.now().strftime("%Y%m%d")
+    out: dict[str, Any] = {
+        "n_up": None,
+        "n_down": None,
+        "zt_count": None,
+        "dt_count": None,
+        "zhaban_rate": None,
+        "max_lianban": None,
+        "promotion_rate": None,
+        "as_of": today,
+        "errors": [],
+    }
+
+    try:
+        act = call_with_timeout(ak.stock_market_activity_legu, 8)
+        if act is not None and not getattr(act, "empty", True):
+            # 常见两列：item/value 或 指标/数值
+            kcol = _pick_col(act, "item", "指标", "名称") or act.columns[0]
+            vcol = _pick_col(act, "value", "数值", "数量") or (act.columns[1] if len(act.columns) > 1 else None)
+            if vcol is not None:
+                kv: dict[str, float] = {}
+                for _, r in act.iterrows():
+                    key = str(r.get(kcol) or "")
+                    kv[key] = _safe_float(r.get(vcol), default=0.0)
+                for k, v in kv.items():
+                    if "上涨" in k and "停" not in k:
+                        out["n_up"] = int(v)
+                    elif "下跌" in k and "停" not in k:
+                        out["n_down"] = int(v)
+                    elif "涨停" in k:
+                        out["zt_count"] = int(v)
+                    elif "跌停" in k:
+                        out["dt_count"] = int(v)
+                    elif "炸板" in k or "开板" in k:
+                        # 有的源直接给家数，有的给比率
+                        if v > 1:
+                            pass  # 家数，配合涨停算比率
+                        else:
+                            out["zhaban_rate"] = float(v)
+    except Exception as e:
+        out["errors"].append(f"activity:{e}")
+
+    zt_df = None
+    try:
+        zt_df = call_with_timeout(ak.stock_zt_pool_em, 10, date=today)
+        if zt_df is not None and not getattr(zt_df, "empty", True):
+            out["zt_count"] = out["zt_count"] or len(zt_df)
+            lb = _df_max(zt_df, "连板", "连续", "天数")
+            if lb is not None:
+                out["max_lianban"] = int(lb)
+    except Exception as e:
+        out["errors"].append(f"zt:{e}")
+
+    try:
+        zb_df = call_with_timeout(ak.stock_zt_pool_zbgc_em, 10, date=today)
+        if zb_df is not None and not getattr(zb_df, "empty", True):
+            zb_n = len(zb_df)
+            zt_n = int(out["zt_count"] or 0)
+            denom = zt_n + zb_n
+            if denom > 0:
+                out["zhaban_rate"] = round(zb_n / denom, 3)
+    except Exception as e:
+        out["errors"].append(f"zhaban:{e}")
+
+    try:
+        dt_df = call_with_timeout(ak.stock_zt_pool_dtgc_em, 8, date=today)
+        if dt_df is not None and not getattr(dt_df, "empty", True):
+            out["dt_count"] = len(dt_df)
+    except Exception as e:
+        out["errors"].append(f"dt:{e}")
+
+    try:
+        prev = call_with_timeout(ak.stock_zt_pool_previous_em, 10, date=today)
+        if prev is not None and not getattr(prev, "empty", True):
+            # 晋级：昨日涨停今日继续涨停或高位。有的表有「涨跌幅」列。
+            pct_c = _pick_col(prev, "涨跌幅", "涨幅")
+            if pct_c:
+                pcts = pd.to_numeric(prev[pct_c], errors="coerce")
+                promo = float((pcts >= 9.5).mean()) if len(pcts) else None
+            else:
+                promo = None
+            # 也可用均涨幅粗代理：均涨幅/10 截到 0-1
+            if promo is None:
+                mean_c = _pick_col(prev, "涨跌幅", "最新")
+                if mean_c:
+                    m = float(pd.to_numeric(prev[mean_c], errors="coerce").mean() or 0)
+                    promo = max(0.0, min(1.0, (m + 2) / 12.0))
+            if promo is not None:
+                out["promotion_rate"] = round(promo, 3)
+    except Exception as e:
+        out["errors"].append(f"promotion:{e}")
+
+    return out

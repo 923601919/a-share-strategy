@@ -397,3 +397,51 @@ def fetch_overnight_global() -> dict[str, Any]:
     except Exception as e:
         _mark("global", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
         raise
+
+
+def fetch_market_breadth(*, ttl: float = 60.0) -> dict[str, Any]:
+    """市场广度（涨跌家数/涨停/炸板/连板/晋级），失败返回空指标。"""
+    if settings.demo_mode:
+        return {
+            "n_up": 2100,
+            "n_down": 1800,
+            "zt_count": 45,
+            "dt_count": 8,
+            "zhaban_rate": 0.22,
+            "max_lianban": 4,
+            "promotion_rate": 0.35,
+            "as_of": datetime.now().strftime("%Y%m%d"),
+            "errors": [],
+            "demo": True,
+        }
+    cached = _cache_get("market_breadth")
+    if cached is not None:
+        return cached
+
+    def _load() -> dict[str, Any]:
+        t0 = time.perf_counter()
+        try:
+            out = raw.fetch_market_breadth()
+            if out:
+                _cache_set("market_breadth", out, ttl)
+            _mark(
+                "breadth",
+                ok=bool(out.get("zt_count") is not None or out.get("n_up") is not None),
+                detail=f"zt={out.get('zt_count')}",
+                ms=(time.perf_counter() - t0) * 1000,
+            )
+            return out
+        except Exception as e:
+            _mark("breadth", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
+            return {
+                "n_up": None,
+                "n_down": None,
+                "zt_count": None,
+                "dt_count": None,
+                "zhaban_rate": None,
+                "max_lianban": None,
+                "promotion_rate": None,
+                "errors": [str(e)],
+            }
+
+    return _single_flight("market_breadth", _load, wait_timeout=ttl + 30)
