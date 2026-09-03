@@ -260,11 +260,11 @@ def apply_chase_penalty(
 
 
 def in_session_bucket(now_hm: str | None = None) -> str:
-    """返回 morning / afternoon / other。"""
+    """返回 morning / afternoon / other。上午覆盖到收盘 11:30，下午到收盘 15:00。"""
     hm = _hm(now_hm)
-    if 945 <= hm <= 1100:
+    if 945 <= hm <= 1130:
         return "morning"
-    if 1330 <= hm <= 1430:
+    if 1330 <= hm <= 1500:
         return "afternoon"
     return "other"
 
@@ -275,31 +275,33 @@ def in_attack_window(now_hm: str | None = None) -> bool:
     return 1015 <= hm <= 1040
 
 
-def session_allowed(session: SessionFilter, *, demo_mode: bool = False) -> tuple[bool, str]:
-    """时段硬约束。auto 仅在重点窗口内扫描。"""
+def session_allowed(
+    session: SessionFilter, *, demo_mode: bool = False, now_hm: str | None = None
+) -> tuple[bool, str]:
+    """时段硬约束。auto 仅在重点窗口内扫描。now_hm 可注入便于测试。"""
     if demo_mode or session == "any":
         return True, "演示/不限时段"
 
-    bucket = in_session_bucket()
+    bucket = in_session_bucket(now_hm)
     if session == "morning":
         if bucket == "morning":
-            extra = "·核心买点10:15-10:40" if in_attack_window() else ""
-            return True, f"上午窗口(09:45-11:00){extra}"
-        return False, "当前不在上午扫描窗口(09:45-11:00)"
+            extra = "·核心买点10:15-10:40" if in_attack_window(now_hm) else ""
+            return True, f"上午窗口(09:45-11:30){extra}"
+        return False, "当前不在上午扫描窗口(09:45-11:30)"
 
     if session == "afternoon":
         if bucket == "afternoon":
-            return True, "下午窗口(13:30-14:30)"
-        return False, "当前不在下午扫描窗口(13:30-14:30)"
+            return True, "下午窗口(13:30-15:00)"
+        return False, "当前不在下午扫描窗口(13:30-15:00)"
 
     # auto
     if bucket == "morning":
         if in_attack_window():
             return True, "自动·核心买点窗口(10:15-10:40)"
-        return True, "自动·上午重点窗口(09:45-11:00)"
+        return True, "自动·上午重点窗口(09:45-11:30)"
     if bucket == "afternoon":
-        return True, "自动·下午重点窗口(13:30-14:30)"
-    return False, "自动模式：非重点时段(09:45-11:00 / 13:30-14:30)，已跳过扫描"
+        return True, "自动·下午重点窗口(13:30-15:00)"
+    return False, "自动模式：非重点时段(09:45-11:30 / 13:30-15:00)，已跳过扫描"
 
 
 def compute_vwap_series(minute: pd.DataFrame) -> pd.Series:

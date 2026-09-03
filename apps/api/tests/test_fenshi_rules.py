@@ -9,8 +9,10 @@ from rules.fenshi import (
     apply_day_vol_and_false_push,
     day_volume_health,
     detect_false_push,
+    in_session_bucket,
     score_leader_dip,
     score_offensive_fenshi,
+    session_allowed,
 )
 
 
@@ -136,3 +138,58 @@ def test_false_push_clears_confirmed_flags():
     assert applied["reattack"] is False
     assert applied["false_push"] is True
     assert any("假进攻" in r for r in applied["reasons"])
+
+
+def test_afternoon_session_window_covers_until_close():
+    """A股 15:00 收盘：下午扫描窗口应覆盖 13:30-15:00（收盘前最后半小时可扫描）。"""
+    # 窗口内（含收盘时刻 15:00）→ afternoon 且允许
+    for hm in ("13:30", "14:31", "14:59", "15:00"):
+        assert in_session_bucket(hm) == "afternoon", hm
+        ok, note = session_allowed("afternoon", now_hm=hm)
+        assert ok is True, hm
+        assert "13:30-15:00" in note
+    # 收盘后 15:01 → 拒绝
+    assert in_session_bucket("15:01") == "other"
+    ok, _ = session_allowed("afternoon", now_hm="15:01")
+    assert ok is False
+    # 上午窗口同样覆盖到 11:30 收盘（详见 morning 测试）
+    assert in_session_bucket("09:45") == "morning"
+    assert in_session_bucket("11:30") == "morning"
+    # 午休与开盘前仍为 other
+    assert in_session_bucket("12:00") == "other"
+    assert in_session_bucket("09:44") == "other"
+    assert in_session_bucket("11:31") == "other"
+
+
+def test_morning_session_window_covers_until_close():
+    """A股上午 11:30 收盘：上午扫描窗口应覆盖 09:45-11:30（收盘前最后半小时可扫描）。"""
+    # 窗口内（含收盘时刻 11:30）→ morning 且允许
+    for hm in ("09:45", "11:01", "11:29", "11:30"):
+        assert in_session_bucket(hm) == "morning", hm
+        ok, note = session_allowed("morning", now_hm=hm)
+        assert ok is True, hm
+        assert "09:45-11:30" in note
+    # 上午收盘后 11:31 → 拒绝
+    assert in_session_bucket("11:31") == "other"
+    ok, _ = session_allowed("morning", now_hm="11:31")
+    assert ok is False
+
+
+def test_auto_session_allows_morning_till_close():
+    """auto 模式在 11:00-11:30（原窗口外）也应允许扫描，核心买点窗口语义不变。"""
+    ok, note = session_allowed("auto", now_hm="11:20")
+    assert ok is True
+    assert "09:45-11:30" in note
+    # 午休 auto 拒绝
+    ok, _ = session_allowed("auto", now_hm="12:30")
+    assert ok is False
+
+
+def test_auto_session_allows_afternoon_till_close():
+    """auto 模式在 14:30-15:00（原窗口外）也应允许扫描。"""
+    ok, note = session_allowed("auto", now_hm="14:45")
+    assert ok is True
+    assert "13:30-15:00" in note
+    # 收盘后 auto 拒绝
+    ok, _ = session_allowed("auto", now_hm="15:30")
+    assert ok is False
