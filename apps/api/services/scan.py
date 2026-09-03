@@ -4,13 +4,15 @@ import json
 import logging
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from datetime import datetime
 from typing import Any, Callable, Literal
 
 from config import settings
-from db import save_scan_snapshot
+from db import save_scan_snapshot, save_scan_quality
 from providers import market as mkt
 from rules.fenshi import (
+    apply_chase_penalty,
     apply_day_vol_and_false_push,
     day_volume_health,
     detect_false_push,
@@ -19,7 +21,7 @@ from rules.fenshi import (
     score_offensive_fenshi,
     session_allowed,
 )
-from rules.risk import anomaly_30d_pct, risk_flags
+from rules.risk import anomaly_30d_pct, is_excluded_board, risk_flags
 
 
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
@@ -54,6 +56,13 @@ def _filter_spot(
     out = df.copy()
     out["code"] = out["code"].astype(str).str.zfill(6)
     out = out[~out["name"].astype(str).map(_is_st)]
+    out = out[
+        ~out["code"].map(
+            lambda c: is_excluded_board(
+                c, exclude_star=settings.exclude_star_market, exclude_bse=settings.exclude_bse
+            )
+        )
+    ]
     if universe_codes:
         out = out[out["code"].isin(universe_codes)]
     out = out[out["amount"] >= amount_floor]
@@ -66,6 +75,72 @@ def _filter_spot(
     sort_cols = [c for c in ("pct", "volume_ratio", "amount") if c in out.columns]
     out = out.sort_values(sort_cols, ascending=False)
     return out.head(limit)
+
+
+def _minute_threshold(now: datetime | None = None) -> int:
+    """早盘（开盘 30 分钟内）放宽分时最低行数，避免正常数据被误判为代理分。"""
+    try:
+        if now is None:
+            now = datetime.now()
+        # 09:30 后的分钟数
+        m = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+        if 0 <= m < settings.minute_early_window_min:
+            return settings.minute_min_rows_early
+    except Exception:
+        pass
+    return settings.minute_min_rows
+
+
+def _is_minute_usable(minute, *, now: datetime | None = None) -> bool:
+    if minute is None:
+        return False
+    return len(minute) >= _minute_threshold(now)
+
+
+def _short_minute_reason(minute, minute_err, *, now: datetime | None = None) -> str:
+    """区分'分时数据太短'（早盘正常）和'分时拉取失败'（真降级）。"""
+    if minute_err is not None:
+        return f"分时拉取失败已降级: {minute_err}"
+    if minute is None:
+        return "分时数据为空，使用盘口代理打分"
+    threshold = _minute_threshold(now)
+    if len(minute) < threshold:
+        return f"分时数据偏短({len(minute)}根/需{threshold}根)，早盘尚未走出形态，使用盘口代理打分"
+    return "分时数据不足，使用盘口代理打分"
+
+
+def _market_env(
+    *, force_index: str | None = None
+) -> dict[str, Any]:
+    """拉大盘指数快照，判定当日环境等级：normal / warn / block。
+
+    warn：上证跌幅达 warn_pct -> 结果分数折减 + 前端风险横幅。
+    block：上证跌幅达 block_pct -> 进攻型观望（直接空结果）。
+    拉取失败静默降级为 normal（不阻塞扫描，note 里标注）。
+    """
+    ref = force_index or settings.market_env_ref_index
+    if not settings.market_env_enabled or settings.demo_mode:
+        return {"level": "normal", "ref_index": ref, "pct": None, "note": "演示模式未接入大盘"}
+    try:
+        snap = mkt.fetch_index_snapshot([ref])
+    except Exception:
+        snap = {}
+    idx = snap.get(ref) or {}
+    pct = idx.get("pct")
+    if pct is None:
+        return {"level": "normal", "ref_index": ref, "pct": None, "note": "大盘快照不可用，跳过环境闸门"}
+    level = "normal"
+    if pct <= settings.market_env_block_pct:
+        level = "block"
+    elif pct <= settings.market_env_warn_pct:
+        level = "warn"
+    return {
+        "level": level,
+        "ref_index": ref,
+        "ref_name": idx.get("name"),
+        "pct": round(float(pct), 2),
+        "note": "",
+    }
 
 
 def _score_from_spot(row: dict[str, Any], *, mode: ScanMode = "fenshi") -> dict[str, Any]:
@@ -319,7 +394,8 @@ def _enrich_one(
     }
 
     if mode == "leader_dip":
-        if minute is not None and len(minute) >= 15:
+        now = datetime.now()
+        if _is_minute_usable(minute, now=now):
             fenshi = score_leader_dip(
                 minute,
                 price=float(row.get("price") or 0),
@@ -330,18 +406,20 @@ def _enrich_one(
             fenshi["proxy"] = False
         else:
             fenshi = _score_from_spot(row, mode="leader_dip")
-            if minute_err is not None:
-                fenshi["reasons"] = [f"分时拉取失败已降级: {minute_err}"] + list(fenshi.get("reasons") or [])
-    elif minute is not None and len(minute) >= 15:
+            fenshi["reasons"] = [_short_minute_reason(minute, minute_err, now=now)] + list(
+                fenshi.get("reasons") or []
+            )
+    elif _is_minute_usable(minute, now=datetime.now()):
         fenshi = score_offensive_fenshi(minute)
         fenshi["proxy"] = False
     else:
         fenshi = _score_from_spot(row, mode="fenshi")
-        if minute_err is not None:
-            fenshi["reasons"] = [f"分时拉取失败已降级: {minute_err}"] + list(fenshi.get("reasons") or [])
+        fenshi["reasons"] = [_short_minute_reason(minute, minute_err, now=datetime.now())] + list(
+            fenshi.get("reasons") or []
+        )
 
     # 进攻型：今/昨量硬过滤 + 假推升降权（leader_dip 不套用 block）
-    if mode == "fenshi" and not fenshi.get("proxy") and minute is not None and len(minute) >= 15:
+    if mode == "fenshi" and not fenshi.get("proxy") and _is_minute_usable(minute, now=datetime.now()):
         day_vol = day_volume_health(
             minute,
             daily,
@@ -357,6 +435,15 @@ def _enrich_one(
             day_vol_level=str(day_vol.get("level") or ""),
         )
         fenshi = apply_day_vol_and_false_push(fenshi, day_vol, false_push)
+        # 追高惩罚：拉升中的票量能/斜率自然拉满，需补上"买入位置"维度
+        if settings.chase_penalty_enabled:
+            fenshi = apply_chase_penalty(
+                fenshi,
+                price=float(row.get("price") or 0),
+                day_high=float(row.get("high") or 0),
+                day_low=float(row.get("low") or 0),
+                vwap=fenshi.get("vwap"),
+            )
 
     risk = risk_flags(
         anom["pct_from_low"],
@@ -375,8 +462,12 @@ def _enrich_one(
     if tags:
         reasons.insert(0, f"强势板块: {', '.join(tags[:2])}")
         if mode == "leader_dip" or universe_policy == "soft":
-            bonus = settings.soft_hot_board_bonus if universe_policy == "soft" else 8.0
-            fenshi["score"] = min(100.0, float(fenshi.get("score") or 0) + bonus)
+            bonus = (
+                settings.soft_hot_board_bonus
+                if universe_policy == "soft"
+                else settings.leader_dip_hot_board_bonus
+            )
+            fenshi["score"] = min(settings.fenshi_score_cap, float(fenshi.get("score") or 0) + bonus)
             if universe_policy == "soft" and mode == "fenshi":
                 reasons.append(f"热门板块加权+{bonus:g}")
 
@@ -387,7 +478,7 @@ def _enrich_one(
         and not fenshi.get("strong_push")
         and not (fenshi.get("pullback") and fenshi.get("reattack"))
     ):
-        fenshi["score"] = max(0.0, float(fenshi.get("score") or 0) - 15)
+        fenshi["score"] = max(0.0, float(fenshi.get("score") or 0) - settings.no_pattern_penalty)
         reasons.append("未确认回踩再攻(降权)")
 
     return {
@@ -419,6 +510,9 @@ def _enrich_one(
             "day_vol_ratio": fenshi.get("day_vol_ratio"),
             "day_vol_level": fenshi.get("day_vol_level"),
             "false_push": fenshi.get("false_push"),
+            "day_position": fenshi.get("day_position"),
+            "vwap_deviation": fenshi.get("vwap_deviation"),
+            "chase_penalty": fenshi.get("chase_penalty"),
         },
     }
 
@@ -436,6 +530,7 @@ def _empty_scan_payload(
     hot_boards: list[dict[str, Any]],
     universe_sectors: list[dict[str, Any]],
     universe_size: int = 0,
+    market_env: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "session_note": session_note,
@@ -465,6 +560,7 @@ def _empty_scan_payload(
         "items": [],
         "timings": {},
         "error_code": None,
+        "market_env": market_env,
     }
 
 
@@ -534,6 +630,40 @@ def run_scan(
     elif universe_policy == "soft":
         mode_label += "·软加权测试"
     session_note = f"{mode_label} · {session_note}"
+
+    # 大盘环境闸门：指数暴跌日整体降级/观望
+    market_env = _market_env()
+    if market_env.get("level") == "block":
+        session_note += (
+            f" · 大盘环境观望（{market_env.get('ref_name') or market_env.get('ref_index')}"
+            f" {market_env.get('pct'):+.2f}% ≤ {settings.market_env_block_pct}%，进攻型暂停）"
+        )
+        payload = _empty_scan_payload(
+            session_note=session_note,
+            spot_source="skipped",
+            min_amount_yi=min_amount_yi,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            session=session,
+            top_n=top_n,
+            mode=mode,
+            hot_boards=[],
+            universe_sectors=[],
+        )
+        payload["error_code"] = "market_blocked"
+        payload["market_env"] = market_env
+        payload["timings"] = timings
+        return payload
+    elif market_env.get("level") == "warn":
+        session_note += (
+            f" · 大盘偏弱（{market_env.get('ref_name') or market_env.get('ref_index')}"
+            f" {market_env.get('pct'):+.2f}%，分数已折减至 {settings.market_env_score_factor:g}）"
+        )
+    elif market_env.get("pct") is not None:
+        session_note += (
+            f" · 大盘（{market_env.get('ref_name') or market_env.get('ref_index')}"
+            f" {market_env.get('pct'):+.2f}%）"
+        )
 
     hot_boards: list[dict[str, Any]] = []
     universe_sectors: list[dict[str, Any]] = []
@@ -727,21 +857,23 @@ def run_scan(
         progress("enrich", 0.7, f"分时打分 0/{len(rows)}")
         t0 = time.perf_counter()
         workers = 4 if not settings.demo_mode else 2
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [
-                pool.submit(
-                    _enrich_one,
-                    r,
-                    board_tags,
-                    mode=mode,
-                    universe_policy=universe_policy,
-                )
-                for r in rows
-            ]
-            for fut in as_completed(futs):
+        pool = ThreadPoolExecutor(max_workers=workers)
+        futs = [
+            pool.submit(
+                _enrich_one,
+                r,
+                board_tags,
+                mode=mode,
+                universe_policy=universe_policy,
+            )
+            for r in rows
+        ]
+        enrich_budget = max(float(settings.enrich_timeout_seconds), 1.0)
+        try:
+            for fut in as_completed(futs, timeout=enrich_budget):
                 check_cancel()
                 try:
-                    item = fut.result(timeout=25)
+                    item = fut.result()
                 except Exception:
                     timed_out += 1
                     item = None
@@ -754,10 +886,27 @@ def run_scan(
                         0.7 + 0.25 * (done_n / total),
                         f"分时打分 {done_n}/{len(rows)}",
                     )
+        except FutureTimeoutError:
+            # 整体预算耗尽：未完成的候选计超时并跳过，不再无限等待
+            pending = [f for f in futs if not f.done()]
+            for f in pending:
+                f.cancel()
+            timed_out += len(pending)
+            done_n = len(rows)
+            progress("enrich", 0.95, f"分时打分超时预算{enrich_budget:g}s，跳过 {len(pending)} 只")
+        finally:
+            # 不等待残留线程：慢请求在后台自行结束，不阻塞本轮扫描
+            pool.shutdown(wait=False, cancel_futures=True)
         mark("enrich_ms", t0)
 
         if timed_out:
             session_note += f" · {timed_out}只分时超时已跳过"
+
+        # 大盘偏弱：对进攻型分数整体折减（龙头低吸是低吸逻辑，不做折减）
+        if market_env.get("level") == "warn" and mode == "fenshi":
+            factor = float(settings.market_env_score_factor)
+            for x in results:
+                x["score"] = round(float(x.get("score") or 0) * factor, 1)
 
         results.sort(key=lambda x: (x.get("score") or 0, x.get("pct") or 0), reverse=True)
         if universe_policy == "quota":
@@ -816,10 +965,40 @@ def run_scan(
             "items": results,
             "timings": timings,
             "error_code": None,
+            "market_env": market_env,
         }
         progress("done", 1.0, f"完成，命中 {len(results)} 只")
         try:
             save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
+        except Exception:
+            pass
+        # 扫描质量摘要落库（结构化、长期积累，供调参/数据源健康对比）
+        try:
+            proxy_count = sum(1 for x in results if (x.get("fenshi") or {}).get("proxy"))
+            positions = [
+                float((x.get("fenshi") or {}).get("day_position"))
+                for x in results
+                if (x.get("fenshi") or {}).get("day_position") is not None
+            ]
+            save_scan_quality(
+                {
+                    "mode": mode,
+                    "universe_policy": universe_policy,
+                    "candidates": len(rows),
+                    "scored": scored,
+                    "fenshi_ok": fenshi_ok,
+                    "proxy_count": proxy_count,
+                    "timed_out": timed_out,
+                    "total_ms": timings.get("total_ms"),
+                    "market_env_level": market_env.get("level"),
+                    "market_pct": market_env.get("pct"),
+                    "spot_source": spot_source,
+                    "strategy_version": settings.strategy_version,
+                    "top_avg_day_position": (
+                        round(sum(positions) / len(positions), 3) if positions else None
+                    ),
+                }
+            )
         except Exception:
             pass
         return payload

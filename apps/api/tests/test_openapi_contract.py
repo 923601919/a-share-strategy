@@ -20,6 +20,7 @@ REQUIRED_PATHS = {
     "/api/watchlist",
     "/api/watchlist/history",
     "/api/watchlist/stats",
+    "/api/stats/score-effectiveness",
     "/api/sim",
 }
 

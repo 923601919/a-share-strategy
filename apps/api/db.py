@@ -82,6 +82,25 @@ def init_db() -> None:
                 user_id INTEGER NOT NULL DEFAULT 1
             );
 
+            CREATE TABLE IF NOT EXISTS scan_quality (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                universe_policy TEXT NOT NULL,
+                candidates INTEGER,
+                scored INTEGER,
+                fenshi_ok INTEGER,
+                proxy_count INTEGER,
+                timed_out INTEGER,
+                total_ms REAL,
+                market_env_level TEXT,
+                market_pct REAL,
+                spot_source TEXT,
+                strategy_version TEXT,
+                top_avg_day_position REAL,
+                user_id INTEGER NOT NULL DEFAULT 1
+            );
+
             CREATE TABLE IF NOT EXISTS watch_tracks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT NOT NULL,
@@ -93,6 +112,8 @@ def init_db() -> None:
                 entry_score REAL,
                 created_at TEXT NOT NULL,
                 removed_at TEXT,
+                day_position REAL,
+                vwap_deviation REAL,
                 user_id INTEGER NOT NULL DEFAULT 1
             );
 
@@ -178,6 +199,12 @@ def init_db() -> None:
                 meta TEXT DEFAULT '',
                 user_id INTEGER NOT NULL DEFAULT 1
             );
+
+            CREATE TABLE IF NOT EXISTS trade_calendar (
+                year INTEGER PRIMARY KEY,
+                dates TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         _migrate_watchlist(conn)
@@ -193,6 +220,8 @@ def _migrate_watch_tracks(conn: sqlite3.Connection) -> None:
         ("exit_return_pct", "REAL"),
         ("completion_reason", "TEXT"),
         ("completion_snapshot", "TEXT"),
+        ("day_position", "REAL"),
+        ("vwap_deviation", "REAL"),
     ]:
         if col not in cols:
             conn.execute(f"ALTER TABLE watch_tracks ADD COLUMN {col} {typ}")
@@ -346,6 +375,30 @@ def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
         (name,),
     ).fetchone()
     return bool(row)
+
+
+def get_trade_calendar(year: int) -> list[str] | None:
+    """读取缓存的全年交易日（YYYY-MM-DD 列表）。无缓存返回 None。"""
+    with get_db() as conn:
+        if not _table_exists(conn, "trade_calendar"):
+            return None
+        row = conn.execute("SELECT dates FROM trade_calendar WHERE year=?", (year,)).fetchone()
+    if not row:
+        return None
+    try:
+        return [str(d) for d in json.loads(row[0])]
+    except Exception:
+        return None
+
+
+def save_trade_calendar(year: int, dates: list[str]) -> None:
+    now = datetime.now(timezone.utc).astimezone().isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO trade_calendar(year, dates, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(year) DO UPDATE SET dates=excluded.dates, updated_at=excluded.updated_at",
+            (year, json.dumps(sorted(dates)), now),
+        )
 
 
 def _ensure_sim_account(conn: sqlite3.Connection, user_id: int | None = None) -> None:
@@ -529,6 +582,8 @@ def create_watch_track(
     entry_pct: float | None,
     entry_score: float | None,
     created_at: str | None = None,
+    day_position: float | None = None,
+    vwap_deviation: float | None = None,
 ) -> int:
     uid = require_user_id()
     now = created_at or datetime.now(timezone.utc).astimezone().isoformat()
@@ -536,11 +591,12 @@ def create_watch_track(
         cur = conn.execute(
             """
             INSERT INTO watch_tracks(
-                code, name, source, note, entry_price, entry_pct, entry_score, created_at, user_id
+                code, name, source, note, entry_price, entry_pct, entry_score,
+                created_at, day_position, vwap_deviation, user_id
             )
-            VALUES(?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
             """,
-            (code, name, source, note, entry_price, entry_pct, entry_score, now, uid),
+            (code, name, source, note, entry_price, entry_pct, entry_score, now, day_position, vwap_deviation, uid),
         )
         return int(cur.lastrowid)
 
@@ -554,6 +610,8 @@ def add_watch(
     entry_price: float | None = None,
     entry_pct: float | None = None,
     entry_score: float | None = None,
+    day_position: float | None = None,
+    vwap_deviation: float | None = None,
 ) -> dict[str, Any]:
     uid = require_user_id()
     code = code.strip().zfill(6)
@@ -567,6 +625,8 @@ def add_watch(
         entry_pct=entry_pct,
         entry_score=entry_score,
         created_at=now,
+        day_position=day_position,
+        vwap_deviation=vwap_deviation,
     )
     with get_db() as conn:
         conn.execute(
@@ -596,6 +656,8 @@ def add_watch(
         "entry_price": entry_price,
         "entry_pct": entry_pct,
         "entry_score": entry_score,
+        "day_position": day_position,
+        "vwap_deviation": vwap_deviation,
         "track_id": track_id,
     }
 
@@ -657,7 +719,7 @@ def list_watch_tracks(*, active_only: bool = False, limit: int = 200) -> list[di
     sql = """
         SELECT id, code, name, source, note, entry_price, entry_pct, entry_score,
                created_at, removed_at, exit_price, exit_return_pct,
-               completion_reason, completion_snapshot
+               completion_reason, completion_snapshot, day_position, vwap_deviation
         FROM watch_tracks
         WHERE user_id=?
     """
@@ -804,6 +866,53 @@ def latest_scan_snapshot() -> dict[str, Any] | None:
             (uid,),
         ).fetchone()
     return dict(row) if row else None
+
+
+def save_scan_quality(q: dict[str, Any]) -> None:
+    """落一条扫描质量摘要（结构化、可长期积累，不受快照裁剪影响）。"""
+    uid = require_user_id()
+    now = datetime.now(timezone.utc).astimezone().isoformat()
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO scan_quality(
+                created_at, mode, universe_policy, candidates, scored, fenshi_ok,
+                proxy_count, timed_out, total_ms, market_env_level, market_pct,
+                spot_source, strategy_version, top_avg_day_position, user_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                now,
+                q.get("mode") or "",
+                q.get("universe_policy") or "",
+                q.get("candidates"),
+                q.get("scored"),
+                q.get("fenshi_ok"),
+                q.get("proxy_count"),
+                q.get("timed_out"),
+                q.get("total_ms"),
+                q.get("market_env_level"),
+                q.get("market_pct"),
+                q.get("spot_source"),
+                q.get("strategy_version"),
+                q.get("top_avg_day_position"),
+                uid,
+            ),
+        )
+
+
+def list_scan_quality(limit: int = 200, *, mode: str | None = None) -> list[dict[str, Any]]:
+    uid = require_user_id()
+    sql = "SELECT * FROM scan_quality WHERE user_id=?"
+    args: list[Any] = [uid]
+    if mode:
+        sql += " AND mode=?"
+        args.append(mode)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with get_db() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
 
 
 def save_daily_review(trade_date: str, payload_json: str) -> dict[str, Any]:

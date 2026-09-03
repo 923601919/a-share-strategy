@@ -5,8 +5,14 @@ from typing import Any, Literal
 
 import pandas as pd
 
+from rules.params import StrategyParams
+
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
 DayVolLevel = Literal["block", "warn", "healthy", "ok", "skip"]
+
+
+def _P(p: StrategyParams | None) -> StrategyParams:
+    return p if p is not None else StrategyParams.from_settings()
 
 
 def _hm(now_hm: str | None = None) -> int:
@@ -135,8 +141,10 @@ def detect_false_push(
     day_vol_ratio: float | None = None,
     day_vol_level: str | None = None,
     lookback: int = 30,
+    p: StrategyParams | None = None,
 ) -> dict[str, Any]:
     """冲高后跌破均价 + 日量偏大 → 假进攻。"""
+    pp = _P(p)
     out = {"false_push": False, "near_high_then_below": False}
     if minute is None or len(minute) < 15 or "close" not in minute.columns:
         return out
@@ -149,8 +157,8 @@ def detect_false_push(
     last = float(c.iloc[-1])
     last_vwap = float(vwap.iloc[-1]) if len(vwap) else last
     window_high = float(c.max())
-    touched_high = (c >= window_high * 0.98).any()
-    below_vwap = last < last_vwap * 0.998
+    touched_high = (c >= window_high * pp.fenshi_near_high_factor).any()
+    below_vwap = last < last_vwap * (1 - pp.fenshi_vwap_tolerance)
     near_high_then_below = bool(touched_high and below_vwap)
 
     vol_hot = bool(
@@ -169,8 +177,11 @@ def apply_day_vol_and_false_push(
     fenshi: dict[str, Any],
     day_vol: dict[str, Any],
     false_push: dict[str, Any],
+    *,
+    p: StrategyParams | None = None,
 ) -> dict[str, Any]:
     """对进攻型打分结果施加日量健康加分 / warn 与假推升降权（block 由调用方剔除）。"""
+    pp = _P(p)
     out = dict(fenshi)
     reasons = list(out.get("reasons") or [])
     score = float(out.get("score") or 0)
@@ -181,22 +192,70 @@ def apply_day_vol_and_false_push(
     out["day_vol_level"] = level
 
     if level == "healthy":
-        score = min(100.0, score + 5)
+        score = min(pp.fenshi_score_cap, score + pp.day_vol_healthy_bonus)
         reasons.append(str(day_vol.get("message") or "日量健康(轻微放量)"))
     elif level == "warn":
-        score = max(0.0, score - 15)
+        score = max(0.0, score - pp.day_vol_warn_penalty)
         reasons.append(str(day_vol.get("message") or "日量偏快(降权)"))
 
     if false_push.get("false_push"):
         out["strong_push"] = False
         out["pullback"] = False
         out["reattack"] = False
-        score = max(0.0, score - 25)
+        score = max(0.0, score - pp.false_push_penalty)
         reasons.append("冲高跌破均价·疑似假进攻")
 
-    out["score"] = round(min(score, 100.0), 1)
+    out["score"] = round(min(score, pp.fenshi_score_cap), 1)
     out["reasons"] = reasons
     out["false_push"] = bool(false_push.get("false_push"))
+    return out
+
+
+def apply_chase_penalty(
+    fenshi: dict[str, Any],
+    *,
+    price: float,
+    day_high: float,
+    day_low: float,
+    vwap: float | None = None,
+    p: StrategyParams | None = None,
+) -> dict[str, Any]:
+    """追高惩罚：买入位置越接近日内高点、离均价乖离越大，越可能是追高。
+
+    策略意图是「回踩均价后重新上攻」，而量能/斜率本质是"正在拉升"的度量，
+    会被重复计入导致拉升中的票得分虚高。本函数补上"我在什么位置买"这一维度：
+    - 日内位置（price 在 day_low..day_high 中的分位）过高 -> 买在当天高点附近
+    - 现价正乖离均价过大 -> 短线过热，回踩空间大
+    """
+    pp = _P(p)
+    out = dict(fenshi)
+    reasons = list(out.get("reasons") or [])
+    score = float(out.get("score") or 0)
+
+    pos: float | None = None
+    if day_high > day_low > 0 and price > 0:
+        pos = (price - day_low) / (day_high - day_low)
+        out["day_position"] = round(pos, 3)
+
+    dev: float | None = None
+    if vwap and vwap > 0 and price > 0:
+        dev = (price / vwap - 1.0) * 100
+        out["vwap_deviation"] = round(dev, 2)
+
+    penalty = 0.0
+    if pos is not None and pos >= pp.chase_pos_high:
+        penalty += pp.chase_pos_penalty
+        reasons.append(f"逼近日内高位(位置{pos:.0%}，追高降权-{pp.chase_pos_penalty:g})")
+    if dev is not None and dev >= pp.chase_dev_high:
+        penalty += pp.chase_dev_penalty
+        reasons.append(f"乖离均价{dev:.2f}%(降权-{pp.chase_dev_penalty:g})")
+
+    if penalty:
+        score = max(0.0, score - penalty)
+
+    out["score"] = round(min(score, pp.fenshi_score_cap), 1)
+    out["reasons"] = reasons
+    out["chase_penalty"] = round(penalty, 1)
     return out
 
 
@@ -244,16 +303,46 @@ def session_allowed(session: SessionFilter, *, demo_mode: bool = False) -> tuple
 
 
 def compute_vwap_series(minute: pd.DataFrame) -> pd.Series:
+    """
+    累计均价（VWAP）。
+
+    优先用真实成交额: vwap = cum(amount) / cum(股数)。
+    成交量单位（股/手）由 amount/(volume*close) 的中位数自动探测。
+    无成交额列时回退为成交量加权收盘价（量纲无关，×100 假设不影响结果）。
+    """
     if minute.empty:
         return pd.Series(dtype=float)
     df = minute.copy()
-    if "amount" in df.columns and df["amount"].sum() > 0:
-        vol_shares = df["volume"].clip(lower=0) * 100
-        typical = df["close"]
-        cum_amt = (typical * vol_shares).cumsum()
-        cum_vol = vol_shares.cumsum().replace(0, pd.NA)
-        vwap = cum_amt / cum_vol
+
+    vol = None
+    if "volume" in df.columns:
+        vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0).clip(lower=0)
+
+    if "amount" in df.columns and vol is not None:
+        amt = pd.to_numeric(df["amount"], errors="coerce").fillna(0).clip(lower=0)
+        if float(amt.sum()) > 0 and float(vol.sum()) > 0:
+            shares = vol.copy()
+            # 探测 volume 单位：股 → amt≈vol*close；手 → amt≈vol*100*close
+            if "close" in df.columns:
+                close = pd.to_numeric(df["close"], errors="coerce").abs()
+                ok = (amt > 0) & (vol > 0) & close.notna() & (close > 0)
+                if bool(ok.any()):
+                    scale = float((vol[ok] * close[ok] / amt[ok]).median())
+                    if scale < 0.5:  # vol 单位是"手"
+                        shares = vol * 100
+            cum_amt = amt.cumsum()
+            cum_vol = shares.cumsum().replace(0, pd.NA)
+            vwap = cum_amt / cum_vol
+            return vwap.ffill().astype(float)
+
+    if vol is not None and float(vol.sum()) > 0 and "close" in df.columns:
+        # 无成交额：close 的量加权均值（权重单位任意，结果一致）
+        w = vol.replace(0, pd.NA)
+        num = (df["close"] * w).cumsum()
+        den = w.cumsum()
+        vwap = num / den
         return vwap.ffill().astype(float)
+
     return df["close"].expanding().mean()
 
 
@@ -263,6 +352,7 @@ def _detect_pullback_reattack(
     volume: pd.Series,
     *,
     lookback: int = 30,
+    p: StrategyParams | None = None,
 ) -> dict[str, Any]:
     """
     回踩均价后再攻：
@@ -270,6 +360,7 @@ def _detect_pullback_reattack(
     2) 末段重新站上均价并上行
     3) 末段放量
     """
+    pp = _P(p)
     n = len(closes)
     lb = min(lookback, n - 1)
     if lb < 12:
@@ -285,34 +376,40 @@ def _detect_pullback_reattack(
     v = vwap.iloc[-lb:].astype(float)
     vol = volume.iloc[-lb:].astype(float).fillna(0)
 
-    above_now = float(c.iloc[-1]) >= float(v.iloc[-1]) * 0.998
+    tol = 1 - pp.fenshi_vwap_tolerance
+    above_now = float(c.iloc[-1]) >= float(v.iloc[-1]) * tol
 
-    # 回踩区：除最后 6 根外的前段
-    hist_c = c.iloc[:-6]
-    hist_v = v.iloc[:-6]
+    # 回踩区：除末段外的前段
+    hist_c = c.iloc[:-pp.fenshi_tail_bars]
+    hist_v = v.iloc[:-pp.fenshi_tail_bars]
     if len(hist_c) < 5:
         pullback = False
     else:
         ratio = hist_c / hist_v.replace(0, pd.NA)
-        # 贴近均价（±0.8%）或短暂跌破
-        near = ((ratio >= 0.992) & (ratio <= 1.008)).any()
-        below = (ratio < 0.998).any()
+        # 贴近均价（±band）或短暂跌破
+        near = ((ratio >= 1 - pp.fenshi_pullback_band) & (ratio <= 1 + pp.fenshi_pullback_band)).any()
+        below = (ratio < tol).any()
         pullback = bool(near or below)
 
-    # 再攻：末 6 根整体抬升且站上均价
-    tail = c.iloc[-6:]
-    tail_v = v.iloc[-6:]
+    # 再攻：末段整体抬升且站上均价
+    tail = c.iloc[-pp.fenshi_tail_bars:]
+    tail_v = v.iloc[-pp.fenshi_tail_bars:]
     reattack = bool(
         above_now
         and float(tail.iloc[-1]) > float(tail.iloc[0])
-        and (tail >= tail_v * 0.998).sum() >= 4
+        and (tail >= tail_v * tol).sum() >= pp.fenshi_tail_above_min
     )
 
-    recent_vol = float(vol.iloc[-5:].mean() or 0)
-    prior_vol = float(vol.iloc[-15:-5].mean() or 0) if len(vol) >= 15 else float(vol.iloc[:-5].mean() or 1)
+    rw = pp.vol_recent_window
+    pw = pp.vol_prior_window
+    recent_vol = float(vol.iloc[-rw:].mean() or 0)
+    prior_vol = (
+        float(vol.iloc[-pw:-rw].mean() or 0) if len(vol) >= pw else float(vol.iloc[:-rw].mean() or 1)
+    )
     vol_breakout = recent_vol / prior_vol if prior_vol > 0 else 1.0
 
-    slope = float((c.iloc[-1] / c.iloc[-8] - 1.0) * 100) if float(c.iloc[-8]) else 0.0
+    sw = pp.slope_window
+    slope = float((c.iloc[-1] / c.iloc[-sw] - 1.0) * 100) if float(c.iloc[-sw]) else 0.0
 
     return {
         "pullback": pullback,
@@ -329,8 +426,10 @@ def _detect_strong_push(
     volume: pd.Series,
     *,
     lookback: int = 30,
+    p: StrategyParams | None = None,
 ) -> dict[str, Any]:
     """强势推升：全天站稳均价 + 斜率大 + 放量 + 逼近日内高位（作者新集能源类）。"""
+    pp = _P(p)
     n = len(closes)
     lb = min(lookback, n - 1)
     if lb < 12:
@@ -346,16 +445,26 @@ def _detect_strong_push(
     v = vwap.iloc[-lb:].astype(float)
     vol = volume.iloc[-lb:].astype(float).fillna(0)
 
-    above_ratio = float((c >= v * 0.998).sum()) / max(len(c), 1)
-    slope = float((c.iloc[-1] / c.iloc[-8] - 1.0) * 100) if float(c.iloc[-8]) else 0.0
-    recent_vol = float(vol.iloc[-5:].mean() or 0)
-    prior_vol = float(vol.iloc[-15:-5].mean() or 0) if len(vol) >= 15 else float(vol.iloc[:-5].mean() or 1)
+    tol = 1 - pp.fenshi_vwap_tolerance
+    above_ratio = float((c >= v * tol).sum()) / max(len(c), 1)
+    sw = pp.slope_window
+    slope = float((c.iloc[-1] / c.iloc[-sw] - 1.0) * 100) if float(c.iloc[-sw]) else 0.0
+    rw = pp.vol_recent_window
+    pw = pp.vol_prior_window
+    recent_vol = float(vol.iloc[-rw:].mean() or 0)
+    prior_vol = (
+        float(vol.iloc[-pw:-rw].mean() or 0) if len(vol) >= pw else float(vol.iloc[:-rw].mean() or 1)
+    )
     vol_breakout = recent_vol / prior_vol if prior_vol > 0 else 1.0
-    near_high = float(c.iloc[-1]) >= float(c.max()) * 0.98
-    above_now = float(c.iloc[-1]) >= float(v.iloc[-1]) * 0.998
+    near_high = float(c.iloc[-1]) >= float(c.max()) * pp.fenshi_near_high_factor
+    above_now = float(c.iloc[-1]) >= float(v.iloc[-1]) * tol
 
     strong_push = bool(
-        above_ratio >= 0.75 and slope >= 0.8 and vol_breakout >= 1.3 and near_high and above_now
+        above_ratio >= pp.strong_push_min_above_ratio
+        and slope >= pp.strong_push_min_slope
+        and vol_breakout >= pp.strong_push_min_vol
+        and near_high
+        and above_now
     )
 
     return {
@@ -376,38 +485,40 @@ def score_leader_dip(
     ma5: float | None,
     open_price: float,
     lookback: int = 30,
+    p: StrategyParams | None = None,
 ) -> dict[str, Any]:
     """龙头低吸：水下/平盘附近 + 贴近 MA5 + 分时企稳。"""
+    pp = _P(p)
     score = 0.0
     reasons: list[str] = []
 
-    if -2.0 <= pct <= 0.5:
-        score += 28
+    if pp.ld_pct_low <= pct <= pp.ld_pct_high:
+        score += pp.ld_pct_high_score
         reasons.append(f"水下/平盘企稳({pct:.2f}%)")
-    elif pct <= 1.5:
-        score += 18
+    elif pct <= pp.ld_pct_mild:
+        score += pp.ld_pct_mild_score
         reasons.append(f"涨幅温和({pct:.2f}%)")
     else:
         reasons.append(f"涨幅偏高({pct:.2f}%)")
 
     if ma5 and ma5 > 0 and price > 0:
         dist = abs(price / ma5 - 1.0) * 100
-        if dist <= 1.5:
-            score += 32
+        if dist <= pp.ld_ma5_near:
+            score += pp.ld_ma5_near_score
             reasons.append(f"贴近MA5({dist:.2f}%)")
-        elif dist <= 3.0:
-            score += 18
+        elif dist <= pp.ld_ma5_mid:
+            score += pp.ld_ma5_mid_score
             reasons.append(f"接近MA5({dist:.2f}%)")
         else:
             reasons.append(f"偏离MA5({dist:.2f}%)")
     else:
         reasons.append("MA5不可用")
 
-    if open_price > 0 and price >= open_price * 0.995:
-        score += 12
+    if open_price > 0 and price >= open_price * pp.ld_open_hold_factor:
+        score += pp.ld_open_hold_score
         reasons.append("现价不低于开盘")
-    elif open_price > 0 and price >= open_price * 0.98:
-        score += 6
+    elif open_price > 0 and price >= open_price * pp.ld_open_soft_factor:
+        score += pp.ld_open_soft_score
         reasons.append("小幅低开回升")
 
     strong_push = False
@@ -420,38 +531,38 @@ def score_leader_dip(
         df = minute.dropna(subset=["close"]).reset_index(drop=True)
         vwap = compute_vwap_series(df)
         vol = df["volume"] if "volume" in df.columns else pd.Series([1.0] * len(df))
-        push = _detect_strong_push(df["close"], vwap, vol, lookback=lookback)
-        pat = _detect_pullback_reattack(df["close"], vwap, vol, lookback=lookback)
+        push = _detect_strong_push(df["close"], vwap, vol, lookback=lookback, p=pp)
+        pat = _detect_pullback_reattack(df["close"], vwap, vol, lookback=lookback, p=pp)
         last = float(df["close"].iloc[-1])
         last_vwap = float(vwap.iloc[-1]) if len(vwap) else last
         vwap_val = round(last_vwap, 3)
-        above_vwap = bool(last >= last_vwap * 0.998)
+        above_vwap = bool(last >= last_vwap * (1 - pp.fenshi_vwap_tolerance))
         slope = round(float(max(pat["slope"], push["slope"])), 3)
         vol_expand = round(float(max(pat["vol_breakout"], push["vol_breakout"])), 3)
         strong_push = bool(push["strong_push"])
 
         if above_vwap:
-            score += 15
+            score += pp.ld_above_vwap_score
             reasons.append("分时站稳均价")
-        elif last >= last_vwap * 0.992:
-            score += 8
+        elif last >= last_vwap * pp.ld_near_vwap_factor:
+            score += pp.ld_near_vwap_score
             reasons.append("分时贴近均价")
         else:
             reasons.append("分时仍偏弱")
 
-        tail = df["close"].iloc[-8:].astype(float)
-        if len(tail) >= 6 and float(tail.iloc[-1]) >= float(tail.iloc[0]):
-            score += 10
+        tail = df["close"].iloc[-pp.ld_tail_bars:].astype(float)
+        if len(tail) >= pp.ld_tail_min_bars and float(tail.iloc[-1]) >= float(tail.iloc[0]):
+            score += pp.ld_tail_score
             reasons.append("近段止跌回升")
     else:
         reasons.append("分时数据不足，仅盘口评估")
 
     if in_attack_window():
-        score = min(100.0, score + 5)
+        score = min(pp.fenshi_score_cap, score + pp.attack_window_bonus)
         reasons.insert(0, "核心买点窗口(10:15-10:40)")
 
     return {
-        "score": round(min(score, 100.0), 1),
+        "score": round(min(score, pp.fenshi_score_cap), 1),
         "above_vwap": above_vwap,
         "pullback": None,
         "reattack": None,
@@ -465,8 +576,11 @@ def score_leader_dip(
     }
 
 
-def score_offensive_fenshi(minute: pd.DataFrame, lookback: int = 30) -> dict[str, Any]:
+def score_offensive_fenshi(
+    minute: pd.DataFrame, lookback: int = 30, p: StrategyParams | None = None
+) -> dict[str, Any]:
     """进攻型分时：回踩均价 + 放量再攻（B）。"""
+    pp = _P(p)
     if minute is None or len(minute) < 15 or "close" not in minute.columns:
         return {
             "score": 0.0,
@@ -482,8 +596,8 @@ def score_offensive_fenshi(minute: pd.DataFrame, lookback: int = 30) -> dict[str
     vwap = compute_vwap_series(df)
     vol = df["volume"] if "volume" in df.columns else pd.Series([1.0] * len(df))
 
-    pat = _detect_pullback_reattack(df["close"], vwap, vol, lookback=lookback)
-    push = _detect_strong_push(df["close"], vwap, vol, lookback=lookback)
+    pat = _detect_pullback_reattack(df["close"], vwap, vol, lookback=lookback, p=pp)
+    push = _detect_strong_push(df["close"], vwap, vol, lookback=lookback, p=pp)
     last = float(df["close"].iloc[-1])
     last_vwap = float(vwap.iloc[-1]) if len(vwap) else last
 
@@ -491,52 +605,52 @@ def score_offensive_fenshi(minute: pd.DataFrame, lookback: int = 30) -> dict[str
     reasons: list[str] = []
 
     if push["strong_push"]:
-        score += 38
+        score += pp.score_strong_push
         reasons.append("强势推升(站稳均价逼近高位)")
     elif pat["pullback"] and pat["reattack"]:
-        score += 40
+        score += pp.score_pullback_reattack
         reasons.append("回踩均价后重新上攻")
     elif pat["pullback"]:
-        score += 18
+        score += pp.score_pullback_only
         reasons.append("出现回踩均价")
     elif pat["reattack"]:
-        score += 22
+        score += pp.score_reattack_only
         reasons.append("站上均价上攻")
     else:
         reasons.append("未形成回踩再攻形态")
 
     if pat["above_vwap"] or push["above_vwap"]:
-        score += 15
+        score += pp.score_above_vwap
         reasons.append("现价站稳均价")
     else:
         reasons.append("现价未站稳均价")
 
     vb = float(max(pat["vol_breakout"], push["vol_breakout"]))
-    if vb >= 1.8:
-        score += 25
+    if vb >= pp.vol_hot:
+        score += pp.vol_hot_score
         reasons.append(f"再攻放量{vb:.2f}x")
-    elif vb >= 1.3:
-        score += 12
+    elif vb >= pp.vol_mild:
+        score += pp.vol_mild_score
         reasons.append(f"量能略增{vb:.2f}x")
     else:
         reasons.append(f"再攻量能偏弱({vb:.2f}x)")
 
     slope = float(max(pat["slope"], push["slope"]))
-    if slope >= 1.0:
-        score += 20
+    if slope >= pp.slope_hot:
+        score += pp.slope_hot_score
         reasons.append(f"再攻斜率{slope:.2f}%")
-    elif slope >= 0.4:
-        score += 10
+    elif slope >= pp.slope_mild:
+        score += pp.slope_mild_score
         reasons.append(f"再攻温和{slope:.2f}%")
     else:
         reasons.append(f"再攻斜率偏弱{slope:.2f}%")
 
     if in_attack_window():
-        score = min(100.0, score + 5)
+        score = min(pp.fenshi_score_cap, score + pp.attack_window_bonus)
         reasons.insert(0, "核心买点窗口(10:15-10:40)")
 
     return {
-        "score": round(min(score, 100.0), 1),
+        "score": round(min(score, pp.fenshi_score_cap), 1),
         "above_vwap": pat["above_vwap"] or push["above_vwap"],
         "pullback": pat["pullback"],
         "reattack": pat["reattack"],

@@ -62,6 +62,7 @@ npm run dev
 
 - **选股**：涨幅/成交额初筛 → 热门概念加权 → 分时得分（站上均价、斜率、量能）→ 30 日异动红线过滤
 - **跟踪**：自选列表刷新行情，展示异动进度、MA5、竞价卖点提示
+- **验证**：`/stats` 分数有效性验证——入池分数分桶 × T+N 胜率/收益，检验打分是否真的有效（纯本地库计算）
 - 个股代码可点到东方财富分时页人工确认
 
 ## 环境变量（API）
@@ -81,6 +82,23 @@ npm run dev
 | `MIN_AMOUNT_YI` | 成交额下限（亿） | 1 |
 | `ANOMALY_WARN_PCT` | 异动警告阈值 | 180 |
 | `ANOMALY_BLOCK_PCT` | 异动剔除阈值 | 195 |
+| `EXCLUDE_STAR_MARKET` | 剔除科创板（688/689） | true |
+| `EXCLUDE_BSE` | 剔除北交所/老三板（4/8/92 开头） | true |
+| `DAILY_CACHE_ENABLED` | 日线按日缓存（盘前/收盘后缓存到下一交易日） | true |
+| `DAILY_CACHE_INTRADAY_TTL` | 盘中日线缓存秒数 | 1800 |
+| `CHASE_PENALTY_ENABLED` | 追高惩罚（避免拉升中的票因量能/斜率虚高） | true |
+| `CHASE_POS_HIGH` | 日内位置 ≥ 此值判为逼近日内高位 | 0.90 |
+| `CHASE_POS_PENALTY` | 逼近日内高位的降权分 | 15 |
+| `CHASE_DEV_HIGH` | 正乖离均价 ≥ 此百分比(%)判为乖离过大 | 2.5 |
+| `CHASE_DEV_PENALTY` | 乖离过大的降权分 | 12 |
+| `MINUTE_MIN_ROWS` | 分时最少行数（正常时段） | 15 |
+| `MINUTE_MIN_ROWS_EARLY` | 早盘放宽后的最少行数 | 8 |
+| `MINUTE_EARLY_WINDOW_MIN` | 开盘后多少分钟内走 early 阈值 | 30 |
+
+策略打分参数（回踩带、量能档位、斜率阈值、各项加减分等）已全部集中到
+`apps/api/config.py` 的「策略打分参数」区，可用环境变量覆盖；规则函数通过
+`rules/params.py` 的 `StrategyParams` 取值。**调整参数请同步 `STRATEGY_VERSION`**，
+复盘与验证页按版本回溯才有意义。
 
 前端见 [`apps/web/.env.example`](apps/web/.env.example)（`NEXT_PUBLIC_API_BASE` / `NEXT_PUBLIC_API_KEY`）。
 

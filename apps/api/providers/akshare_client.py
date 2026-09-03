@@ -754,6 +754,70 @@ def empty_spot_df() -> pd.DataFrame:
     return quotes_to_spot_df({})
 
 
+# 指数代码 -> 新浪 symbol。指数不能用 _sina_symbol（会把 000001 判成深市个股）。
+_INDEX_SYMBOLS: dict[str, str] = {
+    "sh000001": "sh000001",  # 上证指数
+    "sz399001": "sz399001",  # 深证成指
+    "sz399006": "sz399006",  # 创业板指
+    "sh000300": "sh000300",  # 沪深300
+    "sh000905": "sh000905",  # 中证500
+}
+
+
+def fetch_index_quotes(codes: list[str]) -> dict[str, dict[str, Any]]:
+    """指数实时快照（新浪 hq.sinajs.cn）。返回 {指数代码: {name, price, pct, ...}}。
+
+    新浪指数字段：parts[0]=名称 parts[1]=今开 parts[2]=昨收 parts[3]=现价
+    parts[4]=最高 parts[5]=最低。失败静默返回空 dict，由调用方降级。
+    """
+    syms: list[str] = []
+    for c in codes:
+        s = str(c).strip().lower()
+        s = s if s in _INDEX_SYMBOLS else _INDEX_SYMBOLS.get(f"{s[:2]}{s[-6:].zfill(6)}", "")
+        if s:
+            syms.append(s)
+    if not syms:
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        text = _http_get_text(
+            f"https://hq.sinajs.cn/list={','.join(syms)}",
+            encoding="gbk",
+            headers={"Referer": "https://finance.sina.com.cn"},
+        )
+        for line in text.splitlines():
+            if "hq_str_" not in line or '="' not in line:
+                continue
+            left, right = line.split('="', 1)
+            payload = right.rstrip('";')
+            if not payload:
+                continue
+            sym = left.split("hq_str_")[-1].strip()
+            parts = payload.split(",")
+            if len(parts) < 6:
+                continue
+            price = _safe_float(parts[3])
+            pre = _safe_float(parts[2])
+            if price <= 0 and pre > 0:
+                price = pre
+            pct = round((price / pre - 1.0) * 100, 2) if pre > 0 and price > 0 else 0.0
+            out[sym] = {
+                "code": sym,
+                "name": parts[0],
+                "price": price,
+                "pct": pct,
+                "open": _safe_float(parts[1]),
+                "pre_close": pre,
+                "high": _safe_float(parts[4]),
+                "low": _safe_float(parts[5]),
+                "source": "sina_index",
+            }
+    except Exception:
+        pass
+    return out
+
+
 def fetch_overnight_global() -> dict[str, Any]:
     """
     隔夜外盘参考（美股主要指数），用于复盘宏观偏弱→竞价卖提示。

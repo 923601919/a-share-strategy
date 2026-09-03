@@ -17,6 +17,7 @@ const LINKS = [
   { href: "/watch", label: "跟踪" },
   { href: "/sim", label: "模拟盘" },
   { href: "/review", label: "复盘" },
+  { href: "/stats", label: "验证" },
 ];
 
 export default function AppNav() {

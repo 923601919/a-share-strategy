@@ -211,6 +211,7 @@ export default function HomePage() {
     setMsg("");
     setAddingCode(item.code);
     const proxy = Boolean((item.fenshi as { proxy?: boolean })?.proxy);
+    const f = item.fenshi as { day_position?: number | null; vwap_deviation?: number | null };
     try {
       const res = await addWatch({
         code: item.code,
@@ -221,6 +222,8 @@ export default function HomePage() {
         entry_pct: item.pct,
         entry_score: item.score,
         minute_confirmed: !proxy,
+        day_position: f?.day_position ?? null,
+        vwap_deviation: f?.vwap_deviation ?? null,
       });
       const sim = res?.sim;
       if (sim?.ok && sim.position) {
@@ -348,6 +351,39 @@ export default function HomePage() {
         <>
           <section className="panel">
             <div className="muted">{data.session_note}</div>
+            {data.market_env && data.market_env.pct != null ? (
+              <div
+                className="row"
+                style={{
+                  marginTop: 8,
+                  padding: "8px 12px",
+                  borderRadius: 8,
+                  background:
+                    data.market_env.level === "warn"
+                      ? "rgba(230,184,77,0.12)"
+                      : data.market_env.level === "block"
+                        ? "rgba(232,93,93,0.12)"
+                        : "rgba(139,155,176,0.08)",
+                  border: "1px solid var(--line)",
+                }}
+              >
+                <strong>大盘环境</strong>
+                <span>
+                  {data.market_env.ref_name || data.market_env.ref_index}{" "}
+                  <span
+                    className={
+                      data.market_env.pct > 0 ? "up" : data.market_env.pct < 0 ? "down" : ""
+                    }
+                  >
+                    {data.market_env.pct > 0 ? "+" : ""}
+                    {data.market_env.pct}%
+                  </span>
+                </span>
+                {data.market_env.level === "warn" ? (
+                  <span className="muted">大盘偏弱，进攻型分数已折减</span>
+                ) : null}
+              </div>
+            ) : null}
             <div className="muted" style={{ marginTop: 6 }}>
               数据源 spot={data.data_source?.spot ?? "?"} · 候选池{" "}
               {data.data_source?.universe_size ?? "?"} · 分时确认{" "}
@@ -393,6 +429,7 @@ export default function HomePage() {
                   <th>名称</th>
                   <th>涨幅</th>
                   <th>得分</th>
+                  <th>日内位置</th>
                   <th>量比</th>
                   <th>异动</th>
                   <th>原因</th>
@@ -402,6 +439,14 @@ export default function HomePage() {
               <tbody>
                 {data.items.map((it) => {
                   const proxy = Boolean((it.fenshi as { proxy?: boolean })?.proxy);
+                  const fenshi = (it.fenshi ?? {}) as {
+                    proxy?: boolean;
+                    day_position?: number | null;
+                    vwap_deviation?: number | null;
+                    chase_penalty?: number | null;
+                  };
+                  const pos = fenshi.day_position;
+                  const chase = Boolean((fenshi.chase_penalty ?? 0) > 0);
                   return (
                     <tr key={it.code}>
                       <td>
@@ -426,6 +471,18 @@ export default function HomePage() {
                         {it.pct}%
                       </td>
                       <td>{it.score}</td>
+                      <td className={chase ? "down" : ""}>
+                        {pos != null ? (
+                          <>
+                            {(pos * 100).toFixed(0)}%
+                            {chase && fenshi.chase_penalty ? (
+                              <div className="muted">追高-{fenshi.chase_penalty}</div>
+                            ) : null}
+                          </>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
                       <td>{it.volume_ratio}</td>
                       <td>
                         <span className={`pill ${it.risk?.level || "ok"}`}>

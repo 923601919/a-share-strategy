@@ -126,6 +126,14 @@ export type ScanItem = {
   fenshi: Record<string, unknown>;
 };
 
+export type MarketEnv = {
+  level: "normal" | "warn" | "block" | string;
+  ref_index?: string;
+  ref_name?: string;
+  pct?: number | null;
+  note?: string;
+};
+
 export type ScanResult = {
   session_note: string;
   data_source?: {
@@ -145,6 +153,7 @@ export type ScanResult = {
   items: ScanItem[];
   timings?: Record<string, number>;
   error_code?: string | null;
+  market_env?: MarketEnv;
 };
 
 export type ScanJob = {
@@ -201,6 +210,7 @@ const ERROR_HINTS: Record<string, string> = {
   empty_universe: "强势板块成分池为空，暂无候选。",
   universe_failed: "板块成分池拉取失败（网络或数据源）。稍后重试。",
   no_quotes: "没有拿到真实行情报价。",
+  market_blocked: "大盘环境走弱，进攻型策略已暂停推荐。",
   cancelled: "扫描已取消。",
   lost: "服务重启，扫描任务已失效，请重新扫描。",
   scan_timeout: "扫描超时，请稍后重试或缩小扫描范围。",
@@ -350,6 +360,90 @@ export function getWatchlistStats() {
   return request<WatchlistStats>("/api/watchlist/stats");
 }
 
+export type DayStat = {
+  day: string;
+  count: number;
+  win_rate: number | null;
+  avg_return: number | null;
+  median_return?: number | null;
+  avg_win?: number | null;
+  avg_loss?: number | null;
+  best?: number | null;
+  worst?: number | null;
+};
+
+export type StatGroup = {
+  bucket?: string;
+  source?: string;
+  label: string;
+  tracks: number;
+  sufficient?: boolean;
+  days: DayStat[];
+};
+
+export type ScoreEffectiveness = {
+  generated_at: string;
+  days_window: number | null;
+  min_samples: number;
+  summary: {
+    total_tracks: number;
+    tracks_with_score: number;
+    tracks_without_score: number;
+    with_t3: number;
+  };
+  buckets: StatGroup[];
+  by_source: StatGroup[];
+  bucket_by_source_t3: Array<{
+    bucket: string;
+    source: string;
+    label: string;
+    count: number;
+    win_rate: number | null;
+    avg_return: number | null;
+  }>;
+  position_buckets: StatGroup[];
+  monthly: Array<{
+    month: string;
+    tracks: number;
+    t1: DayStat;
+    t3: DayStat;
+  }>;
+  exits: DayStat;
+};
+
+export function getScoreEffectiveness(days?: number) {
+  const q = days ? `?days=${days}` : "";
+  return request<ScoreEffectiveness>(`/api/stats/score-effectiveness${q}`, {
+    timeoutMs: 60_000,
+  });
+}
+
+export type ScanQualityRow = {
+  id: number;
+  created_at: string;
+  mode: string;
+  universe_policy: string;
+  candidates?: number | null;
+  scored?: number | null;
+  fenshi_ok?: number | null;
+  proxy_count?: number | null;
+  timed_out?: number | null;
+  total_ms?: number | null;
+  market_env_level?: string | null;
+  market_pct?: number | null;
+  spot_source?: string | null;
+  strategy_version?: string | null;
+  top_avg_day_position?: number | null;
+};
+
+export function getScanQuality(limit = 200, mode?: string) {
+  const qs = new URLSearchParams({ limit: String(limit) });
+  if (mode) qs.set("mode", mode);
+  return request<{ count: number; items: ScanQualityRow[] }>(`/api/stats/scan-quality?${qs}`, {
+    timeoutMs: 30_000,
+  });
+}
+
 export type WatchHistoryItem = {
   id: number;
   code: string;
@@ -480,6 +574,8 @@ export function addWatch(payload: {
   entry_pct?: number;
   entry_score?: number;
   minute_confirmed?: boolean;
+  day_position?: number | null;
+  vwap_deviation?: number | null;
 }) {
   return request<{
     code: string;

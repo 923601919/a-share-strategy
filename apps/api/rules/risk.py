@@ -5,6 +5,26 @@ from typing import Any
 import pandas as pd
 
 
+def is_excluded_board(
+    code: str,
+    *,
+    exclude_star: bool = True,
+    exclude_bse: bool = True,
+) -> bool:
+    """科创板/北交所排除判定。
+
+    - 科创板 688/689：20% 涨跌幅、50 万权限门槛；
+    - 北交所及老三板 4/8/92 开头：30% 涨跌幅、多数账户无权限。
+    涨跌幅与流动性规则与主板差异大，默认从进攻型候选中剔除。
+    """
+    c = str(code).strip().zfill(6)
+    if exclude_star and (c.startswith("688") or c.startswith("689")):
+        return True
+    if exclude_bse and (c.startswith("4") or c.startswith("8") or c.startswith("92")):
+        return True
+    return False
+
+
 def anomaly_30d_pct(daily: pd.DataFrame) -> dict[str, Any]:
     """近约 30 个交易日最大涨幅进度（相对区间最低收盘）。"""
     if daily is None or daily.empty or "close" not in daily.columns:

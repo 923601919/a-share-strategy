@@ -53,6 +53,7 @@ from services.sim import (
     sell_position,
     sim_overview,
 )
+from services.stats import score_effectiveness
 from services.track import (
     enrich_watch_item,
     expire_past_t3_watchlist,
@@ -121,6 +122,8 @@ class WatchIn(BaseModel):
     entry_pct: float | None = None
     entry_score: float | None = None
     minute_confirmed: bool = True
+    day_position: float | None = None
+    vwap_deviation: float | None = None
 
 
 class ScanIn(BaseModel):
@@ -542,6 +545,8 @@ def post_watchlist(body: WatchIn, user: dict[str, Any] = Depends(get_current_use
         entry_price=entry_price,
         entry_pct=entry_pct,
         entry_score=body.entry_score,
+        day_position=body.day_position,
+        vwap_deviation=body.vwap_deviation,
     )
 
     sim_result: dict = {"ok": False, "skipped": True, "reason": "无有效入池价，未开仓"}
@@ -602,6 +607,28 @@ def review_history_api(
     user: dict[str, Any] = Depends(get_current_user),
 ):
     return {"items": review_history(limit=limit)}
+
+
+@app.get("/api/stats/score-effectiveness")
+def stats_score_effectiveness(
+    days: int | None = Query(default=None, ge=7, le=730, description="只统计最近 N 天入池记录，默认全部"),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """分数-收益验证：入池分数分桶 × T+N 胜率/收益。纯本地库，不打行情网。"""
+    return score_effectiveness(days=days)
+
+
+@app.get("/api/stats/scan-quality")
+def stats_scan_quality(
+    limit: int | None = Query(default=200, ge=1, le=2000),
+    mode: str | None = Query(default=None, description="可选过滤：fenshi / leader_dip"),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """扫描质量摘要：每次扫描的候选/真分时/代理/耗时/大盘环境，长期积累供调参对比。"""
+    from db import list_scan_quality
+
+    rows = list_scan_quality(limit=limit, mode=mode)
+    return {"count": len(rows), "items": rows}
 
 
 @app.get("/api/sim")

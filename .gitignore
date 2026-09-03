@@ -13,3 +13,8 @@ data/cache/
 .DS_Store
 *.log
 apps/api/.venv/
+
+# 环境/缓存/产物,不进版本库
+.workbuddy/
+data/tmp_zhimg/
+apps/web/tsconfig.tsbuildinfo

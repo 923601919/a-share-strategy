@@ -4,6 +4,7 @@ import logging
 import threading
 import time
 from concurrent.futures import Future
+from datetime import datetime, timedelta
 from typing import Any, Callable, TypeVar
 
 import pandas as pd
@@ -134,7 +135,9 @@ def get_spot_df_or_empty(*, use_isolated: bool = True, ttl: float = 45.0) -> pd.
         t0 = time.perf_counter()
         try:
             if use_isolated:
-                bundle = call_isolated("get_spot_df_or_empty_bundle", timeout=22)
+                bundle = call_isolated(
+                    "get_spot_df_or_empty_bundle", timeout=settings.spot_isolated_timeout
+                )
                 df = bundle.get("df") if isinstance(bundle, dict) else bundle
                 src = (bundle or {}).get("source") if isinstance(bundle, dict) else "isolated"
                 _LAST_SPOT_SOURCE_OVERRIDE = src
@@ -157,7 +160,8 @@ def get_spot_df_or_empty(*, use_isolated: bool = True, ttl: float = 45.0) -> pd.
             _mark("spot", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
             return raw.empty_spot_df()
 
-    return _single_flight("spot_df", _load, wait_timeout=ttl + 30)
+    # 外层等待须大于子进程超时，否则单飞会在子进程被杀之前就放弃
+    return _single_flight("spot_df", _load, wait_timeout=settings.spot_isolated_timeout + 30)
 
 
 def fetch_hot_sector_universe(
@@ -305,10 +309,50 @@ def fetch_minute(code: str, days: int = 1) -> pd.DataFrame:
         raise
 
 
+def _seconds_until_next_open(now: datetime) -> float:
+    """距离下一个交易日 09:15（日线数据重新可能变化的时刻）的秒数。"""
+    target = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    if now >= target:
+        target += timedelta(days=1)
+    while target.weekday() >= 5:  # 周六/周日
+        target += timedelta(days=1)
+    return max((target - now).total_seconds(), 60.0)
+
+
+def _daily_cache_ttl() -> float:
+    """日线缓存 TTL：盘中短 TTL（最后一根K会变）；盘前/收盘后/周末缓存到下一交易日开盘前。"""
+    now = datetime.now()
+    if now.weekday() >= 5:
+        return _seconds_until_next_open(now)
+    hm = now.hour * 100 + now.minute
+    if 915 <= hm < 1505:
+        return settings.daily_cache_intraday_ttl
+    return _seconds_until_next_open(now)
+
+
 def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
+    """个股日线：按日缓存。盘中只有最后一根K会变，用短 TTL；收盘后缓存到次日开盘前。
+
+    30 日均线/异动等基于日线前段计算，缓存不影响结果，可砍掉约一半扫描请求量。
+    """
+    key = f"daily:{code}:{limit}"
+    use_cache = settings.daily_cache_enabled and not settings.demo_mode
+    if use_cache:
+        cached = _cache_get(key)
+        if cached is not None:
+            return cached
+
     t0 = time.perf_counter()
+
+    def _load() -> pd.DataFrame:
+        return raw.fetch_daily(code, limit=limit)
+
     try:
-        df = raw.fetch_daily(code, limit=limit)
+        if use_cache:
+            df = _single_flight(key, _load)
+            _cache_set(key, df, _daily_cache_ttl())
+        else:
+            df = _load()
         _mark("daily", ok=True, detail=code, ms=(time.perf_counter() - t0) * 1000)
         return df
     except Exception as e:
@@ -318,6 +362,30 @@ def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
 
 def demo_minute(code: str) -> pd.DataFrame:
     return raw.demo_minute(code)
+
+
+def fetch_index_snapshot(
+    codes: list[str] | None = None,
+    *,
+    ttl: float = 30.0,
+) -> dict[str, dict[str, Any]]:
+    """大盘指数实时快照（带缓存）。默认上证+深成+创业板+沪深300，失败静默返回空。"""
+    codes = codes or ["sh000001", "sz399001", "sz399006", "sh000300"]
+    key = f"index:{','.join(codes)}"
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    t0 = time.perf_counter()
+    try:
+        out = raw.fetch_index_quotes(codes)
+        if out:
+            _cache_set(key, out, ttl)
+        _mark("index", ok=bool(out), detail=f"n={len(out)}", ms=(time.perf_counter() - t0) * 1000)
+        return out
+    except Exception as e:
+        _mark("index", ok=False, detail=str(e), ms=(time.perf_counter() - t0) * 1000)
+        return {}
 
 
 def fetch_overnight_global() -> dict[str, Any]:

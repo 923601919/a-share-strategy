@@ -15,6 +15,7 @@ from db import (
     upsert_track_returns,
 )
 from providers import akshare_client as mkt
+from services.trade_calendar import trade_days_between
 
 ProgressCb = Callable[[str, float, str], None]
 CancelCb = Callable[[], bool]
@@ -53,11 +54,14 @@ def _needs_t3_refresh(entry_date: str, returns: list[dict[str, Any]], *, today: 
         return False
     if any(int(r.get("day_offset", -1)) == 3 for r in returns):
         return False
+    today_d = (today or _today_iso())[:10]
     try:
-        elapsed = (datetime.fromisoformat(today or _today_iso()).date() - datetime.fromisoformat(entry_date).date()).days
+        entry = datetime.fromisoformat(entry_date).date()
+        tday = datetime.fromisoformat(today_d).date()
     except Exception:
-        elapsed = 0
-    return elapsed >= 4
+        return False
+    # 用交易日数替代自然日近似：长假（国庆/春节）下 4 个自然日可能只有 1 个交易日
+    return trade_days_between(entry, tday) >= 3
 
 
 def _daily_bars(code: str, limit: int = 40) -> pd.DataFrame:
