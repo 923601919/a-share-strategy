@@ -60,3 +60,18 @@ docker compose up -d --build                # 重建并重启（web 若改动较
 - 后端单 worker（内存任务队列 + spawn 隔离子进程不支持多进程共享），勿改多 worker。
 - 容器 `restart: unless-stopped`，重启服务器会自动拉起；日志已限 10MB×3。
 - 公网部署后 `JWT_SECRET` 不可泄露；`/docs` 已关闭（`DOCS_ENABLED=false`）。
+
+## 定时扫描（软加权 / 进攻型分时自动加自选）
+
+后端内置进程内调度器（`services/scheduler.py`，APScheduler BackgroundScheduler），**每个交易日 10:40 与 14:20** 各触发一轮扫描，并把全部命中标的自动加入对应策略账号的自选列表：
+
+| 策略账号 | 扫描参数 | 自选来源标记 |
+| -------- | -------- | ------------ |
+| `soft` | `mode=fenshi` + `universe_policy=soft`（软加权） | `source=fenshi` |
+| `fenshi` | `mode=fenshi` + `universe_policy=hot_only`（进攻型分时） | `source=fenshi` |
+
+- 两个账号**完全隔离**（`watchlist` 主键 `(user_id, code)`），账号首次触发时自动创建，无需手动建。
+- 调度开关与参数：`.env` 的 `SCHEDULER_ENABLED`（默认 true）、`SCHEDULER_TIMEZONE`（默认 `Asia/Shanghai`）。
+- 交易日判断走 `services/trade_calendar.py`（akshare 交易日历，失败回退工作日近似）；非交易日自动跳过。
+- 观察：`/api/health` 返回的 `scheduler` 字段含 4 个 job 及下次触发时间。
+- 部署注意：`requirements.txt` 已加 `apscheduler`，重新 `docker compose up -d --build` 时会装入。

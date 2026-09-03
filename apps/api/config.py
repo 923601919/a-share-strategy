@@ -219,6 +219,10 @@ class Settings(BaseSettings):
     # 全市场快照隔离子进程超时（实测抓取约 15s，需留足 pickle/传输余量）
     spot_isolated_timeout: float = 60.0
 
+    # ===== 服务端定时扫描（10:40 / 14:20 自动扫描 + 加自选） =====
+    scheduler_enabled: bool = True  # 是否启用定时扫描（进程内 BackgroundScheduler）
+    scheduler_timezone: str = "Asia/Shanghai"  # 交易日/时间点判断时区（A 股）
+
 
 settings = Settings()
 

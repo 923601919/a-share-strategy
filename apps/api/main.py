@@ -111,6 +111,16 @@ app.add_middleware(ApiKeyMiddleware)
 def _startup() -> None:
     init_db()
     job_store.mark_inflight_lost()
+    from services.scheduler import start_scheduler
+
+    start_scheduler()
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    from services.scheduler import shutdown_scheduler
+
+    shutdown_scheduler()
 
 
 class WatchIn(BaseModel):
@@ -161,6 +171,8 @@ class InviteCreateIn(BaseModel):
 @app.get("/api/health")
 def health():
     sources = mkt.source_health()
+    from services.scheduler import scheduler_status
+
     return {
         "ok": True,
         "demo_mode": settings.demo_mode,
@@ -172,6 +184,7 @@ def health():
         "api_key_required": bool((settings.api_key or "").strip()),
         "auth_required": auth_is_required(),
         "bootstrap_available": auth_is_required() and count_users() == 0,
+        "scheduler": scheduler_status(),
         "sources": sources,
     }
 
