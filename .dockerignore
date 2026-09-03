@@ -1,0 +1,17 @@
+.git
+.github
+.workbuddy
+**/.venv
+**/venv
+**/node_modules
+**/.next
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/*.tsbuildinfo
+data/*.db
+data/cache
+data/tmp_zhimg
+.env
+apps/web/.env*
+!apps/web/.env.example

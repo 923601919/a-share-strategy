@@ -1,0 +1,44 @@
+# 部署方式：仅本机 SSH 隧道访问（端口只绑定 127.0.0.1，不对外）
+# 用法：
+#   ssh -L 3000:127.0.0.1:3000 -L 8000:127.0.0.1:8000 root@<服务器IP>
+#   浏览器打开 http://localhost:3000
+services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    image: ashare-api:latest
+    container_name: ashare-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    mem_limit: 1g
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE: http://127.0.0.1:8000
+    image: ashare-web:latest
+    container_name: ashare-web
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "127.0.0.1:3000:3000"
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
