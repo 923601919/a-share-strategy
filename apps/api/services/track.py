@@ -38,19 +38,52 @@ def _today_iso() -> str:
     return datetime.now().date().isoformat()
 
 
-def is_past_t3(returns: list[dict[str, Any]], *, today: str | None = None) -> bool:
-    """当前日历日是否已超过 T+3 交易日（T+3 收盘日之后）。"""
+def _hm_int(now_hm: str | None = None) -> int:
+    """'HH:MM' / 'HHMM' -> 当日分钟数；None 取当前时间（与 fenshi._hm 同风格）。"""
+    if now_hm is None:
+        now = datetime.now()
+        return now.hour * 60 + now.minute
+    parts = now_hm.split(":")
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    value = int(now_hm)
+    return value // 100 * 60 + value % 100
+
+
+def is_past_t3(
+    returns: list[dict[str, Any]],
+    *,
+    today: str | None = None,
+    now_hm: str | None = None,
+) -> bool:
+    """是否已到 T+3 归档时机：T+3 交易日之后，或 T+3 当日 15:00 收盘后。
+
+    A 股 15:00 收盘（收盘集合竞价 14:57-15:00），收盘价落定后 T+3
+    跟踪即完整，当日即可归档，无需等到下一日。now_hm 可注入便于测试。
+    """
     today = (today or _today_iso())[:10]
     t3 = next((r for r in returns if int(r.get("day_offset", -1)) == 3), None)
     if not t3:
         return False
     trade_date = str(t3.get("trade_date") or "")[:10]
-    return bool(trade_date) and today > trade_date
+    if not trade_date:
+        return False
+    if today > trade_date:
+        return True
+    if today == trade_date:
+        return _hm_int(now_hm) >= 15 * 60  # 15:00 收盘，收盘价已定
+    return False
 
 
-def _needs_t3_refresh(entry_date: str, returns: list[dict[str, Any]], *, today: str | None = None) -> bool:
+def _needs_t3_refresh(
+    entry_date: str,
+    returns: list[dict[str, Any]],
+    *,
+    today: str | None = None,
+    now_hm: str | None = None,
+) -> bool:
     """入池已久但尚无 T+3 落库时，尝试拉日线补全。"""
-    if is_past_t3(returns, today=today):
+    if is_past_t3(returns, today=today, now_hm=now_hm):
         return False
     if any(int(r.get("day_offset", -1)) == 3 for r in returns):
         return False
@@ -62,6 +95,30 @@ def _needs_t3_refresh(entry_date: str, returns: list[dict[str, Any]], *, today: 
         return False
     # 用交易日数替代自然日近似：长假（国庆/春节）下 4 个自然日可能只有 1 个交易日
     return trade_days_between(entry, tday) >= 3
+
+
+def _t3_close_settled(returns: list[dict[str, Any]]) -> bool:
+    """T+3 收盘价是否可信：落库时间晚于其 trade_date 当日 15:00（收盘价已定）。
+
+    盘中拉日线时数据源会给当日实时 K 线，此时落库的"收盘价"并非最终值；
+    无法判断（缺 recorded_at / 解析失败）时保守返回 False，交由强刷路径确认。
+    """
+    t3 = next((r for r in returns if int(r.get("day_offset", -1)) == 3), None)
+    if not t3:
+        return False
+    trade_date = str(t3.get("trade_date") or "")[:10]
+    recorded = str(t3.get("recorded_at") or "")
+    if not trade_date or not recorded:
+        return False
+    try:
+        rec = datetime.fromisoformat(recorded.replace("Z", "+00:00"))
+        close_dt = datetime.fromisoformat(f"{trade_date}T15:00:00").astimezone()
+    except Exception:
+        return False
+    try:
+        return rec >= close_dt
+    except TypeError:
+        return False
 
 
 def _daily_bars(code: str, limit: int = 40) -> pd.DataFrame:
@@ -262,6 +319,11 @@ def expire_past_t3_watchlist(
                 pass
 
         if not is_past_t3(returns, today=today):
+            continue
+
+        # 轻量路径不打网络：T+3 行若在其 trade_date 收盘前落库，"收盘价"可能非最终值，
+        # 跳过本次归档，留给强刷路径（刷新收益）拉到收盘价确认后再归档
+        if not force_refresh and not _t3_close_settled(returns):
             continue
 
         code = str(item["code"]).zfill(6)

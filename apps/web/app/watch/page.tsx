@@ -181,7 +181,7 @@ export default function WatchPage() {
             <h1 style={{ margin: "0 0 6px", fontSize: 20 }}>自选跟踪</h1>
             <p className="muted" style={{ margin: 0 }}>
               {tab === "active"
-                ? `当前自选 ${items.length} 只 · 超过 T+3 会自动归档`
+                ? `当前自选 ${items.length} 只 · T+3 收盘后自动归档`
                 : `履历 ${archived.length} 笔 · 含手动移除与超过 T+3 归档`}
               {refreshingQuotes ? " · 刷新现价中…" : ""}
             </p>
