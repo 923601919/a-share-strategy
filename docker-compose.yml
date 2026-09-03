@@ -7,6 +7,8 @@ services:
     build:
       context: .
       dockerfile: apps/api/Dockerfile
+      args:
+        PIP_INDEX_URL: https://mirrors.cloud.tencent.com/pypi/simple/
     image: ashare-api:latest
     container_name: ashare-api
     restart: unless-stopped
