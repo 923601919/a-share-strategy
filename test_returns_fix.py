@@ -30,7 +30,7 @@ def test_compute_returns_normal():
     def _fake_fetch(code, limit=40, *, no_cache=False):
         seen["no_cache"] = no_cache
         return df
-    track_mod.mkt.fetch_daily = _fake_fetch
+    track_mod.market.fetch_daily = _fake_fetch
 
     rows = track_mod.compute_short_term_returns(
         code="000001", entry_price=10.0, entry_date="2026-09-01", max_days=3, no_cache=True
@@ -46,7 +46,7 @@ def test_compute_returns_normal():
 def test_compute_returns_entry_missing_returns_empty():
     # 日线里没有 >= entry_date 的 bar（入池当日 K 线未入库）
     df = _fake_daily([("2026-08-30", 10.0), ("2026-08-31", 10.5)])
-    track_mod.mkt.fetch_daily = lambda code, limit=40, *, no_cache=False: df
+    track_mod.market.fetch_daily = lambda code, limit=40, *, no_cache=False: df
 
     rows = track_mod.compute_short_term_returns(
         code="000001", entry_price=10.0, entry_date="2026-09-01", max_days=3, no_cache=True

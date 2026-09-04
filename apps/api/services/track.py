@@ -15,6 +15,7 @@ from db import (
     upsert_track_returns,
 )
 from providers import akshare_client as mkt
+from providers import market
 from services.trade_calendar import trade_days_between
 
 ProgressCb = Callable[[str, float, str], None]
@@ -122,7 +123,9 @@ def _t3_close_settled(returns: list[dict[str, Any]]) -> bool:
 
 
 def _daily_bars(code: str, limit: int = 40, *, no_cache: bool = False) -> pd.DataFrame:
-    df = mkt.fetch_daily(code, limit=limit, no_cache=no_cache)
+    # 走带进程缓存的 market.fetch_daily（no_cache 可绕过缓存做收益重算/回填）；
+    # 原始的 akshare_client.fetch_daily 无缓存也无 no_cache 形参，不能直接传 no_cache。
+    df = market.fetch_daily(code, limit=limit, no_cache=no_cache)
     if df is None or df.empty or "date" not in df.columns:
         return pd.DataFrame()
     work = df.copy()
