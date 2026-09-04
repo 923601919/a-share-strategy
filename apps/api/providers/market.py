@@ -146,10 +146,14 @@ def get_spot_df_or_empty(*, use_isolated: bool = True, ttl: float = 45.0) -> pd.
                 _LAST_SPOT_SOURCE_OVERRIDE = None
             if df is None:
                 df = raw.empty_spot_df()
-            _cache_set("spot_df", {"df": df, "source": last_spot_source()}, ttl)
+            empty = bool(getattr(df, "empty", True))
+            # 只缓存非空结果：空快照（数据源抖动/子进程超时被杀）一旦进缓存，
+            # 后续 ttl 秒内的扫描会直接读到空表 → no_quotes → 整轮 0 命中且难以归因。
+            if not empty:
+                _cache_set("spot_df", {"df": df, "source": last_spot_source()}, ttl)
             _mark(
                 "spot",
-                ok=not getattr(df, "empty", True),
+                ok=not empty,
                 detail=last_spot_source(),
                 ms=(time.perf_counter() - t0) * 1000,
             )

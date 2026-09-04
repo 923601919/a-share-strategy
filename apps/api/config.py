@@ -215,7 +215,7 @@ class Settings(BaseSettings):
     daily_cache_intraday_ttl: float = 1800.0  # 盘中日线缓存秒数（最后一根K会变）
 
     # 策略/软件版本（复盘可回溯）
-    strategy_version: str = "2026.09.04-sched-serial"
+    strategy_version: str = "2026.09.04-serial-spotcache"
     scan_use_isolated: bool = True  # 危险行情路径走子进程（全市场快照）
     sector_universe_use_isolated: bool = False  # 新浪板块走子进程易超时，默认进程内
     # 超时后线程可能空转：热点路径优先子进程硬杀
@@ -225,8 +225,9 @@ class Settings(BaseSettings):
     spot_cache_ttl: float = 45.0
     universe_cache_ttl: float = 90.0
     enrich_timeout_seconds: float = 120.0  # enrich 阶段整体预算，超时未完成的候选直接跳过
-    # 全市场快照隔离子进程超时（实测抓取约 15s，需留足 pickle/传输余量）
-    spot_isolated_timeout: float = 60.0
+    # 全市场快照隔离子进程超时（空闲实测抓取约 18s；与其它扫描争抢网络/CPU 时会显著变慢，
+    # 原 60s 会在争抢时被硬杀 → 空快照 → no_quotes → 整轮 0 命中，故放宽到 120s 留足余量）
+    spot_isolated_timeout: float = 120.0
 
     # ===== 服务端定时扫描（10:40 / 14:20 自动扫描 + 加自选） =====
     scheduler_enabled: bool = True  # 是否启用定时扫描（进程内 BackgroundScheduler）
