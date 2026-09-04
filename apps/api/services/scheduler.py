@@ -42,6 +42,19 @@ STRATEGY_FENSHI = "fenshi"   # 进攻型分时（mode=fenshi + hot_only）
 SOURCE_SOFT = "fenshi"       # 软加权落库 source（复用 fenshi 来源标记，前端已支持）
 SOURCE_FENSHI = "fenshi"
 
+# 全局串行锁：同一时刻只允许一轮定时扫描在跑。
+# 原因（2026-09-04 实测）：两个账号的 job 会被 APScheduler 在同一秒并发启动，
+# 而 soft(universe_policy="soft") 必须拉全市场快照（spawn 子进程抓 ~5500 只），
+# 与并发的另一轮扫描争抢网络/内存，子进程内 akshare 会返回**空 DataFrame 且不抛异常**，
+# 最终 soft 拿到 error_code=no_quotes → 命中 0；fenshi 走板块成分实时报价(几十只)不受影响。
+# 串行后 soft 恢复稳定命中（实测 30 命中）。
+_scheduled_scan_lock = threading.Lock()
+_SCHEDULED_LOCK_WAIT = 300.0   # 等另一轮扫描让位的最长秒数（超过则本轮跳过并告警）
+
+# 数据源瞬时失败（no_quotes）重试：全市场快照偶发返回空，退避后重试可自愈
+_NO_QUOTES_RETRIES = 2
+_NO_QUOTES_BACKOFF = 20.0
+
 # 扫描时点 → session 映射（精确对齐交易时段窗口：morning 09:45-11:30 / afternoon 13:30-15:00）
 _HM_SESSION = {
     "10:40": "morning",
@@ -224,7 +237,43 @@ def run_scheduled_scan(
 
     base.scanned = True
     hits = list(result.get("items") or [])
+
+    # 数据源瞬时失败自愈：全市场快照偶发返回空（error_code=no_quotes，akshare 不抛异常），
+    # 退避后重跑一次即可恢复；否则整轮白跑、账号自选为空且难以归因。
+    extra = 0
+    while not hits and result.get("error_code") == "no_quotes" and extra < _NO_QUOTES_RETRIES:
+        extra += 1
+        logger.warning(
+            "scheduled scan [%s] got no_quotes, retry %d/%d after %.0fs (note=%s)",
+            account,
+            extra,
+            _NO_QUOTES_RETRIES,
+            _NO_QUOTES_BACKOFF,
+            (result.get("session_note") or "")[:160],
+        )
+        time.sleep(_NO_QUOTES_BACKOFF)
+        try:
+            with user_scope(uid):
+                result = run_scan(
+                    session=session,
+                    mode=mode,
+                    universe_policy=universe_policy,
+                    top_n=top_n,
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("scheduled scan [%s] no_quotes retry %d failed", account, extra)
+            break
+        hits = list(result.get("items") or [])
+
     base.hit_count = len(hits)
+    if not hits:
+        # 0 命中时把 session_note 打进日志，便于事后直接归因（时段拦截 / 无行情 / 策略收紧）
+        logger.warning(
+            "scheduled scan [%s] 0 hits: error_code=%s note=%s",
+            account,
+            result.get("error_code"),
+            (result.get("session_note") or "")[:300],
+        )
 
     # 加自选（不重试，避免重复写入；异常仅记录）
     try:
@@ -250,13 +299,25 @@ def _make_job(account: str, mode: str, universe_policy: str, session: str) -> Ca
     """构造一个可序列化为单一调度 job 的闭包（APScheduler 要求 callable）。"""
 
     def _job() -> None:
-        r = run_scheduled_scan(
-            account,
-            mode=mode,
-            universe_policy=universe_policy,
-            session=session,
-        )
-        stats.record(r)
+        # 串行化：避免与同时点触发的另一账号扫描并发（并发会让依赖全市场快照的一方拿到空数据）
+        acquired = _scheduled_scan_lock.acquire(timeout=_SCHEDULED_LOCK_WAIT)
+        if not acquired:
+            logger.error(
+                "scheduled scan [%s] SKIPPED: another scan still running after %.0fs",
+                account,
+                _SCHEDULED_LOCK_WAIT,
+            )
+            return
+        try:
+            r = run_scheduled_scan(
+                account,
+                mode=mode,
+                universe_policy=universe_policy,
+                session=session,
+            )
+            stats.record(r)
+        finally:
+            _scheduled_scan_lock.release()
 
     _job.__name__ = f"sched_{account}_{session}"  # 便于日志区分
     return _job
