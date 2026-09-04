@@ -121,8 +121,8 @@ def _t3_close_settled(returns: list[dict[str, Any]]) -> bool:
         return False
 
 
-def _daily_bars(code: str, limit: int = 40) -> pd.DataFrame:
-    df = mkt.fetch_daily(code, limit=limit)
+def _daily_bars(code: str, limit: int = 40, *, no_cache: bool = False) -> pd.DataFrame:
+    df = mkt.fetch_daily(code, limit=limit, no_cache=no_cache)
     if df is None or df.empty or "date" not in df.columns:
         return pd.DataFrame()
     work = df.copy()
@@ -136,12 +136,18 @@ def compute_short_term_returns(
     entry_price: float,
     entry_date: str,
     max_days: int = 3,
+    no_cache: bool = False,
 ) -> list[dict[str, Any]]:
-    """计算 T+0..T+N 相对入池价的涨跌幅（按交易日收盘）。"""
+    """计算 T+0..T+N 相对入池价的涨跌幅（按交易日收盘）。
+
+    no_cache=True 时绕过进程日线缓存，用于收益重算 / 收盘回填，确保读到最新日线。
+    入池当日 K 线尚未入库（start_idx 找不到）时返回空列表 —— 表示「暂无法计算」，
+    由上层决定占位或重试，**不再伪造 T+0=0**（伪造占位会被误判为已完成并覆盖真实数据）。
+    """
     if entry_price <= 0:
         return []
 
-    daily = _daily_bars(code, limit=40)
+    daily = _daily_bars(code, limit=40, no_cache=no_cache)
     rows: list[dict[str, Any]] = []
 
     start_idx: int | None = None
@@ -152,16 +158,8 @@ def compute_short_term_returns(
                 break
 
     if start_idx is None:
-        # 入池当日 K 线尚未入库：T+0 记为入池价
-        rows.append(
-            {
-                "day_offset": 0,
-                "trade_date": entry_date,
-                "close_price": round(entry_price, 3),
-                "return_pct": 0.0,
-            }
-        )
-        return rows
+        # 入池当日 K 线尚未入库 / 日线缺失：无法计算，返回空（不伪造占位）
+        return []
 
     for offset in range(max_days + 1):
         idx = start_idx + offset
@@ -182,6 +180,26 @@ def compute_short_term_returns(
             }
         )
     return rows
+
+
+def _merge_track_returns(
+    existing: list[dict[str, Any]],
+    new: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """收益并集：新值优先覆盖同偏移，保留旧数据中「新计算未覆盖」的偏移（如 T+2/T+3）。
+
+    防止一次「算不全」（如日线缓存滞后、数据未全）的刷新把之前已落库的正确
+    T+1/T+2/T+3 冲掉，导致 track 被错误冻结在残缺状态。
+    """
+    new_map = {int(r["day_offset"]): r for r in new}
+    merged: list[dict[str, Any]] = []
+    for r in existing:
+        off = int(r["day_offset"])
+        if off not in new_map:
+            merged.append(r)
+    merged.extend(new)
+    merged.sort(key=lambda r: int(r["day_offset"]))
+    return merged
 
 
 def _build_completion_snapshot(
@@ -378,27 +396,32 @@ def refresh_track_returns(
             upsert_track_returns(track_id, demo)
         return demo
 
+    # force 刷新（用户点「刷新收益」/ 收盘后回填）必须用最新日线、绕过进程缓存，
+    # 否则收盘后读到的仍是盘前/盘中快照，T+1~T+3 永远算不全。
     try:
         rows = compute_short_term_returns(
             code=code,
             entry_price=entry_price,
             entry_date=entry_date,
             max_days=3,
+            no_cache=force,
         )
     except Exception:
-        # 网络失败时至少给出当日入池占位
-        rows = [
-            {
-                "day_offset": 0,
-                "trade_date": entry_date,
-                "close_price": round(entry_price, 3),
-                "return_pct": 0.0,
-            }
-        ]
+        # 网络失败：保留已有真实收益，绝不伪造占位覆盖（伪造占位会被误判为「已完成」）
+        rows = []
 
-    if persist and rows:
-        upsert_track_returns(track_id, rows)
-    return rows
+    if not rows:
+        # 算不出来（入池当日 K 线未入库 / 网络异常）：返回已有真实数据，不落库、不覆盖。
+        # 返回空时上层（enrich_watch_item）会临时给页面一个展示用占位，但不写库。
+        return get_track_returns(track_id)
+
+    # 算出来的是真实数据，但与库里已有收益做并集（新值优先），避免一次「算不全」的
+    # 刷新把之前已落库的正确 T+1/T+2/T+3 冲掉。
+    existing = get_track_returns(track_id)
+    merged = _merge_track_returns(existing, rows)
+    if persist and merged:
+        upsert_track_returns(track_id, merged)
+    return merged
 
 
 def _track_payload(item: dict[str, Any], returns: list[dict[str, Any]]) -> dict[str, Any]:
@@ -444,7 +467,8 @@ def enrich_watch_item(
     except Exception:
         returns = get_track_returns(int(track_id))
 
-    # 当日刚入池、尚无收益行：本地占位 T+0=0，保证页面立刻有数
+    # 当日刚入池、尚无收益行：给页面一个展示用占位 T+0=0（仅内存，不落库，
+    # 避免伪造占位把真实 track 永久冻结在 T+0=0）。真实数据由「刷新收益」/收盘回填补齐。
     if not returns and item.get("entry_price"):
         entry_date = _parse_entry_date(str(item.get("created_at") or ""))
         returns = [
@@ -455,10 +479,6 @@ def enrich_watch_item(
                 "return_pct": 0.0,
             }
         ]
-        try:
-            upsert_track_returns(int(track_id), returns)
-        except Exception:
-            pass
 
     return {
         **item,
@@ -617,3 +637,43 @@ def run_watchlist_refresh(
 
     prog("done", 1.0, f"完成 · 自选 {len(out)} 只" + (f" · 归档 {len(expired)}" if expired else ""))
     return {"items": out, "stats": watchlist_stats(), "expired": expired}
+
+
+def backfill_all_watchlist_returns(*, on_progress: ProgressCb | None = None) -> dict[str, Any]:
+    """收盘后回填：遍历所有有自选的用户，强制重算每只票的 T+0..T+3 收益（绕过缓存）。
+
+    供定时任务在「每个交易日 15:30」调用，无需用户手点即可把收盘后的最新日线补齐落库，
+    根治「即使收盘了仍刷不出来」的问题。单 worker 串行执行，避免与扫描任务争抢网络/子进程。
+    """
+    from db import list_user_ids_with_active_watchlist
+    from user_ctx import user_scope
+
+    total = 0
+    refreshed = 0
+    failed = 0
+    for uid in list_user_ids_with_active_watchlist():
+        try:
+            with user_scope(uid):
+                items = list_watchlist()
+        except Exception:
+            continue
+        for it in items:
+            track_id = it.get("track_id")
+            if not track_id:
+                continue
+            track = {
+                "id": track_id,
+                "code": str(it.get("code") or "").zfill(6),
+                "entry_price": it.get("entry_price"),
+                "created_at": it.get("created_at"),
+            }
+            try:
+                rows = refresh_track_returns(track, persist=True, force=True)
+                total += 1
+                if rows:
+                    refreshed += 1
+            except Exception:
+                failed += 1
+            if on_progress:
+                on_progress("backfill", total, f"回填收益 {total} · 用户 {uid}")
+    return {"total": total, "refreshed": refreshed, "failed": failed}

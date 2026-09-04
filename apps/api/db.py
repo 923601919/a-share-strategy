@@ -581,6 +581,18 @@ def list_watchlist() -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def list_user_ids_with_active_watchlist() -> list[int]:
+    """返回有自选记录的 distinct user_id，供定时回填遍历。
+
+    watchlist 中的行即活跃自选（归档时移除的是 watch_tracks.removed_at，watchlist 行本身被删除/清理），
+    因此直接对 watchlist 去重即可。由于 list_watchlist 依赖 user_ctx，定时任务线程没有 HTTP 上下文，
+    需先拿到 user_id 列表，再用 user_scope(uid) 逐用户进入上下文处理。
+    """
+    with get_db() as conn:
+        rows = conn.execute("SELECT DISTINCT user_id FROM watchlist").fetchall()
+    return [int(r[0]) for r in rows]
+
+
 def create_watch_track(
     *,
     code: str,

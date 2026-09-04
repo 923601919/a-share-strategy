@@ -334,13 +334,16 @@ def _daily_cache_ttl() -> float:
     return _seconds_until_next_open(now)
 
 
-def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
+def fetch_daily(code: str, limit: int = 40, *, no_cache: bool = False) -> pd.DataFrame:
     """个股日线：按日缓存。盘中只有最后一根K会变，用短 TTL；收盘后缓存到次日开盘前。
 
     30 日均线/异动等基于日线前段计算，缓存不影响结果，可砍掉约一半扫描请求量。
+
+    no_cache=True 时跳过进程缓存、强制拉取最新日线，用于收益重算 / 收盘后回填，
+    避免收盘后读到的仍是盘前/盘中快照、导致 T+1~T+3 永远算不全。
     """
     key = f"daily:{code}:{limit}"
-    use_cache = settings.daily_cache_enabled and not settings.demo_mode
+    use_cache = settings.daily_cache_enabled and not settings.demo_mode and not no_cache
     if use_cache:
         cached = _cache_get(key)
         if cached is not None:
@@ -357,6 +360,9 @@ def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
             _cache_set(key, df, _daily_cache_ttl())
         else:
             df = _load()
+            # 即便 no_cache，也用最新结果刷新缓存，避免同进程后续调用重复打源站
+            if settings.daily_cache_enabled and not settings.demo_mode:
+                _cache_set(key, df, _daily_cache_ttl())
         _mark("daily", ok=True, detail=code, ms=(time.perf_counter() - t0) * 1000)
         return df
     except Exception as e:

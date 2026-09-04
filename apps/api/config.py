@@ -215,7 +215,7 @@ class Settings(BaseSettings):
     daily_cache_intraday_ttl: float = 1800.0  # 盘中日线缓存秒数（最后一根K会变）
 
     # 策略/软件版本（复盘可回溯）
-    strategy_version: str = "2026.09.04-serial-spotcache"
+    strategy_version: str = "2026.09.04-returns-refresh-fix"
     scan_use_isolated: bool = True  # 危险行情路径走子进程（全市场快照）
     sector_universe_use_isolated: bool = False  # 新浪板块走子进程易超时，默认进程内
     # 超时后线程可能空转：热点路径优先子进程硬杀

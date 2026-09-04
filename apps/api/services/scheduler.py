@@ -323,6 +323,35 @@ def _make_job(account: str, mode: str, universe_policy: str, session: str) -> Ca
     return _job
 
 
+# 收盘后收益回填串行锁：避免与同进程其它重算/扫描任务并发争抢网络/子进程
+_backfill_lock = threading.Lock()
+
+
+def _make_backfill_job() -> Callable[[], None]:
+    """构造 15:30 收盘后收益回填 job（每个交易日触发一次）。"""
+
+    def _job() -> None:
+        if not is_trade_date(datetime.now().date()):
+            logger.info("returns backfill skipped: not a trade date")
+            return
+        if not _backfill_lock.acquire(blocking=False):
+            logger.warning("returns backfill SKIPPED: previous backfill still running")
+            return
+        try:
+            # 延迟导入避免循环依赖
+            from services.track import backfill_all_watchlist_returns
+
+            result = backfill_all_watchlist_returns()
+            logger.info("returns backfill done: %s", result)
+        except Exception:  # noqa: BLE001
+            logger.exception("returns backfill FAILED")
+        finally:
+            _backfill_lock.release()
+
+    _job.__name__ = "returns_backfill"
+    return _job
+
+
 _scheduler: BackgroundScheduler | None = None
 
 
@@ -357,6 +386,22 @@ def _build_scheduler() -> BackgroundScheduler:
                 replace_existing=True,
             )
             logger.info("scheduled job registered: %s @ %s (%s/%s)", account, hm, mode, up)
+
+    # 收盘后 15:30 自动回填收益：绕过缓存把当日最新日线补齐落库，无需用户手点。
+    backfill_job = _make_backfill_job()
+    sched.add_job(
+        backfill_job,
+        trigger=CronTrigger(
+            hour=15,
+            minute=30,
+            day_of_week="mon-fri",
+            timezone=str(settings.scheduler_timezone),
+        ),
+        id="returns-backfill",
+        name="returns@15:30",
+        replace_existing=True,
+    )
+    logger.info("scheduled job registered: returns-backfill @ 15:30 mon-fri")
 
     return sched
 
