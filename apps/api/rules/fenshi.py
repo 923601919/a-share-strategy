@@ -659,6 +659,71 @@ def detect_wave_volume(minute: pd.DataFrame | None, *, min_waves: int = 2) -> di
     return out
 
 
+def detect_pullback_after_attack(
+    minute: pd.DataFrame | None,
+    *,
+    lookback: int = 30,
+    p: StrategyParams | None = None,
+) -> dict[str, Any]:
+    """进攻后回落：识别一段拉升（进攻）后回落的时长与深度。
+
+    「进攻」= 最近一个局部高点相对其前方谷底（或窗口起点）的拉升幅度达到
+    consolidation_attack_slope。「回落」= 该高点之后的持续整理期：
+    - duration：峰后K线根数（回落时间）
+    - depth：峰价到峰后最低价的回撤百分比（回落幅度）
+
+    用于「强势整理」判定——回落时间越长、幅度越小，承接越强，越值得加分
+    （具体加分在 score_offensive_fenshi 里施加）。
+    """
+    pp = _P(p)
+    out = {
+        "attacked": False,
+        "duration": 0,
+        "depth": 0.0,
+        "attack_pct": 0.0,
+        "shallow": False,
+    }
+    if minute is None or len(minute) < 15 or "close" not in minute.columns:
+        return out
+    df = minute.dropna(subset=["close"]).reset_index(drop=True)
+    closes = pd.to_numeric(df["close"], errors="coerce").ffill().astype(float)
+    lb = min(lookback, len(closes))
+    c = closes.iloc[-lb:].astype(float)
+    peaks, troughs = _local_extrema(c.tolist(), order=3)
+    if not peaks:
+        return out
+
+    # 从最新峰往回找第一个「真进攻」峰（跳过回落过程中的微小毛刺峰）
+    chosen: tuple[int, int, float] | None = None
+    for pk in reversed(peaks):
+        prev_troughs = [t for t in troughs if t < pk]
+        start = prev_troughs[-1] if prev_troughs else 0
+        start_price = float(c.iloc[start]) if start < pk else 0.0
+        if pk <= start or start_price <= 0:
+            continue
+        attack_pct = (float(c.iloc[pk]) / start_price - 1.0) * 100
+        if attack_pct >= pp.consolidation_attack_slope:
+            chosen = (pk, start, attack_pct)
+            break
+    if chosen is None:
+        return out
+
+    pk, _, attack_pct = chosen
+    peak_price = float(c.iloc[pk])
+    after = c.iloc[pk:]
+    duration = int(len(after) - 1)  # 峰后根数（不含峰本身）
+    low_after = float(after.min())
+    depth = (peak_price - low_after) / peak_price * 100 if peak_price > 0 else 0.0
+    out.update(
+        attacked=True,
+        duration=duration,
+        depth=round(depth, 3),
+        attack_pct=round(attack_pct, 3),
+        shallow=bool(depth <= pp.consolidation_max_depth),
+    )
+    return out
+
+
 def detect_zhaban(
     minute: pd.DataFrame | None,
     *,
@@ -835,6 +900,25 @@ def score_offensive_fenshi(
             score = max(0.0, score - pp.wave_vol_penalty)
             reasons.append(f"量能背离({wave.get('message')})-{pp.wave_vol_penalty:g}")
 
+    cons = detect_pullback_after_attack(df, lookback=lookback, p=pp)
+    if (
+        pp.consolidation_enabled
+        and cons["attacked"]
+        and cons["shallow"]
+        and cons["duration"] >= pp.consolidation_min_duration
+    ):
+        # 时长维度：回落时间越长分越高（封顶）
+        dur_frac = min(cons["duration"] / max(pp.consolidation_duration_max, 1), 1.0)
+        dur_bonus = pp.consolidation_duration_bonus * dur_frac
+        # 幅度维度：回落越浅分越高（深度 0 = 满分，接近上限 = 0）
+        depth_frac = max(0.0, 1.0 - cons["depth"] / max(pp.consolidation_max_depth, 1e-9))
+        depth_bonus = pp.consolidation_shallow_bonus * depth_frac
+        bonus = round(pp.consolidation_base_bonus + dur_bonus + depth_bonus, 1)
+        score = min(pp.fenshi_score_cap, score + bonus)
+        reasons.append(
+            f"进攻后强势整理(回落{cons['duration']}根/深{cons['depth']:.2f}%)+{bonus:g}"
+        )
+
     return {
         "score": round(min(score, pp.fenshi_score_cap), 1),
         "above_vwap": pat["above_vwap"] or push["above_vwap"],
@@ -847,4 +931,5 @@ def score_offensive_fenshi(
         "last": round(last, 3),
         "reasons": reasons,
         "wave_volume": wave,
+        "consolidation": cons,
     }

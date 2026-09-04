@@ -9,11 +9,13 @@ from rules.fenshi import (
     apply_day_vol_and_false_push,
     day_volume_health,
     detect_false_push,
+    detect_pullback_after_attack,
     in_session_bucket,
     score_leader_dip,
     score_offensive_fenshi,
     session_allowed,
 )
+from rules.params import StrategyParams
 
 
 def _sample_minute(*, push: bool = False) -> pd.DataFrame:
@@ -193,3 +195,57 @@ def test_auto_session_allows_afternoon_till_close():
     # 收盘后 auto 拒绝
     ok, _ = session_allowed("auto", now_hm="15:30")
     assert ok is False
+
+
+# ---------- 进攻后回落（强势整理） ----------
+
+def _attack_then_hold(low: float, n_hold: int) -> pd.DataFrame:
+    """进攻：10.00 -> 10.30（前 10 根拉升 + 一根冲顶），随后回落到 low 横盘 n_hold 根。"""
+    rise = [10.0 + i * 0.03 for i in range(10)]  # 10.00..10.27
+    closes = rise + [10.30] + [low] * n_hold
+    n = len(closes)
+    return pd.DataFrame(
+        {
+            "time": [f"09:{30 + i // 60:02d}:{i % 60:02d}" for i in range(n)],
+            "close": closes,
+            "volume": [1000] * n,
+            "amount": [c * 1000 * 100 for c in closes],
+        }
+    )
+
+
+def test_pullback_after_attack_shallow_long():
+    """浅回落 + 长时间整理 -> 识别为强势整理（attacked + shallow）。"""
+    out = detect_pullback_after_attack(_attack_then_hold(low=10.20, n_hold=12))
+    assert out["attacked"] is True
+    assert out["shallow"] is True
+    assert out["duration"] == 12
+    assert 0.0 < out["depth"] < 1.5  # (10.30-10.20)/10.30 ≈ 0.97%
+
+
+def test_pullback_after_attack_deep_short():
+    """深回落 -> shallow=False（不算浅回落强势整理）。"""
+    out = detect_pullback_after_attack(_attack_then_hold(low=9.90, n_hold=6))
+    assert out["attacked"] is True
+    assert out["shallow"] is False
+    assert out["duration"] == 6
+    assert out["depth"] > 3.0  # (10.30-9.90)/10.30 ≈ 3.88%
+
+
+def test_pullback_after_attack_no_peak():
+    """单边拉升无局部峰 -> attacked=False。"""
+    minute = pd.DataFrame({"close": [10.0 + i * 0.02 for i in range(20)]})
+    out = detect_pullback_after_attack(minute)
+    assert out["attacked"] is False
+
+
+def test_consolidation_bonus_in_score():
+    """浅回落且时间够长 -> 加分并写入 reasons；关闭开关后不再加分。"""
+    minute = _attack_then_hold(low=10.20, n_hold=12)
+    out = score_offensive_fenshi(minute)
+    assert out["consolidation"]["attacked"] is True
+    assert any("进攻后强势整理" in r for r in out["reasons"])
+
+    out_off = score_offensive_fenshi(minute, p=StrategyParams(consolidation_enabled=False))
+    assert not any("进攻后强势整理" in r for r in out_off["reasons"])
+    assert out["score"] >= out_off["score"]

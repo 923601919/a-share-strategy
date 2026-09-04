@@ -179,6 +179,15 @@ class Settings(BaseSettings):
     zhaban_enabled: bool = True
     zhaban_benign_bonus: float = 8.0
     zhaban_weak_penalty: float = 12.0
+    # 进攻后回落（强势整理）：回落时间越长、幅度越小 -> 加分越多
+    consolidation_enabled: bool = True
+    consolidation_attack_slope: float = 1.5  # "进攻"最小拉升幅度%
+    consolidation_max_depth: float = 3.0  # 回落深度上限%（更深则不算"浅回落"）
+    consolidation_min_duration: int = 5  # 回落持续最少根数
+    consolidation_duration_max: int = 15  # 达到该回落根数即给满时长分
+    consolidation_base_bonus: float = 4.0  # 满足条件的基础加分
+    consolidation_duration_bonus: float = 4.0  # 时长维度满分（线性递增至封顶）
+    consolidation_shallow_bonus: float = 4.0  # 幅度维度满分（深度=0 给满，越深线性递减）
     # 涨停/大涨票次日铁律
     iron_rule_enabled: bool = True
     iron_rule_big_pct: float = 7.0  # 收盘涨幅达此视为大涨票
@@ -206,7 +215,7 @@ class Settings(BaseSettings):
     daily_cache_intraday_ttl: float = 1800.0  # 盘中日线缓存秒数（最后一根K会变）
 
     # 策略/软件版本（复盘可回溯）
-    strategy_version: str = "2026.09.03-funnel"
+    strategy_version: str = "2026.09.04-consolidation"
     scan_use_isolated: bool = True  # 危险行情路径走子进程（全市场快照）
     sector_universe_use_isolated: bool = False  # 新浪板块走子进程易超时，默认进程内
     # 超时后线程可能空转：热点路径优先子进程硬杀

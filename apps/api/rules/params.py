@@ -83,6 +83,15 @@ class StrategyParams:
     wave_vol_enabled: bool = True
     zhaban_benign_bonus: float = 8.0
     zhaban_weak_penalty: float = 12.0
+    # 进攻后回落（强势整理）：回落时间越长、幅度越小 -> 加分越多
+    consolidation_enabled: bool = True
+    consolidation_attack_slope: float = 1.5  # "进攻"最小拉升幅度%
+    consolidation_max_depth: float = 3.0  # 回落深度上限%（更深则不算"浅回落"）
+    consolidation_min_duration: int = 5  # 回落持续最少根数
+    consolidation_duration_max: int = 15  # 达到该回落根数即给满时长分
+    consolidation_base_bonus: float = 4.0  # 满足条件的基础加分
+    consolidation_duration_bonus: float = 4.0  # 时长维度满分（线性递增至封顶）
+    consolidation_shallow_bonus: float = 4.0  # 幅度维度满分（深度=0 给满，越深线性递减）
 
     @classmethod
     def from_settings(cls) -> "StrategyParams":
