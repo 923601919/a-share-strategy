@@ -136,6 +136,17 @@ class WatchIn(BaseModel):
     vwap_deviation: float | None = None
 
 
+class SoftOptIn(BaseModel):
+    """优化软加权：拉升量能 vs 开盘量能的判定参数。"""
+
+    open_window: int = 5          # 开盘量能取样窗口（前 N 根分时均量）
+    vol_mode: Literal["avg", "peak"] = "avg"  # 拉升量能口径：平均 / 峰值
+    min_ratio: float = 1.2        # 拉升量能 / 开盘量能 放大下限
+    rally_min_pct: float = 1.0    # 拉升识别：近段涨幅达此 % 才算拉升
+    rally_window: int = 30        # 拉升段回看窗口（分时根数）
+    hard_filter: bool = True      # 不达标是否硬剔除（False=降权）
+
+
 class ScanIn(BaseModel):
     min_amount_yi: float | None = Field(default=None, description="成交额下限（亿）")
     min_pct: float | None = None
@@ -144,8 +155,10 @@ class ScanIn(BaseModel):
     top_n: int | None = None
     board_top_n: int = 15
     mode: Literal["fenshi", "leader_dip"] = "fenshi"
-    # hot_only=现网；quota/soft=选股页测试 Tab
-    universe_policy: Literal["hot_only", "quota", "soft"] = "hot_only"
+    # hot_only=现网；quota/soft/soft_opt=选股页测试 Tab
+    universe_policy: Literal["hot_only", "quota", "soft", "soft_opt"] = "hot_only"
+    # 仅 universe_policy=soft_opt 时生效
+    softopt: SoftOptIn | None = None
 
 
 class AuthLoginIn(BaseModel):
@@ -251,6 +264,7 @@ def scan(body: ScanIn | None = None, user: dict[str, Any] = Depends(get_current_
             board_top_n=body.board_top_n,
             mode=body.mode,
             universe_policy=body.universe_policy,
+            softopt=body.softopt.model_dump() if body.softopt else None,
         )
     except ScanCancelled:
         raise HTTPException(status_code=499, detail="cancelled") from None
@@ -287,6 +301,7 @@ def start_scan_job(body: ScanIn | None = None, user: dict[str, Any] = Depends(ge
                     board_top_n=body.board_top_n,
                     mode=body.mode,
                     universe_policy=body.universe_policy,
+                    softopt=body.softopt.model_dump() if body.softopt else None,
                     on_progress=on_progress,
                     should_cancel=lambda: job_store.is_cancelled(job.id),
                 )

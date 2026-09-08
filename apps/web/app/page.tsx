@@ -10,14 +10,45 @@ import {
   type ScanResult,
 } from "@/lib/api";
 
-/** 页面 Tab：后两个为测试策略，不改现网进攻型/龙头低吸 */
-type UiTab = "fenshi" | "leader_dip" | "fenshi_quota" | "fenshi_soft";
+/** 页面 Tab：后三个为测试策略，不改现网进攻型/龙头低吸 */
+type UiTab = "fenshi" | "leader_dip" | "fenshi_quota" | "fenshi_soft" | "fenshi_softopt";
 type ScanMode = "fenshi" | "leader_dip";
-type UniversePolicy = "hot_only" | "quota" | "soft";
+type UniversePolicy = "hot_only" | "quota" | "soft" | "soft_opt";
 
 type ModeFormState = {
   minPct: number;
   maxPct: number;
+};
+
+/** 优化软加权算法参数（拉升量能 vs 开盘量能） */
+type SoftOptState = {
+  openWindow: number; // 开盘量能取样窗口（前 N 根分时均量）
+  volMode: "avg" | "peak"; // 拉升量能口径：平均 / 峰值
+  minRatio: number; // 拉升量能 / 开盘量能 放大下限
+  rallyMinPct: number; // 拉升识别：近段涨幅达此 % 才算拉升
+  rallyWindow: number; // 拉升段回看窗口（分时根数）
+  hardFilter: boolean; // 不达标是否硬剔除（false=降权）
+};
+
+const SOFT_OPT_DEFAULTS: SoftOptState = {
+  openWindow: 5,
+  volMode: "avg",
+  minRatio: 1.2,
+  rallyMinPct: 1.0,
+  rallyWindow: 30,
+  hardFilter: true,
+};
+
+/** 后端返回的拉升量能 vs 开盘量能判定结果（挂在 item.fenshi.rally_open） */
+type RallyOpenResult = {
+  ok?: boolean;
+  ratio?: number | null;
+  rally_vol?: number | null;
+  open_vol?: number | null;
+  vol_mode?: "avg" | "peak" | string;
+  rally_bars?: number;
+  rally_pct?: number | null;
+  message?: string;
 };
 
 const TAB_DEFAULTS: Record<UiTab, ModeFormState> = {
@@ -25,6 +56,7 @@ const TAB_DEFAULTS: Record<UiTab, ModeFormState> = {
   leader_dip: { minPct: -3, maxPct: 2 },
   fenshi_quota: { minPct: 2, maxPct: 6 },
   fenshi_soft: { minPct: 2, maxPct: 6 },
+  fenshi_softopt: { minPct: 2, maxPct: 6 },
 };
 
 const TAB_META: Record<
@@ -61,6 +93,14 @@ const TAB_META: Record<
     test: true,
     tabLabel: "测试·软加权",
   },
+  fenshi_softopt: {
+    title: "优化软加权",
+    desc: "软加权基础上叠加核心条件：个股拉升期间量能（平均或峰值）必须大于开盘量能，作为筛选条件之一（测试，不影响现网）。",
+    mode: "fenshi",
+    policy: "soft_opt",
+    test: true,
+    tabLabel: "优化软加权",
+  },
 };
 
 const STORAGE_KEY = "ashare.scan.v2";
@@ -71,11 +111,12 @@ function createTabState(): Record<UiTab, ModeFormState> {
     leader_dip: { ...TAB_DEFAULTS.leader_dip },
     fenshi_quota: { ...TAB_DEFAULTS.fenshi_quota },
     fenshi_soft: { ...TAB_DEFAULTS.fenshi_soft },
+    fenshi_softopt: { ...TAB_DEFAULTS.fenshi_softopt },
   };
 }
 
 function emptyData(): Record<UiTab, ScanResult | null> {
-  return { fenshi: null, leader_dip: null, fenshi_quota: null, fenshi_soft: null };
+  return { fenshi: null, leader_dip: null, fenshi_quota: null, fenshi_soft: null, fenshi_softopt: null };
 }
 
 function loadPersisted(): {
@@ -85,6 +126,7 @@ function loadPersisted(): {
   minAmount?: number;
   session?: string;
   topN?: number;
+  softOpt?: SoftOptState;
 } | null {
   if (typeof window === "undefined") return null;
   try {
@@ -102,6 +144,7 @@ export default function HomePage() {
   const [minAmount, setMinAmount] = useState(1);
   const [session, setSession] = useState("auto");
   const [topN, setTopN] = useState(20);
+  const [softOpt, setSoftOpt] = useState<SoftOptState>(SOFT_OPT_DEFAULTS);
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState<ScanJob | null>(null);
   const [error, setError] = useState("");
@@ -124,6 +167,7 @@ export default function HomePage() {
       if (persisted.minAmount != null) setMinAmount(persisted.minAmount);
       if (persisted.session) setSession(persisted.session);
       if (persisted.topN != null) setTopN(persisted.topN);
+      if (persisted.softOpt) setSoftOpt({ ...SOFT_OPT_DEFAULTS, ...persisted.softOpt });
     }
     setStorageReady(true);
   }, []);
@@ -133,12 +177,12 @@ export default function HomePage() {
     try {
       sessionStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ tab, formByTab, dataByTab, minAmount, session, topN })
+        JSON.stringify({ tab, formByTab, dataByTab, minAmount, session, topN, softOpt })
       );
     } catch {
       /* ignore quota */
     }
-  }, [tab, formByTab, dataByTab, minAmount, session, topN, storageReady]);
+  }, [tab, formByTab, dataByTab, minAmount, session, topN, softOpt, storageReady]);
 
   function onTabChange(next: UiTab) {
     setTab(next);
@@ -152,6 +196,10 @@ export default function HomePage() {
       ...prev,
       [tab]: { ...prev[tab], ...patch },
     }));
+  }
+
+  function updateSoftOpt(patch: Partial<SoftOptState>) {
+    setSoftOpt((prev) => ({ ...prev, ...patch }));
   }
 
   async function onScan() {
@@ -178,6 +226,17 @@ export default function HomePage() {
           top_n: topN,
           mode: meta.mode,
           universe_policy: meta.policy,
+          softopt:
+            meta.policy === "soft_opt"
+              ? {
+                  open_window: softOpt.openWindow,
+                  vol_mode: softOpt.volMode,
+                  min_ratio: softOpt.minRatio,
+                  rally_min_pct: softOpt.rallyMinPct,
+                  rally_window: softOpt.rallyWindow,
+                  hard_filter: softOpt.hardFilter,
+                }
+              : undefined,
         },
         {
           shouldStop: () => stopRef.current,
@@ -250,7 +309,7 @@ export default function HomePage() {
 
   const maxPctLabel = meta.mode === "leader_dip" ? "涨幅上限≤%" : "当前涨幅<%";
   const pct = Math.round((progress?.progress || 0) * 100);
-  const tabs: UiTab[] = ["fenshi", "leader_dip", "fenshi_quota", "fenshi_soft"];
+  const tabs: UiTab[] = ["fenshi", "leader_dip", "fenshi_quota", "fenshi_soft", "fenshi_softopt"];
 
   return (
     <>
@@ -323,6 +382,83 @@ export default function HomePage() {
             </select>
           </label>
         </div>
+
+        {tab === "fenshi_softopt" ? (
+          <>
+            <div className="section-h" style={{ marginTop: 20 }}>
+              <span>优化软加权 · 量能条件</span>
+              <span className="muted-sm">拉升量能 / 开盘量能 ≥ 阈值</span>
+            </div>
+            <div className="grid-4">
+              <label>
+                拉升量能口径
+                <select
+                  value={softOpt.volMode}
+                  onChange={(e) => updateSoftOpt({ volMode: e.target.value as SoftOptState["volMode"] })}
+                >
+                  <option value="avg">平均量能</option>
+                  <option value="peak">峰值量能</option>
+                </select>
+              </label>
+              <label>
+                放大倍数下限
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0.5"
+                  value={softOpt.minRatio}
+                  onChange={(e) => updateSoftOpt({ minRatio: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                开盘量能窗口（分）
+                <input
+                  type="number"
+                  step="1"
+                  min="1"
+                  value={softOpt.openWindow}
+                  onChange={(e) => updateSoftOpt({ openWindow: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                拉升识别涨幅≥%
+                <input
+                  type="number"
+                  step="0.1"
+                  min="0"
+                  value={softOpt.rallyMinPct}
+                  onChange={(e) => updateSoftOpt({ rallyMinPct: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                拉升回看窗口（分）
+                <input
+                  type="number"
+                  step="1"
+                  min="5"
+                  value={softOpt.rallyWindow}
+                  onChange={(e) => updateSoftOpt({ rallyWindow: Number(e.target.value) })}
+                />
+              </label>
+              <label>
+                不达标处理
+                <select
+                  value={softOpt.hardFilter ? "hard" : "penalty"}
+                  onChange={(e) => updateSoftOpt({ hardFilter: e.target.value === "hard" })}
+                >
+                  <option value="hard">硬剔除（不作为候选）</option>
+                  <option value="penalty">降权（保留但扣分）</option>
+                </select>
+              </label>
+            </div>
+            <div className="muted-sm" style={{ marginTop: 8 }}>
+              判定逻辑：开盘后前 {softOpt.openWindow} 分钟均量作为「开盘量能」；取近{" "}
+              {softOpt.rallyWindow} 分钟内谷底到当前的连续上涨段（涨幅≥{softOpt.rallyMinPct}%）为「拉升段」，
+              计算拉升段{softOpt.volMode === "avg" ? "平均" : "峰值"}量能，比值≥{softOpt.minRatio} 视为达标。
+            </div>
+          </>
+        ) : null}
+
         <div className="row" style={{ marginTop: 16, alignItems: "center" }}>
           <label style={{ flex: "0 0 200px" }}>
             返回条数
@@ -456,6 +592,20 @@ export default function HomePage() {
             </div>
           </div>
 
+          {/* 优化软加权：量能条件达成摘要 */}
+          {meta.policy === "soft_opt" ? (
+            <div className="banner info mt-12">
+              <span className="banner-icon">·</span>
+              <span style={{ flex: 1 }}>
+                <strong>量能条件</strong>（拉升{softOpt.volMode === "avg" ? "平均" : "峰值"}量能 ≥
+                开盘量能×{softOpt.minRatio}）：达标{" "}
+                {data.items.filter((it) => Boolean((it.fenshi as { rally_open?: RallyOpenResult }).rally_open?.ok)).length}{" "}
+                只 / 共 {data.items.length} 只
+                {softOpt.hardFilter ? "（未达标已剔除，不在结果中）" : "（未达标已保留并降权）"}。
+              </span>
+            </div>
+          ) : null}
+
           {/* 板块 chips */}
           <div className="section-h" style={{ marginTop: 20 }}>
             <span>强势板块（候选池来源）</span>
@@ -530,6 +680,9 @@ export default function HomePage() {
                   <th style={{ textAlign: "right" }}>得分</th>
                   <th style={{ textAlign: "right" }}>日内位置</th>
                   <th style={{ textAlign: "right" }}>量比</th>
+                  {meta.policy === "soft_opt" ? (
+                    <th style={{ textAlign: "right" }}>拉升量/开盘</th>
+                  ) : null}
                   <th>异动 / 监管</th>
                   <th>原因</th>
                   <th style={{ textAlign: "right" }}></th>
@@ -549,6 +702,10 @@ export default function HomePage() {
                   const isTop = idx === 0;
                   const rowCls = chase ? "row-chase" : isTop ? "row-top" : "";
                   const pctNum = Number(it.pct ?? 0);
+                  const rallyOpen =
+                    meta.policy === "soft_opt"
+                      ? ((it.fenshi as { rally_open?: RallyOpenResult }).rally_open)
+                      : undefined;
                   return (
                     <tr key={it.code} className={rowCls}>
                       <td className="num">
@@ -602,6 +759,25 @@ export default function HomePage() {
                       <td className="num muted" style={{ textAlign: "right" }}>
                         {it.volume_ratio ?? "-"}
                       </td>
+                      {meta.policy === "soft_opt" ? (
+                        <td style={{ textAlign: "right" }}>
+                          {rallyOpen && rallyOpen.ratio != null ? (
+                            <div>
+                              <span className="num cell-strong">{rallyOpen.ratio.toFixed(2)}x</span>
+                              <div>
+                                <span className={`pill ${rallyOpen.ok ? "ok" : "warn"}`} style={{ fontSize: 11 }}>
+                                  {rallyOpen.ok ? "达标" : "未达标"}
+                                </span>
+                                <span className="muted-sm" style={{ marginLeft: 4 }}>
+                                  {rallyOpen.vol_mode === "peak" ? "峰" : "均"}量{rallyOpen.rally_bars}分
+                                </span>
+                              </div>
+                            </div>
+                          ) : (
+                            <span className="muted">-</span>
+                          )}
+                        </td>
+                      ) : null}
                       <td>
                         <span className={`pill ${it.risk?.level || "ok"}`}>
                           {it.risk?.anomaly_pct ?? "-"}%

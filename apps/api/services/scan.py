@@ -14,9 +14,11 @@ from providers import market as mkt
 from rules.fenshi import (
     apply_chase_penalty,
     apply_day_vol_and_false_push,
+    apply_rally_open_volume,
     apply_zhaban,
     day_volume_health,
     detect_false_push,
+    detect_rally_vs_open_volume,
     detect_zhaban,
     in_attack_window,
     score_leader_dip,
@@ -36,7 +38,7 @@ from rules.sentiment import classify_sentiment
 
 SessionFilter = Literal["auto", "morning", "afternoon", "any"]
 ScanMode = Literal["fenshi", "leader_dip"]
-UniversePolicy = Literal["hot_only", "quota", "soft"]
+UniversePolicy = Literal["hot_only", "quota", "soft", "soft_opt"]
 ProgressCb = Callable[[str, float, str], None]
 CancelCb = Callable[[], bool]
 
@@ -337,6 +339,21 @@ def _build_candidate_rows(
         hot_n = sum(1 for r in rows if str(r.get("code") or "").zfill(6) in universe_codes)
         return rows, f"候选=全市场软加权({len(rows)}，其中热门{hot_n})"
 
+    if universe_policy == "soft_opt":
+        # 优化软加权：候选池同软加权（全市场），额外叠加"拉升量能>开盘量能"条件
+        soft_limit = min(max(settings.max_candidates_spot, 60), 80)
+        rows = _rows_from_filter(
+            spot,
+            min_amount_yi=min_amount_yi,
+            min_pct=min_pct,
+            max_pct=max_pct,
+            limit=soft_limit,
+            universe_codes=None,
+            max_pct_inclusive=max_pct_inclusive,
+        )
+        hot_n = sum(1 for r in rows if str(r.get("code") or "").zfill(6) in universe_codes)
+        return rows, f"候选=全市场优化软加权({len(rows)}，其中热门{hot_n})"
+
     # quota：主池 + 卫星池
     primary_limit = min(base_limit, 32)
     sat_limit = max(8, int(round(base_limit * settings.universe_quota_satellite_pct)))
@@ -505,6 +522,7 @@ def _enrich_one(
     mode: ScanMode = "fenshi",
     universe_policy: UniversePolicy = "hot_only",
     sel_ctx: dict[str, Any] | None = None,
+    softopt: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     code = str(row["code"]).zfill(6)
     name = str(row["name"])
@@ -601,6 +619,38 @@ def _enrich_one(
                 zb = detect_zhaban(minute, pre_close=pre, code=code, name=name)
                 fenshi = apply_zhaban(fenshi, zb)
 
+    # 优化软加权：拉升期间量能必须大于开盘量能（硬过滤 / 降权）
+    if (
+        universe_policy == "soft_opt"
+        and mode == "fenshi"
+        and not fenshi.get("proxy")
+        and _is_minute_usable(minute, now=datetime.now())
+    ):
+        so = softopt or {}
+        so_min_ratio = float(so.get("min_ratio") if so.get("min_ratio") is not None else settings.softopt_min_ratio)
+        rally = detect_rally_vs_open_volume(
+            minute,
+            open_window=int(so.get("open_window") or settings.softopt_open_window),
+            vol_mode=str(so.get("vol_mode") or settings.softopt_vol_mode),
+            min_ratio=so_min_ratio,
+            rally_min_pct=float(
+                so.get("rally_min_pct") if so.get("rally_min_pct") is not None else settings.softopt_rally_min_pct
+            ),
+            rally_window=int(so.get("rally_window") or settings.softopt_rally_window),
+        )
+        fenshi, filtered = apply_rally_open_volume(
+            fenshi,
+            rally,
+            hard_filter=bool(
+                so.get("hard_filter") if so.get("hard_filter") is not None else settings.softopt_hard_filter
+            ),
+            min_ratio=so_min_ratio,
+            penalty=float(so.get("penalty") if so.get("penalty") is not None else settings.softopt_penalty),
+            bonus=float(so.get("bonus") if so.get("bonus") is not None else settings.softopt_bonus),
+        )
+        if filtered:
+            return None
+
     risk = risk_flags(
         anom["pct_from_low"],
         price=float(row.get("price") or 0),
@@ -626,7 +676,7 @@ def _enrich_one(
     life = best_sector_life(tags, ctx.get("life_map") or {}) if settings.sector_life_enabled else None
     hot_base = 0.0
     if tags:
-        if universe_policy == "soft":
+        if universe_policy in ("soft", "soft_opt"):
             hot_base = settings.soft_hot_board_bonus
         elif mode == "leader_dip":
             hot_base = settings.leader_dip_hot_board_bonus
@@ -719,6 +769,7 @@ def _enrich_one(
             "chase_penalty": fenshi.get("chase_penalty"),
             "wave_volume": fenshi.get("wave_volume"),
             "zhaban": fenshi.get("zhaban"),
+            "rally_open": fenshi.get("rally_open"),
         },
     }
 
@@ -780,6 +831,7 @@ def run_scan(
     board_top_n: int = 15,
     mode: ScanMode = "fenshi",
     universe_policy: UniversePolicy = "hot_only",
+    softopt: dict[str, Any] | None = None,
     on_progress: ProgressCb | None = None,
     should_cancel: CancelCb | None = None,
 ) -> dict[str, Any]:
@@ -811,6 +863,30 @@ def run_scan(
     top_n = top_n if top_n is not None else settings.top_n_result
     max_pct_inclusive = mode == "leader_dip"
 
+    # 优化软加权：解析参数（请求覆盖 > 配置默认）
+    if universe_policy == "soft_opt":
+        _so = softopt or {}
+        softopt = {
+            "open_window": int(_so.get("open_window") or settings.softopt_open_window),
+            "vol_mode": str(_so.get("vol_mode") or settings.softopt_vol_mode),
+            "min_ratio": float(
+                _so.get("min_ratio") if _so.get("min_ratio") is not None else settings.softopt_min_ratio
+            ),
+            "rally_min_pct": float(
+                _so.get("rally_min_pct") if _so.get("rally_min_pct") is not None else settings.softopt_rally_min_pct
+            ),
+            "rally_window": int(_so.get("rally_window") or settings.softopt_rally_window),
+            "hard_filter": bool(
+                _so.get("hard_filter") if _so.get("hard_filter") is not None else settings.softopt_hard_filter
+            ),
+            "penalty": float(
+                _so.get("penalty") if _so.get("penalty") is not None else settings.softopt_penalty
+            ),
+            "bonus": float(_so.get("bonus") if _so.get("bonus") is not None else settings.softopt_bonus),
+        }
+    else:
+        softopt = None
+
     progress("session", 0.05, "检查交易时段")
     allowed, session_note = session_allowed(session, demo_mode=settings.demo_mode)
     if not allowed:
@@ -835,6 +911,8 @@ def run_scan(
         mode_label += "·配额测试"
     elif universe_policy == "soft":
         mode_label += "·软加权测试"
+    elif universe_policy == "soft_opt":
+        mode_label += "·优化软加权"
     session_note = f"{mode_label} · {session_note}"
 
     # 大盘环境闸门：指数暴跌日整体降级/观望；情绪默认提示级
@@ -981,8 +1059,8 @@ def run_scan(
                 session_note += f" · 板块成分池失败，测试策略降级全市场: {str(e)[:60]}"
 
             check_cancel()
-            # soft/quota 需要全市场快照；hot_only 优先成分实时报价
-            need_full_spot = universe_policy in ("soft", "quota")
+            # soft/quota/soft_opt 需要全市场快照；hot_only 优先成分实时报价
+            need_full_spot = universe_policy in ("soft", "quota", "soft_opt")
             if universe_codes and not need_full_spot:
                 progress("quotes", 0.45, f"拉取成分实时报价({len(universe_codes)}只)")
                 t0 = time.perf_counter()
@@ -1073,8 +1151,8 @@ def run_scan(
             except Exception:
                 pass
 
-        # soft/quota：用成分标签标记热门（全市场票也可能命中）
-        if universe_policy in ("soft", "quota") and universe_codes:
+        # soft/quota/soft_opt：用成分标签标记热门（全市场票也可能命中）
+        if universe_policy in ("soft", "quota", "soft_opt") and universe_codes:
             for r in rows:
                 code = str(r.get("code") or "").zfill(6)
                 if code in universe_codes and code not in board_tags:
@@ -1105,6 +1183,7 @@ def run_scan(
                 mode=mode,
                 universe_policy=universe_policy,
                 sel_ctx=sel_ctx,
+                softopt=softopt,
             )
             for r in rows
         ]
@@ -1208,6 +1287,7 @@ def run_scan(
                 "universe_policy": universe_policy,
                 "demo_mode": settings.demo_mode,
                 "strategy_version": settings.strategy_version,
+                "softopt": softopt,
             },
             "count": len(results),
             "items": results,

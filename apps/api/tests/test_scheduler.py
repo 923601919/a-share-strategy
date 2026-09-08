@@ -26,8 +26,10 @@ from services.scheduler import (  # noqa: E402
     ensure_strategy_user,
     run_scheduled_scan,
     _add_hits_to_watchlist,
+    _build_scheduler,
     STRATEGY_SOFT,
     STRATEGY_FENSHI,
+    STRATEGY_SOFT_OPT,
 )
 
 
@@ -54,6 +56,48 @@ def test_ensure_strategy_users_distinct():
     soft_uid = ensure_strategy_user(STRATEGY_SOFT)
     fenshi_uid = ensure_strategy_user(STRATEGY_FENSHI)
     assert soft_uid != fenshi_uid
+
+
+def test_ensure_strategy_soft_opt_distinct():
+    """优化软加权 soft_opt 是独立账号，与 soft / fenshi 互不相同。"""
+    soft_uid = ensure_strategy_user(STRATEGY_SOFT)
+    fenshi_uid = ensure_strategy_user(STRATEGY_FENSHI)
+    opt_uid = ensure_strategy_user(STRATEGY_SOFT_OPT)
+    assert opt_uid not in (soft_uid, fenshi_uid)
+    assert opt_uid == ensure_strategy_user(STRATEGY_SOFT_OPT)  # 幂等
+
+
+def test_run_scheduled_scan_soft_opt_forwards_softopt(monkeypatch):
+    """soft_opt 定时扫描：universe_policy 透传 soft_opt，softopt 留空用配置默认。"""
+    monkeypatch.setattr(sched, "is_trade_date", lambda d: True)
+    captured: dict = {}
+
+    def capture(**kw):
+        captured.update(kw)
+        return {"count": 0, "items": [], "error_code": None, "session_note": ""}
+
+    monkeypatch.setattr("services.scan.run_scan", capture)
+    r = run_scheduled_scan(STRATEGY_SOFT_OPT, universe_policy="soft_opt", session="morning", max_retries=0)
+    assert r.scanned is True
+    assert captured.get("universe_policy") == "soft_opt"
+    # 调度侧不传具体参数 -> 交由 run_scan 用 config.py 的 softopt_* 默认归一化
+    assert captured.get("softopt") is None
+
+
+def test_scheduler_registers_soft_opt_jobs():
+    """_build_scheduler 应为 soft_opt 注册 10:40/14:20 两个 job，总计 7 个。"""
+    s = _build_scheduler()
+    try:
+        ids = {j.id for j in s.get_jobs()}
+    finally:
+        try:
+            s.shutdown(wait=False)
+        except Exception:
+            pass
+    assert "soft_opt-morning" in ids
+    assert "soft_opt-afternoon" in ids
+    # 3 账号 × 2 时间点 + 15:30 收益回填 = 7
+    assert len(ids) == 7, f"job 数应为 7，实际 {len(ids)}: {sorted(ids)}"
 
 
 def test_skip_on_non_trade_date(monkeypatch):

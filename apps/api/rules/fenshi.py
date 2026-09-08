@@ -818,6 +818,149 @@ def apply_zhaban(fenshi: dict[str, Any], zhaban: dict[str, Any], *, p: StrategyP
     return out
 
 
+def detect_rally_vs_open_volume(
+    minute: pd.DataFrame | None,
+    *,
+    open_window: int = 5,
+    vol_mode: str = "avg",
+    min_ratio: float = 1.2,
+    rally_min_pct: float = 1.0,
+    rally_window: int = 30,
+) -> dict[str, Any]:
+    """优化软加权核心条件：拉升期间量能 vs 开盘量能。
+
+    口径：
+    - 开盘量能 = 开盘后前 open_window 根分时的均量（成交量，无成交额回退成交额）。
+    - 拉升段 = 近 rally_window 根内，从最低价谷底到当前价的连续上涨段
+      （当前价相对谷底涨幅 >= rally_min_pct 才判定为"拉升"）。
+    - 拉升量能 = 拉升段内成交量（avg=平均 / peak=峰值），由 vol_mode 决定。
+    - 判定：ratio = 拉升量能 / 开盘量能 >= min_ratio 视为达标。
+
+    返回结构化字段供上层硬过滤/降权，以及前端展示。
+    """
+    empty = {
+        "ok": False,
+        "ratio": None,
+        "rally_vol": None,
+        "open_vol": None,
+        "vol_mode": vol_mode,
+        "rally_bars": 0,
+        "rally_pct": None,
+        "message": "分时数据不足，无法评估拉升量能",
+    }
+    if minute is None or len(minute) < 15 or "close" not in minute.columns:
+        return empty
+    df = minute.dropna(subset=["close"]).reset_index(drop=True)
+    if len(df) < 3:
+        return empty
+
+    closes = pd.to_numeric(df["close"], errors="coerce").ffill().astype(float)
+    if "volume" in df.columns:
+        vols = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(float)
+    elif "amount" in df.columns:
+        vols = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(float)
+    else:
+        return empty
+
+    n = len(df)
+
+    # 开盘量能：前 open_window 根均量
+    ow = max(1, min(int(open_window), n))
+    open_vol = float(vols.iloc[:ow].mean() or 0)
+    if open_vol <= 0:
+        out = dict(empty)
+        out.update({"open_vol": 0.0, "message": "开盘量能为 0，无法比较"})
+        return out
+
+    # 拉升段识别：回看窗口内最低收盘价的谷底 -> 当前
+    w = max(2, min(int(rally_window), n))
+    win = closes.iloc[-w:]
+    trough_pos = int(win.idxmin())  # 相对全 df 的绝对位置
+    trough_price = float(closes.iloc[trough_pos])
+    end_price = float(closes.iloc[-1])
+    rally_pct = ((end_price / trough_price) - 1.0) * 100.0 if trough_price > 0 else 0.0
+
+    if rally_pct < rally_min_pct:
+        out = dict(empty)
+        out.update(
+            open_vol=round(open_vol, 2),
+            rally_pct=round(rally_pct, 3),
+            message=f"未识别到拉升段(近{w}根涨幅{rally_pct:.2f}%<{rally_min_pct:g}%)",
+        )
+        return out
+
+    seg = vols.iloc[trough_pos:]
+    rally_bars = int(len(seg))
+    if rally_bars <= 0:
+        out = dict(empty)
+        out.update(open_vol=round(open_vol, 2), message="拉升段为空")
+        return out
+
+    if vol_mode == "peak":
+        rally_vol = float(seg.max() or 0)
+    else:
+        rally_vol = float(seg.mean() or 0)
+
+    ratio = (rally_vol / open_vol) if open_vol > 0 else None
+    ok = bool(ratio is not None and ratio >= min_ratio)
+
+    if ratio is not None:
+        label = "峰值" if vol_mode == "peak" else "平均"
+        message = f"拉升{label}量能/开盘量能 {ratio:.2f}x" + (f"（≥{min_ratio:g}达标）" if ok else f"（<{min_ratio:g}不达标）")
+    else:
+        message = "拉升量能/开盘量能 无法计算"
+
+    return {
+        "ok": ok,
+        "ratio": round(ratio, 3) if ratio is not None else None,
+        "rally_vol": round(rally_vol, 2),
+        "open_vol": round(open_vol, 2),
+        "vol_mode": vol_mode,
+        "rally_bars": rally_bars,
+        "rally_pct": round(rally_pct, 3),
+        "message": message,
+    }
+
+
+def apply_rally_open_volume(
+    fenshi: dict[str, Any],
+    rally: dict[str, Any],
+    *,
+    hard_filter: bool = True,
+    min_ratio: float = 1.2,
+    penalty: float = 15.0,
+    bonus: float = 6.0,
+    p: StrategyParams | None = None,
+) -> tuple[dict[str, Any] | None, bool]:
+    """把拉升量能条件叠加到进攻型打分结果上。
+
+    - 达标：加分 bonus，附原因。
+    - 不达标：hard_filter=True 返回 (None, False) 表示剔除；
+              否则降权 penalty。
+    返回 (fenshi 或 None, filtered)。
+    """
+    pp = _P(p)
+    out = dict(fenshi)
+    reasons = list(out.get("reasons") or [])
+    score = float(out.get("score") or 0)
+    out["rally_open"] = rally
+
+    if rally.get("ok"):
+        if bonus:
+            score = min(pp.fenshi_score_cap, score + bonus)
+            reasons.append(f"{rally.get('message')}+{bonus:g}")
+    else:
+        if hard_filter:
+            return None, True
+        if penalty:
+            score = max(0.0, score - penalty)
+            reasons.append(f"{rally.get('message')}-{penalty:g}")
+
+    out["score"] = round(min(score, pp.fenshi_score_cap), 1)
+    out["reasons"] = reasons
+    return out, False
+
+
 def score_offensive_fenshi(
     minute: pd.DataFrame, lookback: int = 30, p: StrategyParams | None = None
 ) -> dict[str, Any]:

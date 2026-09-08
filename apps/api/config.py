@@ -31,8 +31,17 @@ class Settings(BaseSettings):
     top_n_result: int = 30
     # 测试策略：配额制卫星池占比（非主线名额）
     universe_quota_satellite_pct: float = 0.25
-    # 软加权：热门板块加分（仅 soft 策略对进攻型生效）
+    # 软加权：热门板块加分（仅 soft / soft_opt 策略对进攻型生效）
     soft_hot_board_bonus: float = 8.0
+    # 优化软加权（soft_opt）：拉升期间量能必须大于开盘量能（筛选条件）
+    softopt_open_window: int = 5        # 开盘量能取样窗口：开盘后前 N 根分时的均量
+    softopt_vol_mode: str = "avg"       # 拉升量能口径：avg=平均量能 / peak=峰值量能
+    softopt_min_ratio: float = 1.2      # 拉升量能 / 开盘量能 需 >= 此放大倍数
+    softopt_rally_min_pct: float = 1.0  # 拉升识别：近段涨幅达此 % 才算"拉升"
+    softopt_rally_window: int = 30      # 拉升段回看窗口（分时根数）
+    softopt_hard_filter: bool = True    # 不达标是否硬剔除（False=降权）
+    softopt_penalty: float = 15.0       # 不达标降权分（hard_filter=False 时生效）
+    softopt_bonus: float = 6.0          # 达标加分（量能条件满足时的正向反馈）
     anomaly_warn_pct: float = 180.0
     anomaly_block_pct: float = 195.0
     # 进攻型分时：今累计成交/昨全日（优先成交额）

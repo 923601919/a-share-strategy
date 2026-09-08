@@ -2,9 +2,10 @@
 
 设计目标
 --------
-- 两个独立策略账号（软加权 soft / 进攻型分时 fenshi），各自拥有完全隔离的自选列表。
+- 三个独立策略账号（软加权 soft / 进攻型分时 fenshi / 优化软加权 soft_opt），各自拥有完全隔离的自选列表。
 - 每个交易日两个时间点（默认 10:40 上午、14:20 下午）各触发一轮扫描。
 - 扫描结果的全部标的自动写入对应账号的自选列表（source 标记为策略来源），供后续数据分析。
+- soft_opt 在软加权基础上叠加「拉升量能必须 > 开盘量能」硬过滤（参数取 config.py 的 softopt_* 默认值）。
 
 关键约束（与本项目既有约定对齐）
 --------------------------------
@@ -34,13 +35,15 @@ from user_ctx import user_scope
 
 logger = logging.getLogger("scheduler")
 
-# 策略账号名（软加权 / 进攻型分时）——两个独立用户，各自隔离的自选列表
-STRATEGY_SOFT = "soft"       # 软加权（universe_policy=soft）
-STRATEGY_FENSHI = "fenshi"   # 进攻型分时（mode=fenshi + hot_only）
+# 策略账号名（软加权 / 进攻型分时 / 优化软加权）——三个独立用户，各自隔离的自选列表
+STRATEGY_SOFT = "soft"           # 软加权（universe_policy=soft）
+STRATEGY_FENSHI = "fenshi"      # 进攻型分时（mode=fenshi + hot_only）
+STRATEGY_SOFT_OPT = "soft_opt"  # 优化软加权（universe_policy=soft_opt，拉升量能>开盘量能硬过滤）
 
 # 自选来源标记：与 WatchIn.source 的 Literal 一致，便于前端 by_source 统计
 SOURCE_SOFT = "fenshi"       # 软加权落库 source（复用 fenshi 来源标记，前端已支持）
 SOURCE_FENSHI = "fenshi"
+SOURCE_SOFT_OPT = "fenshi"   # 优化软加权同样复用 fenshi 来源标记
 
 # 全局串行锁：同一时刻只允许一轮定时扫描在跑。
 # 原因（2026-09-04 实测）：两个账号的 job 会被 APScheduler 在同一秒并发启动，
@@ -170,6 +173,7 @@ def run_scheduled_scan(
     retry_backoff_seconds: float = 30.0,
     top_n: int | None = None,
     source: str | None = None,
+    softopt: dict[str, Any] | None = None,
 ) -> ScheduledScanResult:
     """执行一轮定时扫描并把全部命中标的加入对应账号自选。
 
@@ -203,7 +207,11 @@ def run_scheduled_scan(
 
     uid = ensure_strategy_user(account)
     if source is None:
-        source = SOURCE_SOFT if account == STRATEGY_SOFT else SOURCE_FENSHI
+        source = (
+            SOURCE_SOFT_OPT if account == STRATEGY_SOFT_OPT
+            else SOURCE_SOFT if account == STRATEGY_SOFT
+            else SOURCE_FENSHI
+        )
 
     # 扫描（带重试）。延迟导入避免循环依赖。
     from services.scan import run_scan
@@ -218,6 +226,7 @@ def run_scheduled_scan(
                     mode=mode,
                     universe_policy=universe_policy,
                     top_n=top_n,
+                    softopt=softopt,
                 )
             break
         except Exception as e:  # noqa: BLE001
@@ -259,6 +268,7 @@ def run_scheduled_scan(
                     mode=mode,
                     universe_policy=universe_policy,
                     top_n=top_n,
+                    softopt=softopt,
                 )
         except Exception as e:  # noqa: BLE001
             logger.exception("scheduled scan [%s] no_quotes retry %d failed", account, extra)
@@ -371,6 +381,7 @@ def _build_scheduler() -> BackgroundScheduler:
         for account, mode, up in [
             (STRATEGY_SOFT, "fenshi", "soft"),
             (STRATEGY_FENSHI, "fenshi", "hot_only"),
+            (STRATEGY_SOFT_OPT, "fenshi", "soft_opt"),
         ]:
             job = _make_job(account, mode, up, session)
             sched.add_job(

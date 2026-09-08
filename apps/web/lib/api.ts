@@ -189,6 +189,15 @@ export type ScanJob = {
   params?: Record<string, unknown>;
 };
 
+export type SoftOptBody = {
+  open_window?: number;
+  vol_mode?: "avg" | "peak";
+  min_ratio?: number;
+  rally_min_pct?: number;
+  rally_window?: number;
+  hard_filter?: boolean;
+};
+
 export type ScanBody = {
   min_amount_yi?: number;
   min_pct?: number;
@@ -196,7 +205,8 @@ export type ScanBody = {
   session?: string;
   top_n?: number;
   mode?: "fenshi" | "leader_dip";
-  universe_policy?: "hot_only" | "quota" | "soft";
+  universe_policy?: "hot_only" | "quota" | "soft" | "soft_opt";
+  softopt?: SoftOptBody;
 };
 
 export function scan(body?: ScanBody) {

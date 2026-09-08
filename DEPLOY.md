@@ -69,9 +69,10 @@ docker compose up -d --build                # 重建并重启（web 若改动较
 | -------- | -------- | ------------ |
 | `soft` | `mode=fenshi` + `universe_policy=soft`（软加权） | `source=fenshi` |
 | `fenshi` | `mode=fenshi` + `universe_policy=hot_only`（进攻型分时） | `source=fenshi` |
+| `soft_opt` | `mode=fenshi` + `universe_policy=soft_opt`（优化软加权，拉升量能>开盘量能硬过滤，参数取 config.py `softopt_*` 默认） | `source=fenshi` |
 
 - 两个账号**完全隔离**（`watchlist` 主键 `(user_id, code)`），账号首次触发时自动创建，无需手动建。
 - 调度开关与参数：`.env` 的 `SCHEDULER_ENABLED`（默认 true）、`SCHEDULER_TIMEZONE`（默认 `Asia/Shanghai`）。
 - 交易日判断走 `services/trade_calendar.py`（akshare 交易日历，失败回退工作日近似）；非交易日自动跳过。
-- 观察：`/api/health` 返回的 `scheduler` 字段含 4 个 job 及下次触发时间。
+- 观察：`/api/health` 返回的 `scheduler` 字段含 7 个 job（3 个策略账号 × 2 时间点 + 15:30 收益回填）及下次触发时间。
 - 部署注意：`requirements.txt` 已加 `apscheduler`，重新 `docker compose up -d --build` 时会装入。
