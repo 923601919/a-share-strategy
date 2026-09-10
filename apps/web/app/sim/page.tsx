@@ -6,6 +6,7 @@ import {
   getSim,
   resetSim,
   sellSim,
+  sourceLabel,
   type SimOverview,
 } from "@/lib/api";
 
@@ -182,11 +183,7 @@ export default function SimPage() {
                   <td>{p.code}</td>
                   <td>{p.name}</td>
                   <td className="muted">
-                    {p.source === "fenshi"
-                      ? "分时"
-                      : p.source === "longtou"
-                        ? "龙头"
-                        : p.source || "默认"}
+                    {sourceLabel(p.source)}
                     {p.take_profit_pct != null ? ` +${p.take_profit_pct}%` : ""}
                   </td>
                   <td>{p.shares}</td>

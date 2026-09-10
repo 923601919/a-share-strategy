@@ -24,6 +24,8 @@ SOURCE_LABELS = {
     "fenshi": "进攻型分时",
     "longtou": "龙头低吸",
     "manual": "手工",
+    "soft": "软加权",
+    "soft_opt": "优化软加权",
 }
 # 日内位置分桶（追高参数校准的核心维度：买在高位的票 T+N 是否更差）
 POSITION_KEYS = ("<0.3", "0.3-0.6", "0.6-0.9", ">=0.9", "unknown")

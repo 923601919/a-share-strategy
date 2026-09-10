@@ -306,6 +306,26 @@ export async function scanWithProgress(
   }
 }
 
+/**
+ * 自选/持仓来源 → 中文名。
+ * 必须与后端 apps/api/services/stats.py 的 SOURCE_LABELS 保持一致，
+ * 否则统计页（用后端返回的 label）与自选/持仓页（前端查表）会显示不一致。
+ * soft / soft_opt 为 verify 汇总账户区分三策略来源而新增（2026-09-10）。
+ */
+export const SOURCE_LABELS: Record<string, string> = {
+  fenshi: "进攻型分时",
+  longtou: "龙头低吸",
+  manual: "手工",
+  soft: "软加权",
+  soft_opt: "优化软加权",
+};
+
+/** 取来源中文名；未知来源原样返回（新策略上线时不会显示成空白）。 */
+export function sourceLabel(source?: string | null): string {
+  if (!source) return "-";
+  return SOURCE_LABELS[source] || source;
+}
+
 export type WatchTrackDay = {
   day_offset: number;
   trade_date: string;

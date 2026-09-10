@@ -39,11 +39,15 @@ logger = logging.getLogger("scheduler")
 STRATEGY_SOFT = "soft"           # 软加权（universe_policy=soft）
 STRATEGY_FENSHI = "fenshi"      # 进攻型分时（mode=fenshi + hot_only）
 STRATEGY_SOFT_OPT = "soft_opt"  # 优化软加权（universe_policy=soft_opt，拉升量能>开盘量能硬过滤）
+STRATEGY_VERIFY = "verify"      # 汇总验证账户：同一账户内跑上述三策略，靠 source 区分来源
 
-# 自选来源标记：与 WatchIn.source 的 Literal 一致，便于前端 by_source 统计
-SOURCE_SOFT = "fenshi"       # 软加权落库 source（复用 fenshi 来源标记，前端已支持）
-SOURCE_FENSHI = "fenshi"
-SOURCE_SOFT_OPT = "fenshi"   # 优化软加权同样复用 fenshi 来源标记
+# 自选来源标记：与 WatchIn.source 的 Literal 一致，便于前端 by_source 统计。
+# 老三账户（soft/fenshi/soft_opt）沿用 "fenshi" —— 它们靠 user_id 隔离自选，
+# source 不参与区分，保持既有行为以免改变止损止盈取值链路。
+# verify 账户才使用三值区分：同一自选页里要能看出每条来自哪个策略。
+SOURCE_FENSHI = "fenshi"        # 进攻型分时（老三账户沿用；verify 下表示进攻型分时命中）
+SOURCE_SOFT = "soft"            # 软加权，仅 verify 账户使用
+SOURCE_SOFT_OPT = "soft_opt"    # 优化软加权，仅 verify 账户使用
 
 # 全局串行锁：同一时刻只允许一轮定时扫描在跑。
 # 原因（2026-09-04 实测）：两个账号的 job 会被 APScheduler 在同一秒并发启动，
@@ -59,10 +63,29 @@ _NO_QUOTES_RETRIES = 2
 _NO_QUOTES_BACKOFF = 20.0
 
 # 扫描时点 → session 映射（精确对齐交易时段窗口：morning 09:45-11:30 / afternoon 13:30-15:00）
+# 09:45 是 morning 窗口的起点且为闭区间（实测 in_session_bucket("09:45") == "morning"），放行。
 _HM_SESSION = {
+    "09:45": "morning",
     "10:40": "morning",
     "14:20": "afternoon",
 }
+
+# 定时扫描计划表：(账号, mode, universe_policy, source, 时间点列表)
+#
+# 之所以用显式列表而不是「账号列表 × 时间点列表」的笛卡尔积：不同账号需要的时间点不同。
+#   - 老三账户：各自独立自选，10:40 / 14:20 生产在用 → source 一律沿用 fenshi
+#   - verify：单一汇总账户跑三策略，仅 9:45 → source 必须三值区分，页面才可分辨
+# 顺序即意向上的执行先后（实际由 APScheduler 同秒触发 + 全局串行锁排队决定）。
+SCHEDULE_PLAN: list[tuple[str, str, str, str, tuple[str, ...]]] = [
+    # ---- 老三账户：保持既有行为完全不变 ----
+    (STRATEGY_SOFT, "fenshi", "soft", SOURCE_FENSHI, ("10:40", "14:20")),
+    (STRATEGY_FENSHI, "fenshi", "hot_only", SOURCE_FENSHI, ("10:40", "14:20")),
+    (STRATEGY_SOFT_OPT, "fenshi", "soft_opt", SOURCE_FENSHI, ("10:40", "14:20")),
+    # ---- verify 汇总账户：9:45 三个策略依次跑，靠 source 在同一自选页区分来源 ----
+    (STRATEGY_VERIFY, "fenshi", "soft", SOURCE_SOFT, ("09:45",)),
+    (STRATEGY_VERIFY, "fenshi", "hot_only", SOURCE_FENSHI, ("09:45",)),
+    (STRATEGY_VERIFY, "fenshi", "soft_opt", SOURCE_SOFT_OPT, ("09:45",)),
+]
 
 
 @dataclass
@@ -130,8 +153,17 @@ def _add_hits_to_watchlist(
 ) -> tuple[int, int]:
     """把扫描命中标的加入指定账号自选。返回 (added, skipped_duplicate)。
 
-    幂等：watchlist 主键 (user_id, code)，重复添加走 ON CONFLICT DO UPDATE，
-    因此以「添加前是否已存在」判定是否重复（用于统计），实际写入均成功。
+    **保留首次命中**：watchlist 主键 (user_id, code)，而 add_watch 是
+    ON CONFLICT DO UPDATE —— 若重复写入，后一轮扫描会静默覆盖先前的
+    source / entry_price / entry_score。这在单策略账号（如 soft）里无碍，
+    但在 verify 汇总账号里会致命：三个策略串行跑，后跑的会把前两个的来源
+    全部改成自己的，自选页就无法区分来源了。
+    因此这里改为「已存在则跳过」，每条自选的来源 = 首次命中它的那个策略，
+    且入门价/分数保持首次快照，后续收益统计口径稳定。
+
+    副作用：同一标的被多策略同时命中时，只记录首次来源，「多策略共振」信号
+    不在 watchlist 表内体现（如需共振分析，应另建关联表，不应靠覆盖主键实现）。
+
     内部自行用 user_scope 包裹，调用方无需预先设置用户上下文。
     """
     with user_scope(uid):
@@ -142,8 +174,10 @@ def _add_hits_to_watchlist(
             code = str(h.get("code") or "").zfill(6)
             if not code:
                 continue
+            if code in existing:
+                dup += 1
+                continue
             name = str(h.get("name") or code)
-            was_present = code in existing
             add_watch(
                 code,
                 name,
@@ -155,11 +189,8 @@ def _add_hits_to_watchlist(
                 day_position=(h.get("fenshi") or {}).get("day_position"),
                 vwap_deviation=(h.get("fenshi") or {}).get("vwap_deviation"),
             )
-            if was_present:
-                dup += 1
-            else:
-                added += 1
-                existing.add(code)
+            added += 1
+            existing.add(code)
     return added, dup
 
 
@@ -207,11 +238,11 @@ def run_scheduled_scan(
 
     uid = ensure_strategy_user(account)
     if source is None:
-        source = (
-            SOURCE_SOFT_OPT if account == STRATEGY_SOFT_OPT
-            else SOURCE_SOFT if account == STRATEGY_SOFT
-            else SOURCE_FENSHI
-        )
+        # 兜底一律沿用 fenshi：老三账户（soft/fenshi/soft_opt）靠 user_id 隔离自选，
+        # 来源不参与区分，必须保持既有行为以免改变止损止盈取值链路。
+        # verify 汇总账户的三个策略 job 由 SCHEDULE_PLAN 显式传入各自 source，
+        # 不会走到这个分支（见 _make_job 的 source 参数）。
+        source = SOURCE_FENSHI
 
     # 扫描（带重试）。延迟导入避免循环依赖。
     from services.scan import run_scan
@@ -305,7 +336,13 @@ def run_scheduled_scan(
     return base
 
 
-def _make_job(account: str, mode: str, universe_policy: str, session: str) -> Callable[[], None]:
+def _make_job(
+    account: str,
+    mode: str,
+    universe_policy: str,
+    session: str,
+    source: str | None = None,
+) -> Callable[[], None]:
     """构造一个可序列化为单一调度 job 的闭包（APScheduler 要求 callable）。"""
 
     def _job() -> None:
@@ -324,12 +361,15 @@ def _make_job(account: str, mode: str, universe_policy: str, session: str) -> Ca
                 mode=mode,
                 universe_policy=universe_policy,
                 session=session,
+                source=source,
             )
             stats.record(r)
         finally:
             _scheduled_scan_lock.release()
 
-    _job.__name__ = f"sched_{account}_{session}"  # 便于日志区分
+    # job 名需含 universe_policy：verify 账户在同一 session 下有三个策略 job，
+    # 否则日志里无法区分是哪一个在跑。
+    _job.__name__ = f"sched_{account}_{universe_policy}_{session}"  # 便于日志区分
     return _job
 
 
@@ -375,15 +415,12 @@ def _build_scheduler() -> BackgroundScheduler:
         },
     )
 
-    for hm, session in _HM_SESSION.items():
-        hour, minute = (int(x) for x in hm.split(":"))
-        # 每个策略账号 × 每个时间点 = 一个独立 job
-        for account, mode, up in [
-            (STRATEGY_SOFT, "fenshi", "soft"),
-            (STRATEGY_FENSHI, "fenshi", "hot_only"),
-            (STRATEGY_SOFT_OPT, "fenshi", "soft_opt"),
-        ]:
-            job = _make_job(account, mode, up, session)
+    # 按计划表注册（而非笛卡尔积）：账号 × 策略 × 该账号自己的时间点
+    for account, mode, up, source, times in SCHEDULE_PLAN:
+        for hm in times:
+            session = _HM_SESSION[hm]
+            hour, minute = (int(x) for x in hm.split(":"))
+            job = _make_job(account, mode, up, session, source)
             sched.add_job(
                 job,
                 trigger=CronTrigger(
@@ -392,11 +429,17 @@ def _build_scheduler() -> BackgroundScheduler:
                     day_of_week="mon-fri",
                     timezone=str(settings.scheduler_timezone),
                 ),
-                id=f"{account}-{session}",
-                name=f"{account}@{hm}",
+                # id 必须带上策略维度：verify 在同一 session 下注册三个 job，
+                # 若沿用 "{account}-{session}" 会同 id，被 replace_existing 互相覆盖，
+                # 最终只剩最后一个策略生效。
+                id=f"{account}-{up}-{hm.replace(':', '')}",
+                name=f"{account}@{hm}/{up}",
                 replace_existing=True,
             )
-            logger.info("scheduled job registered: %s @ %s (%s/%s)", account, hm, mode, up)
+            logger.info(
+                "scheduled job registered: %s @ %s (%s/%s, source=%s)",
+                account, hm, mode, up, source,
+            )
 
     # 收盘后 15:30 自动回填收益：绕过缓存把当日最新日线补齐落库，无需用户手点。
     backfill_job = _make_backfill_job()

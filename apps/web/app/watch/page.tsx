@@ -6,6 +6,7 @@ import {
   getWatchlistHistory,
   refreshWatchlistWithProgress,
   removeWatch,
+  sourceLabel,
   type WatchHistoryItem,
   type WatchlistResponse,
   type WatchlistStats,
@@ -364,7 +365,7 @@ export default function WatchPage() {
                   <tr key={it.id}>
                     <td>{it.code}</td>
                     <td>{it.name}</td>
-                    <td className="muted">{it.source || "-"}</td>
+                    <td className="muted">{sourceLabel(it.source)}</td>
                     <td>{it.entry_price ?? "-"}</td>
                     <td>{it.entry_score ?? "-"}</td>
                     <td>{fmtRet(retAt(it, 0))}</td>

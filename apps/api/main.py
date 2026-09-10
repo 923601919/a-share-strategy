@@ -126,7 +126,9 @@ def _shutdown() -> None:
 class WatchIn(BaseModel):
     code: str
     name: str = ""
-    source: Literal["manual", "fenshi", "longtou"] = "manual"
+    # soft / soft_opt 为 2026-09-10 新增：verify 汇总账户在同一账户内跑三策略，
+    # 需靠 source 区分来源（老三账户沿用 fenshi，保持既有行为不变）。
+    source: Literal["manual", "fenshi", "longtou", "soft", "soft_opt"] = "manual"
     note: str = ""
     entry_price: float | None = None
     entry_pct: float | None = None
