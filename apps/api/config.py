@@ -242,6 +242,20 @@ class Settings(BaseSettings):
     scheduler_enabled: bool = True  # 是否启用定时扫描（进程内 BackgroundScheduler）
     scheduler_timezone: str = "Asia/Shanghai"  # 交易日/时间点判断时区（A 股）
 
+    # ===== 大盘涨跌预判（六爻；仅供娱乐，作业在 15:45 盘后跑）=====
+    # 与扫描共用 scheduler_enabled / scheduler_timezone，但可单独关：
+    # 预判要写库、要打行情网，不想让它跟着扫描一起上线时用这个开关。
+    market_forecast_enabled: bool = True
+    market_forecast_symbol: str = "000001.SH"      # 标的（当前只支持上证指数）
+    market_forecast_label: str = "上证指数"         # 展示名（前端/接口原样透出）
+    # 起卦盐值：同一天同一标的、改了它 → 卦象就不同。默认与 tianji 对齐，
+    # 这样两边对同一日期能摇出同一卦（黄金向量就是靠这个对齐的）。
+    market_forecast_seed_salt: str = "yz-standard-v1"
+    # 平盘阈值（**单位是百分点**，不是比例）：|涨跌幅| <= 此值判为平盘。
+    # 平盘样本不进二元统计（既不算命中也不算未命中），所以它同时影响
+    # 命中率的分母与"永远猜涨"基线——0.05 是 tianji 沿用值，改动等于换口径。
+    market_forecast_flat_threshold_pct: float = 0.05
+
 
 settings = Settings()
 

@@ -421,6 +421,89 @@ def fetch_daily(code: str, limit: int = 40) -> pd.DataFrame:
     return df.tail(limit).reset_index(drop=True)
 
 
+def fetch_index_daily(code: str = "000001", limit: int = 400) -> list[dict[str, Any]]:
+    """**指数**日线（升序）。主源东财 `index_zh_a_hist`，备源新浪 `stock_zh_index_daily`。
+
+    返回 `[{date, close, prev_close, source}]`，`date` 为 ISO 日期。
+    `prev_close` 由**上一根收盘**推出——指数没有除权除息，所以它与交易所
+    公布的前收盘价恒等（见 `forecast/change.py` 的口径说明）。首根没有上一根，
+    `prev_close` 记 None（结算时按 `naive` 口径退回，不会静默算错）。
+
+    ⚠ 与 `fetch_daily`（个股）的区别：这里不做复权、不抓除权事件。
+    指数没有分红除权，给它算复权因子会凭空造出一条斜率不同的曲线，
+    而那条曲线照样画得出来。
+
+    失败时抛异常由调用方决定降级/留待结算——**不要返回空列表当作「没有行情」**，
+    那两件事在结算环节的处理完全不同（一个该重试，一个该保持待结算）。
+    """
+    import akshare as ak
+
+    raw = str(code).strip().lower()
+    symbol6 = raw[-6:].zfill(6)
+    # 指数不能用 _sina_symbol（会把 000001 判成深市个股）
+    sina_sym = f"sh{symbol6}" if f"sh{symbol6}" in _INDEX_SYMBOLS else f"sz{symbol6}"
+
+    end = datetime.now()
+    start = end - timedelta(days=limit * 2 + 30)
+    errors: list[str] = []
+
+    def _from_em() -> pd.DataFrame:
+        df = ak.index_zh_a_hist(
+            symbol=symbol6,
+            period="daily",
+            start_date=start.strftime("%Y%m%d"),
+            end_date=end.strftime("%Y%m%d"),
+        )
+        return df.rename(columns={"日期": "date", "收盘": "close"})
+
+    def _from_sina() -> pd.DataFrame:
+        df = ak.stock_zh_index_daily(symbol=sina_sym)
+        if "date" not in df.columns and "日期" in df.columns:
+            df = df.rename(columns={"日期": "date"})
+        return df
+
+    df: pd.DataFrame | None = None
+    source = ""
+    for label, fn in (("em", _from_em), ("sina", _from_sina)):
+        try:
+            got = call_with_timeout(fn, 15)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{label}: {e}")
+            continue
+        if got is None or len(got) == 0:
+            errors.append(f"{label}: 空结果")
+            continue
+        df, source = got, label
+        break
+
+    if df is None:
+        raise RuntimeError(f"指数日线获取失败（{symbol6}）：" + "；".join(errors))
+
+    if "date" not in df.columns or "close" not in df.columns:
+        raise RuntimeError(f"指数日线字段缺失（{symbol6}）：{list(df.columns)}")
+
+    out: list[dict[str, Any]] = []
+    prev: float | None = None
+    for _, row in df.iterrows():
+        d = row["date"]
+        try:
+            iso = d.date().isoformat() if hasattr(d, "date") else str(d)[:10]
+        except Exception:  # noqa: BLE001
+            continue
+        close = _safe_float(row["close"])
+        if close <= 0:
+            continue
+        out.append({"date": iso, "close": close, "prev_close": prev, "source": source})
+        prev = close
+
+    out.sort(key=lambda b: b["date"])
+    # 排序后再重算 prev_close：某些源按倒序返回
+    for i, b in enumerate(out):
+        b["prev_close"] = out[i - 1]["close"] if i > 0 else None
+
+    return out[-limit:]
+
+
 def fetch_concept_boards_top(n: int = 20) -> list[dict[str, Any]]:
     """板块涨幅前列。东财 push2 在部分网络不可用，优先同花顺/新浪。"""
     import akshare as ak

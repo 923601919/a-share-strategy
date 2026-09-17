@@ -902,4 +902,155 @@ export function logout() {
   setAccessToken(null);
 }
 
+// ============================================================ 大盘预判（六爻）
+//
+// ⚠ 这一组接口**只有读**：预测只能由服务端 15:45 的定时作业产生。
+// 任何"手动补一条"的入口都会让准确率失去意义——因为它证明不了
+// 起卦时点是我们事前选的，而不是事后挑的。
+//
+// 展示层有一条硬要求：**不要只显示一个百分比**。报告的完整结构里带基线、
+// 置信区间、p 值、随样本量变化的门槛与样本充足性标记；把 rate 单独拎出来展示，
+// 正是在这个功能上最容易误导人的做法。
+
+export type ForecastDirection = "up" | "down" | "flat";
+
+export type ForecastOutcome = {
+  actual_direction: ForecastDirection;
+  actual_change: number;
+  close: number;
+  base_close: number;
+  basis: string;
+  /** bar=官方日线 / sina_rt=收盘后实时行情先结掉 / rtQuote=实时口径 */
+  source: string;
+  /** true 命中 / false 未命中 / null 不计入二元统计（任一方为平盘） */
+  hit: boolean | null;
+  settled_at: string;
+};
+
+export type ForecastItem = {
+  id: string;
+  symbol: string;
+  target_date: string;
+  /** 起卦时点（必须早于 target_date，否则就是未来函数） */
+  as_of: string;
+  generated_at: string;
+  /** live=当时真实产出 / replay=事后回补（不进准确率） */
+  origin: "live" | "replay";
+  direction: ForecastDirection;
+  strength: number;
+  hexagram: string | null;
+  changed_hexagram: string | null;
+  engine_ver: string;
+  ruleset_ver: string;
+  outcome: ForecastOutcome | null;
+};
+
+export type ForecastLatest = {
+  symbol: string;
+  symbol_label: string;
+  server_time: string;
+  upcoming: ForecastItem | null;
+  recent_settled: ForecastItem | null;
+  disclaimer: string;
+};
+
+export type ForecastHistory = {
+  symbol: string;
+  items: ForecastItem[];
+  disclaimer: string;
+};
+
+export type ForecastPermutation = {
+  iterations: number;
+  observed_hits: number;
+  observed_rate: number;
+  null_mean: number;
+  null_std: number;
+  null_p95: number;
+  p_value: number;
+  edge: number;
+};
+
+export type ForecastAccuracy = {
+  symbol: string;
+  window_days: number;
+  /** 有效样本数（平盘已剔除） */
+  n: number;
+  hits: number;
+  rate: number;
+  ci: { low: number; high: number };
+  p_value: number;
+  baselines: { random: number; always_up: number; always_down: number };
+  significant: boolean;
+  /** 当前样本量下"优于随机"所需的准确率门槛（随 n 变化） */
+  threshold: number;
+  flat_count: number;
+  sample_sufficient: boolean;
+  note: string;
+  /** 偏置匹配置换检验：样本 < 20 时为 null */
+  permutation: ForecastPermutation | null;
+  pending_count: number;
+  disclaimer: string;
+};
+
+export type ForecastRun = {
+  run_date: string;
+  status: string;
+  detail: string;
+  fired_at: string | null;
+};
+
+export type ForecastRuns = {
+  symbol: string;
+  runs: ForecastRun[];
+  /** 交易日但没有任何预测覆盖的那些日子（如实列出，不伪造补跑） */
+  gaps: string[];
+  gap_note: string;
+  disclaimer: string;
+};
+
+export function getForecastLatest() {
+  return request<ForecastLatest>("/api/market/forecast/latest");
+}
+
+export function getForecastHistory(limit = 30) {
+  return request<ForecastHistory>(`/api/market/forecast/history?limit=${encodeURIComponent(limit)}`);
+}
+
+export function getForecastAccuracy(windowDays = 0) {
+  return request<ForecastAccuracy>(
+    `/api/market/forecast/accuracy?window_days=${encodeURIComponent(windowDays)}`
+  );
+}
+
+export function getForecastRuns(limit = 30, gapDays = 60) {
+  return request<ForecastRuns>(
+    `/api/market/forecast/runs?limit=${encodeURIComponent(limit)}&gap_days=${encodeURIComponent(gapDays)}`
+  );
+}
+
+/** 方向的中文标签。flat 只可能出现在**结算结果**里，预测侧不会输出它。 */
+export function directionLabel(d: ForecastDirection | string | null | undefined): string {
+  if (d === "up") return "涨";
+  if (d === "down") return "跌";
+  if (d === "flat") return "平盘";
+  return "-";
+}
+
+/** 结算依据来源的中文说明。区分它是有意义的：实时口径是可以被官方日线修正的。 */
+export function outcomeSourceLabel(s: string | null | undefined): string {
+  if (s === "bar") return "官方日线";
+  if (s === "sina_rt" || s === "rtQuote") return "实时行情（待官方日线确认）";
+  return s || "-";
+}
+
+/** 作业状态的中文说明。failed 必须显眼——那代表当天样本永久缺了一条。 */
+export function forecastRunStatusLabel(s: string | null | undefined): string {
+  if (s === "ok") return "正常";
+  if (s === "partial") return "部分完成";
+  if (s === "failed") return "失败（当天无产出）";
+  if (s === "holiday") return "非交易日";
+  return s || "-";
+}
+
 export { API_BASE };

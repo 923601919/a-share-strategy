@@ -94,20 +94,49 @@ def test_scheduler_registers_soft_opt_jobs():
     """
     s = _build_scheduler()
     try:
-        ids = [j.id for j in s.get_jobs()]
+        jobs = {j.id: j for j in s.get_jobs()}
     finally:
         try:
             s.shutdown(wait=False)
         except Exception:
             pass
-    # 老三账户 3×2 时间点 + verify 3×1 时间点 + 15:30 收益回填 = 10
-    assert len(ids) == 10, f"job 数应为 10，实际 {len(ids)}: {sorted(ids)}"
+    ids = list(jobs)
+    # 老三账户 3×2 时间点 + verify 3×1 时间点 + 15:30 收益回填 + 15:45 大盘预判 = 11
+    assert len(ids) == 11, f"job 数应为 11，实际 {len(ids)}: {sorted(ids)}"
     assert len(set(ids)) == len(ids), f"job id 存在重复（发生覆盖）: {sorted(ids)}"
     assert "soft_opt-soft_opt-1040" in ids
     assert "soft_opt-soft_opt-1420" in ids
     assert "verify-soft-0945" in ids
     assert "verify-hot_only-0945" in ids
     assert "verify-soft_opt-0945" in ids
+
+
+def test_scheduler_registers_market_forecast_at_1545():
+    """大盘预判作业必须注册在 **15:45 周一至周五**，且与扫描错开。
+
+    时点不是随手挑的：15:00 收盘后，15:30 的收益回填先跑（两者都打行情网），
+    预判排在后面可以避免在同一分钟争抢 akshare 连接。
+    另一条同样重要：预判**不与扫描共用串行锁**——共用的话，
+    15:45 若撞上某轮扫描变慢，预判会被静默跳过，而当天的样本就永久缺了一条。
+    """
+    from apscheduler.triggers.cron import CronTrigger
+
+    s = _build_scheduler()
+    try:
+        job = next((j for j in s.get_jobs() if j.id == "market-forecast"), None)
+        all_ids = [j.id for j in s.get_jobs()]
+    finally:
+        try:
+            s.shutdown(wait=False)
+        except Exception:
+            pass
+    assert job is not None, f"缺少 market-forecast job，现有：{all_ids}"
+
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert isinstance(job.trigger, CronTrigger)
+    assert fields["hour"] == "15"
+    assert fields["minute"] == "45"
+    assert fields["day_of_week"] == "mon-fri"
 
 
 def test_skip_on_non_trade_date(monkeypatch):

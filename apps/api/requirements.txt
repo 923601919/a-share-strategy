@@ -10,3 +10,5 @@ PyJWT>=2.8.0
 bcrypt>=4.0.0
 pytest>=8.0.0
 apscheduler>=3.10.0
+# 大盘预判（六爻）用干支历法：四柱/旬空来自这里，与 tianji 的 lunar-typescript 同源
+lunar-python>=1.3.0

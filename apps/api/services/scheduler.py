@@ -402,6 +402,55 @@ def _make_backfill_job() -> Callable[[], None]:
     return _job
 
 
+# 大盘预判作业串行锁：独立于扫描锁。
+# 它与扫描共享的只是网络（akshare）与 SQLite，不需要排在扫描后面——
+# 反而要独立：若共用一把锁，15:45 撞上某轮扫描变慢，预判会被静默跳过，
+# 而当天的记录就永久缺了一条（漏跑看得出来，但代价是样本少一天）。
+_forecast_lock = threading.Lock()
+
+
+def _make_forecast_job() -> Callable[[], None]:
+    """构造 15:45 大盘预判作业（结算 + 为下一个交易日起卦）。
+
+    时点选择依据（实测，2026-09-17）：15:00 收盘后新浪**当日**指数日线仍未发布，
+    所以作业本身不依赖它——当日用实时行情先结算（`source='sina_rt'`），
+    次日官方日线到位后再 upsert 修正。15:45 这个时点给的是"盘后数据基本稳定"，
+    而不是"当日日线一定拿得到"——后者在本机不成立。
+    """
+
+    def _job() -> None:
+        if not getattr(settings, "market_forecast_enabled", True):
+            logger.info("market forecast skipped: disabled by config")
+            return
+        if not is_trade_date(datetime.now().date()):
+            logger.info("market forecast skipped: not a trade date")
+            return
+        if not _forecast_lock.acquire(blocking=False):
+            logger.warning("market forecast SKIPPED: previous forecast run still in progress")
+            return
+        try:
+            from forecast.service import run_daily_forecast
+
+            result = run_daily_forecast()
+            logger.info(
+                "market forecast done: status=%s target=%s created=%s",
+                result.get("status"),
+                result.get("target_date"),
+                result.get("created"),
+            )
+            if result.get("status") == "failed":
+                # 0 产出 = 失败（对应 tianji 的退出码 3）。这条必须响亮：
+                # 静默少一条记录比报错危险得多。
+                logger.error("market forecast FAILED (0 output): %s", result.get("notes"))
+        except Exception:  # noqa: BLE001
+            logger.exception("market forecast FAILED")
+        finally:
+            _forecast_lock.release()
+
+    _job.__name__ = "market_forecast"
+    return _job
+
+
 _scheduler: BackgroundScheduler | None = None
 
 
@@ -456,6 +505,26 @@ def _build_scheduler() -> BackgroundScheduler:
         replace_existing=True,
     )
     logger.info("scheduled job registered: returns-backfill @ 15:30 mon-fri")
+
+    # 15:45 大盘预判：结算到期预测 + 为下一个交易日起卦。
+    # 刻意排在 15:30 收益回填之后：两者都打行情网，错开可避免在同一分钟内
+    # 争抢 akshare 的连接（预判失败会直接少一天样本，不能靠重试弥补）。
+    if getattr(settings, "market_forecast_enabled", True):
+        sched.add_job(
+            _make_forecast_job(),
+            trigger=CronTrigger(
+                hour=15,
+                minute=45,
+                day_of_week="mon-fri",
+                timezone=str(settings.scheduler_timezone),
+            ),
+            id="market-forecast",
+            name="forecast@15:45",
+            replace_existing=True,
+        )
+        logger.info("scheduled job registered: market-forecast @ 15:45 mon-fri")
+    else:
+        logger.info("market-forecast job NOT registered (MARKET_FORECAST_ENABLED=false)")
 
     return sched
 

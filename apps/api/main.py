@@ -717,3 +717,80 @@ def sim_reset(body: SimResetIn | None = None, user: dict[str, Any] = Depends(get
         return reset_sim(body.initial_capital)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ============================================================ 大盘预判（六爻）
+# 只读接口。⚠ 这些接口**没有写入形态**：预测只能由 15:45 的定时作业产生，
+# 「写入即冻结」（表上有 UPDATE/DELETE 触发器）。任何"手动补一条"的入口
+# 都会让准确率失去意义——因为它证明不了起卦时点是我们事前选的。
+# 所有响应都带 disclaimer：仅供娱乐，不构成投资建议。
+
+
+@app.get("/api/market/forecast/latest")
+def market_forecast_latest(user: dict[str, Any] = Depends(get_current_user)):
+    """当前生效的预测（目标日 >= 今天的最近一条）+ 最近一条已结算的。"""
+    from forecast.service import latest_payload
+
+    try:
+        return latest_payload()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/market/forecast/history")
+def market_forecast_history(
+    limit: int = Query(default=30, ge=1, le=365),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """历史预测：方向/强度/卦名 vs 实际方向/涨跌幅/命中/待结算。"""
+    from forecast.service import history_payload
+
+    try:
+        return history_payload(limit=limit)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/market/forecast/accuracy")
+def market_forecast_accuracy(
+    window_days: int = Query(default=0, ge=0, le=3650, description="只统计最近 N 天，0=全部"),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """准确率报告。结构里必然带基线、置信区间、p 值、门槛与样本充足性——
+    不存在"只给一个百分比"的形态（那是这个功能最容易骗人的地方）。"""
+    from forecast.service import accuracy_payload
+
+    try:
+        return accuracy_payload(window_days=window_days)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/market/forecast/runs")
+def market_forecast_runs(
+    limit: int = Query(default=30, ge=1, le=200),
+    gap_days: int = Query(default=60, ge=1, le=365, description="缺口检测回看天数"),
+    user: dict[str, Any] = Depends(get_current_user),
+):
+    """作业运行记录 + **漏跑缺口列表**（交易日但无预测覆盖）。"""
+    from forecast.service import runs_payload
+
+    try:
+        return runs_payload(limit=limit, gap_days=gap_days)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/market/forecast/verify/{prediction_id}")
+def market_forecast_verify(
+    prediction_id: str,
+    admin: dict[str, Any] = Depends(require_admin),
+):
+    """复核一条预测的 content_hash（事后审计"库被手改过"的场景）。
+
+    表上的触发器挡得住 UPDATE/DELETE，挡不住绕过 SQLite 直接改文件。
+    这个接口就是为那种情况留的：改了字段，哈希就对不上。
+    """
+    from forecast.service import verify_content_hash
+
+    return verify_content_hash(prediction_id)

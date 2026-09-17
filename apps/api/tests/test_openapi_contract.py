@@ -22,6 +22,11 @@ REQUIRED_PATHS = {
     "/api/watchlist/stats",
     "/api/stats/score-effectiveness",
     "/api/sim",
+    # 大盘预判（只读）：前端 /market 页依赖这四个
+    "/api/market/forecast/latest",
+    "/api/market/forecast/history",
+    "/api/market/forecast/accuracy",
+    "/api/market/forecast/runs",
 }
 
 

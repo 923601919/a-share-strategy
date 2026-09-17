@@ -18,6 +18,7 @@ const LINKS = [
   { href: "/sim", label: "模拟盘" },
   { href: "/review", label: "复盘" },
   { href: "/stats", label: "验证" },
+  { href: "/market", label: "大盘预判" },
 ];
 
 export default function AppNav() {

@@ -1163,6 +1163,225 @@
           }
         ]
       }
+    },
+    "/api/market/forecast/latest": {
+      "get": {
+        "summary": "Market Forecast Latest",
+        "description": "当前生效的预测（目标日 >= 今天的最近一条）+ 最近一条已结算的。",
+        "operationId": "market_forecast_latest_api_market_forecast_latest_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/api/market/forecast/history": {
+      "get": {
+        "summary": "Market Forecast History",
+        "description": "历史预测：方向/强度/卦名 vs 实际方向/涨跌幅/命中/待结算。",
+        "operationId": "market_forecast_history_api_market_forecast_history_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 365,
+              "minimum": 1,
+              "default": 30,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/market/forecast/accuracy": {
+      "get": {
+        "summary": "Market Forecast Accuracy",
+        "description": "准确率报告。结构里必然带基线、置信区间、p 值、门槛与样本充足性——\n不存在\"只给一个百分比\"的形态（那是这个功能最容易骗人的地方）。",
+        "operationId": "market_forecast_accuracy_api_market_forecast_accuracy_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "window_days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 3650,
+              "minimum": 0,
+              "description": "只统计最近 N 天，0=全部",
+              "default": 0,
+              "title": "Window Days"
+            },
+            "description": "只统计最近 N 天，0=全部"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/market/forecast/runs": {
+      "get": {
+        "summary": "Market Forecast Runs",
+        "description": "作业运行记录 + **漏跑缺口列表**（交易日但无预测覆盖）。",
+        "operationId": "market_forecast_runs_api_market_forecast_runs_get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 30,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "gap_days",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 365,
+              "minimum": 1,
+              "description": "缺口检测回看天数",
+              "default": 60,
+              "title": "Gap Days"
+            },
+            "description": "缺口检测回看天数"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/market/forecast/verify/{prediction_id}": {
+      "get": {
+        "summary": "Market Forecast Verify",
+        "description": "复核一条预测的 content_hash（事后审计\"库被手改过\"的场景）。\n\n表上的触发器挡得住 UPDATE/DELETE，挡不住绕过 SQLite 直接改文件。\n这个接口就是为那种情况留的：改了字段，哈希就对不上。",
+        "operationId": "market_forecast_verify_api_market_forecast_verify__prediction_id__get",
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "prediction_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Prediction Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1351,10 +1570,21 @@
             "enum": [
               "hot_only",
               "quota",
-              "soft"
+              "soft",
+              "soft_opt"
             ],
             "title": "Universe Policy",
             "default": "hot_only"
+          },
+          "softopt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SoftOptIn"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "type": "object",
@@ -1401,6 +1631,47 @@
           "position_id"
         ],
         "title": "SimSellIn"
+      },
+      "SoftOptIn": {
+        "properties": {
+          "open_window": {
+            "type": "integer",
+            "title": "Open Window",
+            "default": 5
+          },
+          "vol_mode": {
+            "type": "string",
+            "enum": [
+              "avg",
+              "peak"
+            ],
+            "title": "Vol Mode",
+            "default": "avg"
+          },
+          "min_ratio": {
+            "type": "number",
+            "title": "Min Ratio",
+            "default": 1.2
+          },
+          "rally_min_pct": {
+            "type": "number",
+            "title": "Rally Min Pct",
+            "default": 1.0
+          },
+          "rally_window": {
+            "type": "integer",
+            "title": "Rally Window",
+            "default": 30
+          },
+          "hard_filter": {
+            "type": "boolean",
+            "title": "Hard Filter",
+            "default": true
+          }
+        },
+        "type": "object",
+        "title": "SoftOptIn",
+        "description": "优化软加权：拉升量能 vs 开盘量能的判定参数。"
       },
       "ValidationError": {
         "properties": {
@@ -1458,7 +1729,9 @@
             "enum": [
               "manual",
               "fenshi",
-              "longtou"
+              "longtou",
+              "soft",
+              "soft_opt"
             ],
             "title": "Source",
             "default": "manual"

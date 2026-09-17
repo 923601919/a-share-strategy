@@ -1,0 +1,1195 @@
+{
+  "profileHash": "0da2843edf6479f1",
+  "engineVersion": "0.1.2",
+  "rulesetVersion": "0.1.0",
+  "cases": [
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-09-18",
+      "asOfDate": "2026-09-17",
+      "context": {
+        "solarDate": "2026-09-17",
+        "dayPillar": {
+          "gan": "甲",
+          "zhi": "午",
+          "sexagenary": 30
+        },
+        "monthPillar": {
+          "gan": "丁",
+          "zhi": "酉",
+          "sexagenary": 33
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 8,
+        "voidBranches": [
+          "辰",
+          "巳"
+        ],
+        "monthElement": "metal",
+        "dayElement": "fire"
+      },
+      "id": "c3d85c81d14a40db",
+      "direction": "up",
+      "strength": 0.24,
+      "yaoValues": [
+        8,
+        7,
+        7,
+        7,
+        8,
+        6
+      ],
+      "material": "000001.SH|2026-09-18|yz-standard-v1",
+      "digest": "d86ee8962d9a402a5dc49ac0504f778ae31a2e27e6342f2f9fff4a5e174ce449",
+      "hexagram": "雷风恒",
+      "changedHexagram": "火风鼎",
+      "movingYao": [
+        6
+      ],
+      "yongShen": {
+        "relation": "wealth",
+        "position": 6,
+        "zhi": "戌",
+        "element": "earth"
+      },
+      "reasoning": [
+        "取用神：以妻财为用神（求财之常法）。本卦妻财凡 2 爻，取6爻庚戌（土）为主用神。",
+        "用神休囚，力量平平。",
+        "用神自身发动，主事有变动、方向将明。",
+        "用神化回头生，变爻生本爻，后势转强。",
+        "世爻在3爻（辛酉·官鬼），应爻在6爻（庚戌·妻财）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.620（中性 0.500），判为偏涨（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "辛",
+          "zhi": "丑",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": []
+        },
+        {
+          "position": 2,
+          "gan": "辛",
+          "zhi": "亥",
+          "element": "water",
+          "relation": "parent",
+          "deity": "vermilionBird",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": []
+        },
+        {
+          "position": 3,
+          "gan": "辛",
+          "zhi": "酉",
+          "element": "metal",
+          "relation": "official",
+          "deity": "hookChen",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "临月建"
+          ]
+        },
+        {
+          "position": 4,
+          "gan": "庚",
+          "zhi": "午",
+          "element": "fire",
+          "relation": "child",
+          "deity": "coilingSnake",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "qiu",
+          "flags": [
+            "临日辰"
+          ]
+        },
+        {
+          "position": 5,
+          "gan": "庚",
+          "zhi": "申",
+          "element": "metal",
+          "relation": "official",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": []
+        },
+        {
+          "position": 6,
+          "gan": "庚",
+          "zhi": "戌",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": [
+            "回头生"
+          ]
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-09-21",
+      "asOfDate": "2026-09-18",
+      "context": {
+        "solarDate": "2026-09-18",
+        "dayPillar": {
+          "gan": "乙",
+          "zhi": "未",
+          "sexagenary": 31
+        },
+        "monthPillar": {
+          "gan": "丁",
+          "zhi": "酉",
+          "sexagenary": 33
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 8,
+        "voidBranches": [
+          "辰",
+          "巳"
+        ],
+        "monthElement": "metal",
+        "dayElement": "earth"
+      },
+      "id": "0e80996a850e377f",
+      "direction": "down",
+      "strength": 0.3,
+      "yaoValues": [
+        8,
+        8,
+        7,
+        9,
+        6,
+        6
+      ],
+      "material": "000001.SH|2026-09-21|yz-standard-v1",
+      "digest": "259accdf32d645511a5e83394f15760b24e033ad1db8886dee7a08f4ad5004b3",
+      "hexagram": "雷山小过",
+      "changedHexagram": "风山渐",
+      "movingYao": [
+        4,
+        5,
+        6
+      ],
+      "yongShen": null,
+      "reasoning": [
+        "雷山小过卦中无妻财爻（财不上卦），所求之财无可依托，判为不利。",
+        "世爻在4爻（庚午·官鬼），应爻在1爻（丙辰·父母）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.350（中性 0.500），判为偏跌（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "丙",
+          "zhi": "辰",
+          "element": "earth",
+          "relation": "parent",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": true,
+          "vigor": "xiu",
+          "flags": [
+            "旬空",
+            "月建合"
+          ]
+        },
+        {
+          "position": 2,
+          "gan": "丙",
+          "zhi": "午",
+          "element": "fire",
+          "relation": "official",
+          "deity": "vermilionBird",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "qiu",
+          "flags": [
+            "日辰合"
+          ]
+        },
+        {
+          "position": 3,
+          "gan": "丙",
+          "zhi": "申",
+          "element": "metal",
+          "relation": "brother",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": []
+        },
+        {
+          "position": 4,
+          "gan": "庚",
+          "zhi": "午",
+          "element": "fire",
+          "relation": "official",
+          "deity": "coilingSnake",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "qiu",
+          "flags": [
+            "日辰合",
+            "化合"
+          ]
+        },
+        {
+          "position": 5,
+          "gan": "庚",
+          "zhi": "申",
+          "element": "metal",
+          "relation": "brother",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "回头克",
+            "化合"
+          ]
+        },
+        {
+          "position": 6,
+          "gan": "庚",
+          "zhi": "戌",
+          "element": "earth",
+          "relation": "parent",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": [
+            "回头克",
+            "化合"
+          ]
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-09-22",
+      "asOfDate": "2026-09-21",
+      "context": {
+        "solarDate": "2026-09-21",
+        "dayPillar": {
+          "gan": "戊",
+          "zhi": "戌",
+          "sexagenary": 34
+        },
+        "monthPillar": {
+          "gan": "丁",
+          "zhi": "酉",
+          "sexagenary": 33
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 8,
+        "voidBranches": [
+          "辰",
+          "巳"
+        ],
+        "monthElement": "metal",
+        "dayElement": "earth"
+      },
+      "id": "9d094f9cff8ba4b2",
+      "direction": "up",
+      "strength": 0,
+      "yaoValues": [
+        8,
+        7,
+        7,
+        8,
+        7,
+        7
+      ],
+      "material": "000001.SH|2026-09-22|yz-standard-v1",
+      "digest": "35b657865a187beb05532981b353a76e7aa5c82559b890cb4cbae24a99425619",
+      "hexagram": "巽为风",
+      "changedHexagram": null,
+      "movingYao": [],
+      "yongShen": {
+        "relation": "wealth",
+        "position": 1,
+        "zhi": "丑",
+        "element": "earth"
+      },
+      "reasoning": [
+        "取用神：以妻财为用神（求财之常法）。本卦妻财凡 2 爻，取1爻辛丑（土）为主用神。",
+        "用神休囚，力量平平。",
+        "世爻在6爻（辛卯·兄弟），应爻在3爻（辛酉·官鬼）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.500（中性 0.500），判为偏涨（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "辛",
+          "zhi": "丑",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": []
+        },
+        {
+          "position": 2,
+          "gan": "辛",
+          "zhi": "亥",
+          "element": "water",
+          "relation": "parent",
+          "deity": "coilingSnake",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": []
+        },
+        {
+          "position": 3,
+          "gan": "辛",
+          "zhi": "酉",
+          "element": "metal",
+          "relation": "official",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "临月建"
+          ]
+        },
+        {
+          "position": 4,
+          "gan": "辛",
+          "zhi": "未",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": []
+        },
+        {
+          "position": 5,
+          "gan": "辛",
+          "zhi": "巳",
+          "element": "fire",
+          "relation": "child",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": true,
+          "vigor": "qiu",
+          "flags": [
+            "旬空"
+          ]
+        },
+        {
+          "position": 6,
+          "gan": "辛",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "brother",
+          "deity": "vermilionBird",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": [
+            "月破",
+            "日辰合"
+          ]
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-10-09",
+      "asOfDate": "2026-09-30",
+      "context": {
+        "solarDate": "2026-09-30",
+        "dayPillar": {
+          "gan": "丁",
+          "zhi": "未",
+          "sexagenary": 43
+        },
+        "monthPillar": {
+          "gan": "丁",
+          "zhi": "酉",
+          "sexagenary": 33
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 8,
+        "voidBranches": [
+          "寅",
+          "卯"
+        ],
+        "monthElement": "metal",
+        "dayElement": "earth"
+      },
+      "id": "9682ec8582d91d81",
+      "direction": "up",
+      "strength": 0.12,
+      "yaoValues": [
+        7,
+        8,
+        8,
+        8,
+        9,
+        7
+      ],
+      "material": "000001.SH|2026-10-09|yz-standard-v1",
+      "digest": "fc5578ce118b051ac69c883970963d0ccd89ce656ebb7b24e75f57491272e930",
+      "hexagram": "风雷益",
+      "changedHexagram": "山雷颐",
+      "movingYao": [
+        5
+      ],
+      "yongShen": {
+        "relation": "wealth",
+        "position": 3,
+        "zhi": "辰",
+        "element": "earth"
+      },
+      "reasoning": [
+        "取用神：以妻财为用神（求财之常法）。本卦妻财凡 2 爻，取3爻庚辰（土）为主用神。",
+        "用神休囚，力量平平。",
+        "5爻辛巳（火·子孙）发动，生用神，为助力。",
+        "世爻在3爻（庚辰·妻财），应爻在6爻（辛卯·兄弟）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.560（中性 0.500），判为偏涨（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "庚",
+          "zhi": "子",
+          "element": "water",
+          "relation": "parent",
+          "deity": "vermilionBird",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": []
+        },
+        {
+          "position": 2,
+          "gan": "庚",
+          "zhi": "寅",
+          "element": "wood",
+          "relation": "brother",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": true,
+          "vigor": "si",
+          "flags": [
+            "旬空"
+          ]
+        },
+        {
+          "position": 3,
+          "gan": "庚",
+          "zhi": "辰",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "coilingSnake",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": [
+            "月建合"
+          ]
+        },
+        {
+          "position": 4,
+          "gan": "辛",
+          "zhi": "未",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": [
+            "临日辰"
+          ]
+        },
+        {
+          "position": 5,
+          "gan": "辛",
+          "zhi": "巳",
+          "element": "fire",
+          "relation": "child",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "qiu",
+          "flags": [
+            "回头克"
+          ]
+        },
+        {
+          "position": 6,
+          "gan": "辛",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "brother",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": true,
+          "vigor": "si",
+          "flags": [
+            "旬空",
+            "月破"
+          ]
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2027-02-05",
+      "asOfDate": "2027-02-04",
+      "context": {
+        "solarDate": "2027-02-04",
+        "dayPillar": {
+          "gan": "甲",
+          "zhi": "寅",
+          "sexagenary": 50
+        },
+        "monthPillar": {
+          "gan": "壬",
+          "zhi": "寅",
+          "sexagenary": 38
+        },
+        "yearPillar": {
+          "gan": "丁",
+          "zhi": "未",
+          "sexagenary": 43
+        },
+        "hourBranch": 7,
+        "voidBranches": [
+          "子",
+          "丑"
+        ],
+        "monthElement": "wood",
+        "dayElement": "wood"
+      },
+      "id": "c07133a9023b2cd4",
+      "direction": "down",
+      "strength": 0.4,
+      "yaoValues": [
+        9,
+        7,
+        7,
+        8,
+        7,
+        8
+      ],
+      "material": "000001.SH|2027-02-05|yz-standard-v1",
+      "digest": "6e5201d433cb672b9216343dae090d4d00b1adc353808502b6cdc4e392c90ea3",
+      "hexagram": "水天需",
+      "changedHexagram": "水风井",
+      "movingYao": [
+        1
+      ],
+      "yongShen": {
+        "relation": "wealth",
+        "position": 1,
+        "zhi": "子",
+        "element": "water"
+      },
+      "reasoning": [
+        "取用神：以妻财为用神（求财之常法）。本卦妻财凡 2 爻，取1爻甲子（水）为主用神。",
+        "用神休囚，力量平平。",
+        "用神旬空，所求之事悬而未定。",
+        "用神自身发动，主事有变动、方向将明。",
+        "用神化回头克，变爻克本爻，后势转弱。",
+        "世爻在4爻（戊申·子孙），应爻在1爻（甲子·妻财）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.300（中性 0.500），判为偏跌（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "甲",
+          "zhi": "子",
+          "element": "water",
+          "relation": "wealth",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": true,
+          "vigor": "xiu",
+          "flags": [
+            "旬空",
+            "回头克",
+            "化合"
+          ]
+        },
+        {
+          "position": 2,
+          "gan": "甲",
+          "zhi": "寅",
+          "element": "wood",
+          "relation": "official",
+          "deity": "vermilionBird",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "临月建",
+            "临日辰"
+          ]
+        },
+        {
+          "position": 3,
+          "gan": "甲",
+          "zhi": "辰",
+          "element": "earth",
+          "relation": "brother",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": []
+        },
+        {
+          "position": 4,
+          "gan": "戊",
+          "zhi": "申",
+          "element": "metal",
+          "relation": "child",
+          "deity": "coilingSnake",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "qiu",
+          "flags": [
+            "月破",
+            "日破"
+          ]
+        },
+        {
+          "position": 5,
+          "gan": "戊",
+          "zhi": "戌",
+          "element": "earth",
+          "relation": "brother",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": []
+        },
+        {
+          "position": 6,
+          "gan": "戊",
+          "zhi": "子",
+          "element": "water",
+          "relation": "wealth",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": true,
+          "vigor": "xiu",
+          "flags": [
+            "旬空"
+          ]
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-12-08",
+      "asOfDate": "2026-12-07",
+      "context": {
+        "solarDate": "2026-12-07",
+        "dayPillar": {
+          "gan": "乙",
+          "zhi": "卯",
+          "sexagenary": 51
+        },
+        "monthPillar": {
+          "gan": "庚",
+          "zhi": "子",
+          "sexagenary": 36
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 8,
+        "voidBranches": [
+          "子",
+          "丑"
+        ],
+        "monthElement": "water",
+        "dayElement": "wood"
+      },
+      "id": "ef654c39f0b5ccac",
+      "direction": "down",
+      "strength": 0.3,
+      "yaoValues": [
+        7,
+        7,
+        8,
+        9,
+        7,
+        7
+      ],
+      "material": "000001.SH|2026-12-08|yz-standard-v1",
+      "digest": "0dc99d160516966d3b6ac8a2d300c44e5a047295ba1f3d79e15baccfa8e69162",
+      "hexagram": "天泽履",
+      "changedHexagram": "风泽中孚",
+      "movingYao": [
+        4
+      ],
+      "yongShen": null,
+      "reasoning": [
+        "天泽履卦中无妻财爻（财不上卦），所求之财无可依托，判为不利。",
+        "世爻在5爻（壬申·子孙），应爻在2爻（丁卯·官鬼）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.350（中性 0.500），判为偏跌（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "丁",
+          "zhi": "巳",
+          "element": "fire",
+          "relation": "parent",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": []
+        },
+        {
+          "position": 2,
+          "gan": "丁",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "official",
+          "deity": "vermilionBird",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": [
+            "临日辰"
+          ]
+        },
+        {
+          "position": 3,
+          "gan": "丁",
+          "zhi": "丑",
+          "element": "earth",
+          "relation": "brother",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": true,
+          "vigor": "qiu",
+          "flags": [
+            "旬空",
+            "月建合"
+          ]
+        },
+        {
+          "position": 4,
+          "gan": "壬",
+          "zhi": "午",
+          "element": "fire",
+          "relation": "parent",
+          "deity": "coilingSnake",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": [
+            "月破",
+            "化合"
+          ]
+        },
+        {
+          "position": 5,
+          "gan": "壬",
+          "zhi": "申",
+          "element": "metal",
+          "relation": "child",
+          "deity": "whiteTiger",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": []
+        },
+        {
+          "position": 6,
+          "gan": "壬",
+          "zhi": "戌",
+          "element": "earth",
+          "relation": "brother",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "qiu",
+          "flags": [
+            "日辰合"
+          ]
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-06-22",
+      "asOfDate": "2026-06-19",
+      "context": {
+        "solarDate": "2026-06-19",
+        "dayPillar": {
+          "gan": "甲",
+          "zhi": "子",
+          "sexagenary": 0
+        },
+        "monthPillar": {
+          "gan": "甲",
+          "zhi": "午",
+          "sexagenary": 30
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 8,
+        "voidBranches": [
+          "戌",
+          "亥"
+        ],
+        "monthElement": "fire",
+        "dayElement": "water"
+      },
+      "id": "3093b1434ca4207a",
+      "direction": "up",
+      "strength": 0.38,
+      "yaoValues": [
+        7,
+        8,
+        9,
+        8,
+        9,
+        7
+      ],
+      "material": "000001.SH|2026-06-22|yz-standard-v1",
+      "digest": "a35defba3f343271e17c35c3c8bbf9902d53ae93da044a1be07ce9326128bc42",
+      "hexagram": "风火家人",
+      "changedHexagram": "山雷颐",
+      "movingYao": [
+        3,
+        5
+      ],
+      "yongShen": {
+        "relation": "wealth",
+        "position": 2,
+        "zhi": "丑",
+        "element": "earth"
+      },
+      "reasoning": [
+        "取用神：以妻财为用神（求财之常法）。本卦妻财凡 2 爻，取2爻己丑（土）为主用神。",
+        "用神为月令所生而相，气势向旺。",
+        "5爻辛巳（火·子孙）发动，生用神，为助力。",
+        "卦中子孙旺相，子孙生妻财，为财有源。",
+        "世爻在2爻（己丑·妻财），应爻在5爻（辛巳·子孙）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.690（中性 0.500），判为偏涨（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "己",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "brother",
+          "deity": "azureDragon",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": []
+        },
+        {
+          "position": 2,
+          "gan": "己",
+          "zhi": "丑",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "vermilionBird",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": [
+            "日辰合"
+          ]
+        },
+        {
+          "position": 3,
+          "gan": "己",
+          "zhi": "亥",
+          "element": "water",
+          "relation": "parent",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": true,
+          "vigor": "qiu",
+          "flags": [
+            "旬空",
+            "回头克"
+          ]
+        },
+        {
+          "position": 4,
+          "gan": "辛",
+          "zhi": "未",
+          "element": "earth",
+          "relation": "wealth",
+          "deity": "coilingSnake",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": [
+            "月建合"
+          ]
+        },
+        {
+          "position": 5,
+          "gan": "辛",
+          "zhi": "巳",
+          "element": "fire",
+          "relation": "child",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "回头克"
+          ]
+        },
+        {
+          "position": 6,
+          "gan": "辛",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "brother",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiu",
+          "flags": []
+        }
+      ]
+    },
+    {
+      "symbol": "000001.SH",
+      "targetDate": "2026-03-09",
+      "asOfDate": "2026-03-06",
+      "context": {
+        "solarDate": "2026-03-06",
+        "dayPillar": {
+          "gan": "己",
+          "zhi": "卯",
+          "sexagenary": 15
+        },
+        "monthPillar": {
+          "gan": "辛",
+          "zhi": "卯",
+          "sexagenary": 27
+        },
+        "yearPillar": {
+          "gan": "丙",
+          "zhi": "午",
+          "sexagenary": 42
+        },
+        "hourBranch": 7,
+        "voidBranches": [
+          "申",
+          "酉"
+        ],
+        "monthElement": "wood",
+        "dayElement": "wood"
+      },
+      "id": "ce7a0153975ce5ab",
+      "direction": "down",
+      "strength": 0.3,
+      "yaoValues": [
+        9,
+        7,
+        8,
+        8,
+        7,
+        7
+      ],
+      "material": "000001.SH|2026-03-09|yz-standard-v1",
+      "digest": "bfec0c113fd323b262078222ce0643e4b20ce40b0ce65762d52650b60fd6602a",
+      "hexagram": "风泽中孚",
+      "changedHexagram": "风水涣",
+      "movingYao": [
+        1
+      ],
+      "yongShen": null,
+      "reasoning": [
+        "风泽中孚卦中无妻财爻（财不上卦），所求之财无可依托，判为不利。",
+        "世爻在4爻（辛未·兄弟），应爻在1爻（丁巳·父母）。世为己、应为市，二者关系可作为辅助参照。",
+        "综合得分 0.350（中性 0.500），判为偏跌（得分 ≥ 0.5 判涨，否则判跌）。"
+      ],
+      "dressedYao": [
+        {
+          "position": 1,
+          "gan": "丁",
+          "zhi": "巳",
+          "element": "fire",
+          "relation": "parent",
+          "deity": "coilingSnake",
+          "isShi": false,
+          "isYing": true,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": [
+            "回头生"
+          ]
+        },
+        {
+          "position": 2,
+          "gan": "丁",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "official",
+          "deity": "whiteTiger",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "临月建",
+            "临日辰"
+          ]
+        },
+        {
+          "position": 3,
+          "gan": "丁",
+          "zhi": "丑",
+          "element": "earth",
+          "relation": "brother",
+          "deity": "blackTortoise",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": []
+        },
+        {
+          "position": 4,
+          "gan": "辛",
+          "zhi": "未",
+          "element": "earth",
+          "relation": "brother",
+          "deity": "azureDragon",
+          "isShi": true,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "si",
+          "flags": []
+        },
+        {
+          "position": 5,
+          "gan": "辛",
+          "zhi": "巳",
+          "element": "fire",
+          "relation": "parent",
+          "deity": "vermilionBird",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "xiang",
+          "flags": []
+        },
+        {
+          "position": 6,
+          "gan": "辛",
+          "zhi": "卯",
+          "element": "wood",
+          "relation": "official",
+          "deity": "hookChen",
+          "isShi": false,
+          "isYing": false,
+          "isVoid": false,
+          "vigor": "wang",
+          "flags": [
+            "临月建",
+            "临日辰"
+          ]
+        }
+      ]
+    }
+  ]
+}

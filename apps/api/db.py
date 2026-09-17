@@ -214,6 +214,75 @@ def init_db() -> None:
                 leader TEXT,
                 PRIMARY KEY (trade_date, name)
             );
+
+            -- ===== 大盘涨跌预判（自 tianji 迁移）=====
+            -- 预测记录：写入即冻结，只允许 INSERT（见下方两个 trigger）
+            CREATE TABLE IF NOT EXISTS market_predictions (
+                id            TEXT PRIMARY KEY,
+                symbol        TEXT NOT NULL,
+                target_date   TEXT NOT NULL,
+                as_of         TEXT NOT NULL,
+                generated_at  TEXT NOT NULL,
+                origin        TEXT NOT NULL CHECK (origin IN ('live','replay')),
+                direction     TEXT NOT NULL CHECK (direction IN ('up','down','flat')),
+                strength      REAL NOT NULL,
+                basis_json    TEXT NOT NULL,
+                profile_hash  TEXT NOT NULL,
+                engine_ver    TEXT NOT NULL,
+                ruleset_ver   TEXT NOT NULL,
+                content_hash  TEXT NOT NULL,
+                created_at    TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_mp_target
+                ON market_predictions(symbol, target_date);
+
+            -- 指数日线缓存：**可修正**（数据源修正过历史值时 upsert），非冻结
+            CREATE TABLE IF NOT EXISTS market_index_daily (
+                symbol      TEXT NOT NULL,
+                trade_date  TEXT NOT NULL,
+                close       REAL NOT NULL,
+                prev_close  REAL,
+                source      TEXT NOT NULL,
+                fetched_at  TEXT NOT NULL,
+                PRIMARY KEY (symbol, trade_date)
+            );
+
+            -- 结算结果：按 (symbol, target_date) upsert（数据源修正后可重结算），
+            -- 口径（flat 阈值）随 ruleset_ver 固化在行内
+            CREATE TABLE IF NOT EXISTS market_forecast_outcomes (
+                symbol           TEXT NOT NULL,
+                target_date      TEXT NOT NULL,
+                base_date        TEXT NOT NULL,
+                base_close       REAL NOT NULL,
+                close            REAL NOT NULL,
+                actual_change    REAL NOT NULL,
+                actual_direction TEXT NOT NULL CHECK (actual_direction IN ('up','down','flat')),
+                basis            TEXT NOT NULL,
+                source           TEXT NOT NULL,
+                ruleset_ver      TEXT NOT NULL,
+                settled_at       TEXT NOT NULL,
+                PRIMARY KEY (symbol, target_date)
+            );
+
+            -- 作业运行记录：漏跑检测的对照表
+            CREATE TABLE IF NOT EXISTS market_forecast_runs (
+                run_date   TEXT PRIMARY KEY,
+                status     TEXT NOT NULL,
+                detail     TEXT DEFAULT '',
+                fired_at   TEXT
+            );
+
+            -- 冻结约束：任何写入路径（含手改库）都不能 UPDATE / DELETE 预测记录。
+            -- 这是本功能「写入即冻结」的硬保证——没有它，准确率就成了可以事后
+            -- 修改的东西，而那正是整个功能唯一的价值所在。
+            CREATE TRIGGER IF NOT EXISTS market_predictions_no_update
+                BEFORE UPDATE ON market_predictions
+                BEGIN SELECT RAISE(ABORT, 'market_predictions is append-only'); END;
+
+            CREATE TRIGGER IF NOT EXISTS market_predictions_no_delete
+                BEFORE DELETE ON market_predictions
+                BEGIN SELECT RAISE(ABORT, 'market_predictions is append-only'); END;
             """
         )
         _migrate_watchlist(conn)
@@ -1561,3 +1630,256 @@ def list_sim_trades(limit: int = 200) -> list[dict[str, Any]]:
             (uid, limit),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ================================================================ 大盘涨跌预判
+#
+# 这些表**不属于任何用户**（大盘只有一个），因此不走 user_ctx / user_id：
+# 加了 user_id 只会让「同一个大盘」在每个账号里各存一份，而它们本该是同一批事实。
+
+
+def insert_market_prediction(rec: dict[str, Any]) -> bool:
+    """写入一条预测记录。返回是否真正新增（False = 同 id 已存在，跳过）。
+
+    ⚠ 只允许 INSERT。表上有两个 BEFORE UPDATE/DELETE 触发器，任何更新或删除
+    都会被 SQLite 以 `market_predictions is append-only` 拒绝——包括手改库。
+    这不是洁癖：预测记录一旦可改，准确率就成了可以事后修补的东西。
+    """
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT 1 FROM market_predictions WHERE id=?", (rec["id"],)
+        ).fetchone()
+        if existing:
+            return False
+        conn.execute(
+            """
+            INSERT INTO market_predictions(
+                id, symbol, target_date, as_of, generated_at, origin, direction,
+                strength, basis_json, profile_hash, engine_ver, ruleset_ver,
+                content_hash, created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                rec["id"],
+                rec["symbol"],
+                rec["target_date"],
+                rec["as_of"],
+                rec["generated_at"],
+                rec["origin"],
+                rec["direction"],
+                float(rec["strength"]),
+                rec["basis_json"],
+                rec["profile_hash"],
+                rec["engine_ver"],
+                rec["ruleset_ver"],
+                rec["content_hash"],
+                rec["created_at"],
+            ),
+        )
+    return True
+
+
+def _prediction_row_to_dict(row: sqlite3.Row, with_basis: bool = True) -> dict[str, Any]:
+    d = dict(row)
+    if with_basis:
+        try:
+            d["basis"] = json.loads(d.pop("basis_json") or "{}")
+        except Exception:  # noqa: BLE001
+            d["basis"] = {}
+    else:
+        d.pop("basis_json", None)
+    return d
+
+
+def get_market_prediction(prediction_id: str) -> dict[str, Any] | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM market_predictions WHERE id=?", (prediction_id,)
+        ).fetchone()
+    return _prediction_row_to_dict(row) if row else None
+
+
+def list_market_predictions(
+    symbol: str | None = None,
+    limit: int = 60,
+    origin: str | None = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM market_predictions WHERE 1=1"
+    args: list[Any] = []
+    if symbol:
+        sql += " AND symbol=?"
+        args.append(symbol)
+    if origin:
+        sql += " AND origin=?"
+        args.append(origin)
+    sql += " ORDER BY target_date DESC, generated_at DESC LIMIT ?"
+    args.append(int(limit))
+    with get_db() as conn:
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    return [_prediction_row_to_dict(r) for r in rows]
+
+
+def has_live_prediction_for(symbol: str, target_date: str) -> dict[str, Any] | None:
+    """同口径（live）的该目标日是否已有记录。用于作业幂等：跑两遍不覆盖。"""
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM market_predictions WHERE symbol=? AND target_date=? AND origin='live'",
+            (symbol, target_date),
+        ).fetchone()
+    return _prediction_row_to_dict(row) if row else None
+
+
+def list_pending_settlement(symbol: str, up_to: str) -> list[dict[str, Any]]:
+    """到期但尚无结算结果的 live 预测（目标日 ≤ up_to）。"""
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.* FROM market_predictions p
+            LEFT JOIN market_forecast_outcomes o
+              ON o.symbol = p.symbol AND o.target_date = p.target_date
+            WHERE p.symbol=? AND p.origin='live' AND p.target_date <= ?
+              AND o.target_date IS NULL
+            ORDER BY p.target_date ASC
+            """,
+            (symbol, up_to),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_market_index_daily(symbol: str, bars: list[dict[str, Any]]) -> int:
+    """写入/更新指数日线。返回写入条数。
+
+    日线**不是**冻结数据：数据源修正过历史值时，这里的 upsert 正是修正入口
+    （对应 tianji 的 `--force-sync`）。而预测记录本身永远不动。
+    """
+    if not bars:
+        return 0
+    now = datetime.now(timezone.utc).astimezone().isoformat()
+    with get_db() as conn:
+        for b in bars:
+            conn.execute(
+                """
+                INSERT INTO market_index_daily(symbol, trade_date, close, prev_close, source, fetched_at)
+                VALUES (?,?,?,?,?,?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    close=excluded.close,
+                    prev_close=COALESCE(excluded.prev_close, market_index_daily.prev_close),
+                    source=excluded.source,
+                    fetched_at=excluded.fetched_at
+                """,
+                (
+                    symbol,
+                    b["date"],
+                    float(b["close"]),
+                    float(b["prev_close"]) if b.get("prev_close") is not None else None,
+                    b.get("source") or "",
+                    now,
+                ),
+            )
+    return len(bars)
+
+
+def list_market_index_daily(
+    symbol: str,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict[str, Any]]:
+    sql = "SELECT * FROM market_index_daily WHERE symbol=?"
+    args: list[Any] = [symbol]
+    if start:
+        sql += " AND trade_date >= ?"
+        args.append(start)
+    if end:
+        sql += " AND trade_date <= ?"
+        args.append(end)
+    sql += " ORDER BY trade_date ASC"
+    with get_db() as conn:
+        rows = conn.execute(sql, tuple(args)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_market_forecast_outcome(rec: dict[str, Any]) -> None:
+    """写入结算结果。
+
+    **结算结果可 upsert**（与预测记录的冻结相对）：数据源修正过历史值时，
+    实际方向本身就该跟着修正——把一条基于错误行情的「命中」永久冻结，
+    比允许修正危险得多。修正会覆盖 settled_at，可以看出来。
+    """
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO market_forecast_outcomes(
+                symbol, target_date, base_date, base_close, close, actual_change,
+                actual_direction, basis, source, ruleset_ver, settled_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(symbol, target_date) DO UPDATE SET
+                base_date=excluded.base_date, base_close=excluded.base_close,
+                close=excluded.close, actual_change=excluded.actual_change,
+                actual_direction=excluded.actual_direction, basis=excluded.basis,
+                source=excluded.source, ruleset_ver=excluded.ruleset_ver,
+                settled_at=excluded.settled_at
+            """,
+            (
+                rec["symbol"],
+                rec["target_date"],
+                rec["base_date"],
+                float(rec["base_close"]),
+                float(rec["close"]),
+                float(rec["actual_change"]),
+                rec["actual_direction"],
+                rec["basis"],
+                rec.get("source") or "",
+                rec["ruleset_ver"],
+                rec["settled_at"],
+            ),
+        )
+
+
+def list_market_forecast_outcomes(symbol: str, limit: int = 500) -> list[dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM market_forecast_outcomes WHERE symbol=? ORDER BY target_date DESC LIMIT ?",
+            (symbol, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_market_forecast_outcome(symbol: str, target_date: str) -> dict[str, Any] | None:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM market_forecast_outcomes WHERE symbol=? AND target_date=?",
+            (symbol, target_date),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_market_forecast_run(
+    run_date: str, status: str, detail: str = "", fired_at: str | None = None
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO market_forecast_runs(run_date, status, detail, fired_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(run_date) DO UPDATE SET
+                status=excluded.status, detail=excluded.detail, fired_at=excluded.fired_at
+            """,
+            (run_date, status, detail, fired_at),
+        )
+
+
+def list_market_forecast_runs(limit: int = 60) -> list[dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM market_forecast_runs ORDER BY run_date DESC LIMIT ?", (int(limit),)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_market_forecast_target_dates(symbol: str, origin: str = "live") -> list[str]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT target_date FROM market_predictions WHERE symbol=? AND origin=? ORDER BY target_date",
+            (symbol, origin),
+        ).fetchall()
+    return [str(r["target_date"]) for r in rows]
