@@ -104,18 +104,28 @@ def main() -> int:
 
     rows: list[dict] = []
     strat_of: dict[int, str] = {}
+    # 丢样原因要能说清楚，否则 n 的变化会被当成"数据少了"而不是"口径变了"
+    drop = {"no_strategy": 0, "not_t3": 0, "no_ret": 0, "no_t3row": 0, "no_index": 0}
+    sample_no_index: list[tuple] = []
     q = (
         "SELECT id,user_id,source,entry_score,day_position,date(created_at),"
         "exit_return_pct,completion_reason FROM watch_tracks"
     )
     for tid, uid, src, score, pos, ed, er, cr in conn.execute(q):
         st = STRAT_MAP.get((uid, src))
-        if st:
-            strat_of[tid] = st
-        if cr != "auto_t3" or er is None or st is None:
+        if st is None:
+            drop["no_strategy"] += 1
+            continue
+        strat_of[tid] = st
+        if cr != "auto_t3":
+            drop["not_t3"] += 1
+            continue
+        if er is None:
+            drop["no_ret"] += 1
             continue
         td = t3_date.get(tid)
         if not td:
+            drop["no_t3row"] += 1
             continue
         rec: dict = {"st": st, "ed": ed, "td": td, "r": er, "score": score, "pos": pos}
         ok = True
@@ -124,13 +134,18 @@ def main() -> int:
             z = idx.get((b, td))
             if not a or not z:
                 ok = False
+                if len(sample_no_index) < 8:
+                    sample_no_index.append((tid, st, ed, td, b))
                 break
-            rec[b] = (z / a - 1) * 100.0
-        if ok:
-            rows.append(rec)
+        if not ok:
+            drop["no_index"] += 1
+            continue
+        rows.append(rec)
 
-    print(f"N_VALID={len(rows)}  (入池 {len(strat_of)} 条，其中 auto_t3 且四基准齐全 "
-          f"{len(rows)} 条)")
+    print(f"N_VALID={len(rows)}")
+    print(f"丢弃明细: {drop}")
+    if sample_no_index:
+        print(f"缺指数样本(前8): {sample_no_index}")
 
     print("\n=== 全样本：各基准下的超额收益 ===")
     print(f"{'基准':<10}{'n':>6}{'个股':>9}{'指数':>9}{'超额':>9}{'se':>7}"
