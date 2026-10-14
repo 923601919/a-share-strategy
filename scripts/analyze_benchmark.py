@@ -137,6 +137,7 @@ def main() -> int:
                 if len(sample_no_index) < 8:
                     sample_no_index.append((tid, st, ed, td, b))
                 break
+            rec[b] = (z / a - 1) * 100.0
         if not ok:
             drop["no_index"] += 1
             continue
