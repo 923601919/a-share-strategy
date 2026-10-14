@@ -67,6 +67,29 @@ def ols(xs: list[float], ys: list[float]) -> tuple[float, float, float, float]:
     return b, b / seb, a, a / sea
 
 
+def welch(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
+    """Welch 两样本 t 检验。返回 (差值, t, 近似自由度)。
+
+    为什么不用等方差 t：两组样本量与方差都差得远（如 496 vs 1601），
+    等方差假设不成立，用它会低估标准误、虚高显著性。
+    """
+    n1, n2 = len(xs), len(ys)
+    if n1 < 2 or n2 < 2:
+        return float("nan"), float("nan"), float("nan")
+    m1 = sum(xs) / n1
+    m2 = sum(ys) / n2
+    v1 = sum((v - m1) ** 2 for v in xs) / (n1 - 1)
+    v2 = sum((v - m2) ** 2 for v in ys) / (n2 - 1)
+    se = math.sqrt(v1 / n1 + v2 / n2)
+    if se <= 0:
+        return m1 - m2, float("inf"), float("nan")
+    t = (m1 - m2) / se
+    df = (v1 / n1 + v2 / n2) ** 2 / (
+        (v1 / n1) ** 2 / (n1 - 1) + (v2 / n2) ** 2 / (n2 - 1)
+    )
+    return m1 - m2, t, df
+
+
 def describe(vals: list[float]) -> tuple[int, float, float, float, float, float]:
     """返回 (n, mean, se, t, win_pct)。"""
     n = len(vals)
@@ -256,6 +279,27 @@ def main() -> int:
         ex = [r["r"] - r[b] for r in sub]
         n, m, se, t, win = describe(ex)
         print(f"{name:<10}{n:>6}{sum(r['r'] for r in sub)/n:>9.2f}{m:>9.2f}{win:>7.1f}%")
+
+    # ---- 组间差异检验 ----
+    # 分桶均值看着有差别不等于差别显著。这里对三个最想下结论的对比做 Welch 检验。
+    print("\n=== 组间差异检验（中证1000 基准，Welch t，|t|>1.96 约 p<0.05）===")
+    print(f"{'对比':<28}{'n1':>6}{'n2':>6}{'差值':>9}{'t':>8}{'df':>9}")
+
+    def cmp(name: str, g1, g2) -> None:
+        x1 = [r["r"] - r[b] for r in rows if g1(r)]
+        x2 = [r["r"] - r[b] for r in rows if g2(r)]
+        d, t, df = welch(x1, x2)
+        print(f"{name:<28}{len(x1):>6}{len(x2):>6}{d:>9.2f}{t:>8.2f}{df:>9.0f}")
+
+    cmp("fenshi - soft",
+        lambda r: r["st"] == "fenshi",
+        lambda r: r["st"] == "soft")
+    cmp("pos>=0.9 - pos<0.9",
+        lambda r: r["pos"] is not None and r["pos"] >= 0.9,
+        lambda r: r["pos"] is not None and r["pos"] < 0.9)
+    cmp("soft score>=70 - score<50",
+        lambda r: r["st"] == "soft" and r["score"] is not None and r["score"] >= 70,
+        lambda r: r["st"] == "soft" and r["score"] is not None and r["score"] < 50)
 
     return 0
 
