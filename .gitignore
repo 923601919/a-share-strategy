@@ -7,6 +7,9 @@ node_modules/
 .next/
 data/*.db
 data/cache/
+# 分析过程产出的中间文件（线上数据转储、基准指数快照），不进版本库
+data/_*.csv
+data/_*.json
 .env
 .env.*
 !.env.example
