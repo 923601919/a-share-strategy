@@ -67,6 +67,47 @@ def ols(xs: list[float], ys: list[float]) -> tuple[float, float, float, float]:
     return b, b / seb, a, a / sea
 
 
+def ols2(
+    x1: list[float], x2: list[float], ys: list[float]
+) -> tuple[float, float, float, float, float, float]:
+    """二元 OLS：y = a + b1*x1 + b2*x2。返回 (b1, t(b1), b2, t(b2), a, n)。
+
+    为什么需要它：单变量斜率会被「选择效应」污染。追高惩罚会给高位置票扣 15 分，
+    于是**只有更强的**高位置票才挤得进 top-N —— 高位置组的收益里混进了
+    「被惩罚逼出来的强度」。把 entry_score 一起放进回归，斜率才问得清
+    「同样强度的票，位置越高是更好还是更差」。
+    """
+    n = len(ys)
+    if n < 4 or len(x1) != n or len(x2) != n:
+        return (float("nan"),) * 6
+    m1 = sum(x1) / n
+    m2 = sum(x2) / n
+    my = sum(ys) / n
+    c1 = [v - m1 for v in x1]
+    c2 = [v - m2 for v in x2]
+    cy = [v - my for v in ys]
+    s11 = sum(v * v for v in c1)
+    s22 = sum(v * v for v in c2)
+    s12 = sum(a * b for a, b in zip(c1, c2))
+    s1y = sum(a * b for a, b in zip(c1, cy))
+    s2y = sum(a * b for a, b in zip(c2, cy))
+    det = s11 * s22 - s12 * s12
+    if abs(det) < 1e-12:
+        return (float("nan"),) * 6
+    b1 = (s22 * s1y - s12 * s2y) / det
+    b2 = (s11 * s2y - s12 * s1y) / det
+    a0 = my - b1 * m1 - b2 * m2
+    resid = [y - (a0 + b1 * p + b2 * q) for p, q, y in zip(x1, x2, ys)]
+    s2 = sum(v * v for v in resid) / (n - 3)
+    if s2 <= 0:
+        return b1, float("inf"), b2, float("inf"), a0, n
+    var1 = s2 * s22 / det
+    var2 = s2 * s11 / det
+    se1 = math.sqrt(var1) if var1 > 0 else float("inf")
+    se2 = math.sqrt(var2) if var2 > 0 else float("inf")
+    return b1, b1 / se1, b2, b2 / se2, a0, n
+
+
 def welch(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
     """Welch 两样本 t 检验。返回 (差值, t, 近似自由度)。
 
@@ -323,9 +364,15 @@ def main() -> int:
     print(f"（warn 档有 {warn_n} 条入池样本；block 档样本数应为 0 —— "
           f"闸门生效的话当天不会出结果，非 0 说明闸门没拦住）")
 
-    # 阈值该放在哪：闸门关注的是「组合」而不是「指数」。
-    # 组合对上证的 beta 见口径A，把它折算过去才知道「上证 -1.5%」等于组合跌多少。
-    print("\n--- 闸门阈值折算（用口径A 的上证 beta）---")
+    # 闸门的**作用路径**是什么？想清楚这点才能问对问题。
+    #
+    # 闸门读的是「入池日上证跌了多少」，它的效力只能通过「入池日的市场状态是否
+    # 预示后续 T+3 的超额」来体现。所以这里要回归的是
+    #         组合 T+3 平均收益  ~  入池日上证涨跌幅
+    # ——注意它**不等于**上面的口径A：口径A 的自变量是「上证在同期（入池日→T+3）
+    # 的涨跌幅」，那是个事后变量，拿它算出的 beta 再大也不能用在闸门上。
+    # 上一版报告里那句「按 beta 折算阈值」正是混用了这两个变量，这里订正。
+    print("\n--- 闸门效力：入池日上证涨跌幅能否预示后续 T+3 超额 ---")
     by_day_g: dict[str, list[dict]] = {}
     for r in rows:
         by_day_g.setdefault(r["ed"], []).append(r)
@@ -334,19 +381,29 @@ def main() -> int:
     ys_pt = [sum(r["r"] for r in by_day_g[d]) / len(by_day_g[d]) for d in gdays]
     pairs = [(x, y) for x, y in zip(xs_sp, ys_pt) if x is not None]
     if len(pairs) >= 3:
-        beta_sp, t_beta_sp, _, _ = ols([p[0] for p in pairs], [p[1] for p in pairs])
-        print(f"口径A beta(组合 ~ 上证) = {beta_sp:.2f}  (n={len(pairs)} 天, t={t_beta_sp:.2f})")
-        if beta_sp > 0:
-            print(f"  现阈值 -1.5% 对应组合约 {beta_sp * -1.5:+.2f}%  → "
-                  f"若想让组合在 -1.5% 时才折分，上证阈值应设为 "
-                  f"{-1.5 / beta_sp:+.2f}%")
-            print(f"  现阈值 -2.5% 对应组合约 {beta_sp * -2.5:+.2f}%  → "
-                  f"若想让组合在 -2.5% 时才观望，上证阈值应设为 "
-                  f"{-2.5 / beta_sp:+.2f}%")
-        # 换成中证1000 作参考指数则 beta≈1，阈值不必折算——但代价是指数本身波动更大，
-        # 触发会更频繁。两条路二选一，不能既换指数又保留原阈值。
+        bx, tx, _, _ = ols([p[0] for p in pairs], [p[1] for p in pairs])
+        print(f"beta(组合 T+3 收益 ~ 入池日上证涨跌幅) = {bx:.2f}  "
+              f"(n={len(pairs)} 天, t={tx:.2f})")
+        if tx <= 1.96:
+            print("  t 不显著 → 入池日上证的涨跌**不足以**预示后续超额。"
+                  "这并不自动说明闸门没用（见下面的选择效应说明），")
+            print("  但它说明「按 beta 折算阈值」这条路走不通：斜率本身就不显著，"
+                  "折算出来的阈值没有含义。")
+        else:
+            print(f"  斜率显著 → 入池日上证跌 1% 对应组合 T+3 少赚 {-bx:.2f}pp；"
+                  f"若要让组合在 -1.5pp 时才折分，阈值约 {-1.5 / bx:+.2f}%")
     else:
-        print("上证涨跌幅样本不足，跳过折算")
+        print("上证涨跌幅样本不足，跳过")
+
+    # ★ 选择效应（读上面所有分组结论时都必须带着它）★
+    # 闸门在 warn 档会把全体进攻型分数 ×0.8，**再**做 top-N 截断。于是
+    # 「warn 档的入池样本」= 扛过折分的那批最强的票。它们表现不差，
+    # 既可能是「闸门筛得好」，也可能是「根本不需要闸门」——两种解释都自洽，
+    # 现有数据分不开。要分开必须留住每个候选的**折分前**分数，
+    # 而 scan_snapshots 只存了入选后的 items。
+    print("（选择效应提醒：warn 档样本是「扛过 ×0.8 折分」的幸存者，"
+          "其表现好既可能是闸门筛得好、也可能是闸门不必要。"
+          "要分辨必须落库折分前的全候选分成，当前库做不到。）")
 
     # scan_quality 里的**实际触发记录**：闸门真的按什么频率开火。
     # 这张表与上表口径不同（盘中 vs 收盘），放在一起才能看出收盘代理差多少。
@@ -440,6 +497,61 @@ def main() -> int:
     print("  注意这只是**已入池样本内**的条件相关：惩罚会让高分位置票落到 top-N 之外，")
     print("  我们看不到那些被筛掉的票——真正的消融需要候选池，而 scan_snapshots 只存了")
     print("  入选后的 items。下面的组间检验同样受此限制。）")
+
+    # 选择效应体检：高位置组是不是被惩罚"逼"得更强了？
+    # entry_score 是**折分后**的分，所以把罚掉的分加回去就是折分前的强度。
+    # 若高位置组的「折分前均值」明显更高，说明该组混进了选择效应，
+    # 单变量斜率为正就不足以推出「位置越高越好」。
+    print("\n--- 选择效应体检：各组折分前强度（entry_score + 已扣分）---")
+    print(f"{'位置':<12}{'n':>6}{'折分前均分':>12}{'折分后均分':>12}{'已扣分':>9}")
+    for lo, hi, name in ((0.9, 9, ">=0.90"), (0.7, 0.9, "0.70-0.90"),
+                         (0.5, 0.7, "0.50-0.70"), (0.3, 0.5, "0.30-0.50"),
+                         (-1, 0.3, "<0.30")):
+        sub = [r for r in rows if r["pos"] is not None and r["score"] is not None
+               and lo <= r["pos"] < hi]
+        if not sub:
+            continue
+        pre = [r["score"] + 15.0 if r["pos"] >= 0.9 else r["score"] for r in sub]
+        post = [r["score"] for r in sub]
+        print(f"{name:<12}{len(sub):>6}{sum(pre)/len(pre):>12.1f}"
+              f"{sum(post)/len(post):>12.1f}{sum(pre)/len(pre)-sum(post)/len(post):>9.1f}")
+
+    print("\n--- 方向量化：控制 entry_score 后的斜率 ---")
+    print(f"{'模型':<24}{'n':>6}{'自变量斜率':>12}{'t(斜率)':>10}"
+          f"{'score斜率':>11}{'t(score)':>10}")
+    sel = [r for r in rows if r["pos"] is not None and r["score"] is not None]
+    if len(sel) >= 5:
+        b1, t1, _, _ = ols([r["pos"] for r in sel], [r["r"] - r[b] for r in sel])
+        print(f"{'单变量 pos':<24}{len(sel):>6}{b1:>12.3f}{t1:>10.2f}{'-':>11}{'-':>10}")
+        b1, t1, b2, t2, _, n2 = ols2(
+            [r["pos"] for r in sel], [r["score"] for r in sel],
+            [r["r"] - r[b] for r in sel],
+        )
+        print(f"{'pos + entry_score':<24}{n2:>6}{b1:>12.3f}{t1:>10.2f}"
+              f"{b2:>11.3f}{t2:>10.2f}")
+        print("  → 两行对比是关键：斜率若在加入 entry_score 后掉到不显著，"
+              "说明「位置越高越好」里很大一部分")
+        print("    其实是「被 -15 分惩罚筛出来的强度」，不是位置本身。")
+        # 二元回归的共线性诊断：pos 与 score 的相关系数
+        mp = sum(r["pos"] for r in sel) / len(sel)
+        ms = sum(r["score"] for r in sel) / len(sel)
+        sp = math.sqrt(sum((r["pos"] - mp) ** 2 for r in sel) / (len(sel) - 1))
+        ss = math.sqrt(sum((r["score"] - ms) ** 2 for r in sel) / (len(sel) - 1))
+        cov = sum((r["pos"] - mp) * (r["score"] - ms) for r in sel) / (len(sel) - 1)
+        if sp > 0 and ss > 0:
+            print(f"  （共线性参考：corr(pos, entry_score) = {cov / (sp * ss):+.3f}）")
+
+    # 乖离同样做一遍控制（它是另一条惩罚触发条件）
+    sel_d = [r for r in rows if r["dev"] is not None and r["score"] is not None]
+    if len(sel_d) >= 5:
+        b1, t1, _, _ = ols([r["dev"] for r in sel_d], [r["r"] - r[b] for r in sel_d])
+        print(f"{'单变量 dev':<24}{len(sel_d):>6}{b1:>12.3f}{t1:>10.2f}{'-':>11}{'-':>10}")
+        b1, t1, b2, t2, _, n2 = ols2(
+            [r["dev"] for r in sel_d], [r["score"] for r in sel_d],
+            [r["r"] - r[b] for r in sel_d],
+        )
+        print(f"{'dev + entry_score':<24}{n2:>6}{b1:>12.3f}{t1:>10.2f}"
+              f"{b2:>11.3f}{t2:>10.2f}")
 
     # ---- 组间差异检验 ----
     # 分桶均值看着有差别不等于差别显著。这里对想下结论的对比逐个做 Welch 检验。
