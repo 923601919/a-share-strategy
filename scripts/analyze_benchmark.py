@@ -706,6 +706,15 @@ def main() -> int:
         print(f"被 top-N 截掉的打分候选：{n_cut} 条")
         print(f"反事实下进出变化：进入 {len(entered_all)} 条 / 掉出 {len(exited_all)} 条"
               f"（{changed_rounds}/{len(rounds_map)} 轮有变化）")
+        # 上界的紧度：cf = 最终分 + 扣分。下游是 min(score_cap, score+bonus) 链，
+        # 折分前的分越高越会撞封顶 → 估计值偏大。撞顶的行越多，「进出」规模越虚高。
+        # fenshi_score_cap 是项目常量（测试 test_default_params_match_legacy_behavior
+        # 显式钉住 = 100.0），这里直接用它来标出撞顶行。
+        cap = 100.0
+        clipped = [r for r in scored if (r["score"] or 0) + (r["pen"] or 0) > cap]
+        if scored:
+            print(f"（cf 估计触及封顶 {cap:g} 的候选：{len(clipped)}/{len(scored)} —— "
+                  f"这些行的 cf 被截到封顶，估计仍是上界，进出规模偏乐观）")
         if entered_all:
             print(f"  会被放进来（前12）：{entered_all[:12]}")
         if exited_all:
