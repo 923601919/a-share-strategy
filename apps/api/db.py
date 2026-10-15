@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 
 from config import settings
@@ -100,6 +100,37 @@ def init_db() -> None:
                 top_avg_day_position REAL,
                 user_id INTEGER NOT NULL DEFAULT 1
             );
+
+            -- 折分前的候选分数（消融回测的唯一依据）。
+            -- scan_snapshots/scan_quality 只看得见入选后的 top-N，而追高惩罚
+            -- 恰恰是把票挡在 top-N 外的那个环节：被挡掉的票不在库里，就没法问
+            -- 「不罚它们会怎样」。这张表按候选逐行落库（含落选者与被打分阶段
+            -- 直接剔除者），专门为参数消融留出对照面。
+            CREATE TABLE IF NOT EXISTS scan_candidates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                universe_policy TEXT NOT NULL,
+                strategy_version TEXT,
+                spot_source TEXT,
+                market_env_level TEXT,
+                top_n INTEGER,
+                code TEXT NOT NULL,
+                name TEXT,
+                pct REAL,
+                amount REAL,
+                score REAL,
+                score_pre_chase REAL,
+                chase_penalty REAL,
+                day_position REAL,
+                vwap_deviation REAL,
+                selected INTEGER NOT NULL DEFAULT 0,
+                reject_reason TEXT,
+                user_id INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scan_candidates_created
+                ON scan_candidates(user_id, created_at);
 
             CREATE TABLE IF NOT EXISTS watch_tracks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -995,6 +1026,84 @@ def list_scan_quality(limit: int = 200, *, mode: str | None = None) -> list[dict
     uid = require_user_id()
     sql = "SELECT * FROM scan_quality WHERE user_id=?"
     args: list[Any] = [uid]
+    if mode:
+        sql += " AND mode=?"
+        args.append(mode)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    with get_db() as conn:
+        rows = conn.execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def save_scan_candidates(rows: list[dict[str, Any]]) -> int:
+    """逐候选落一行（含落选的与打分阶段就被剔除的）。返回写入行数。
+
+    只增不改：消融回测要看的是「当时那一轮究竟看到了什么」，
+    任何事后修订都会把实验变成在改过的数据上做实验。
+    """
+    if not rows:
+        return 0
+    uid = require_user_id()
+    now = datetime.now(timezone.utc).astimezone().isoformat()
+    keep_days = max(1, int(settings.scan_candidate_keep_days))
+    cutoff = (datetime.now(timezone.utc).astimezone() - timedelta(days=keep_days)).isoformat()
+    payload = [
+        (
+            now,
+            r.get("mode") or "",
+            r.get("universe_policy") or "",
+            r.get("strategy_version"),
+            r.get("spot_source"),
+            r.get("market_env_level"),
+            r.get("top_n"),
+            r.get("code") or "",
+            r.get("name"),
+            r.get("pct"),
+            r.get("amount"),
+            r.get("score"),
+            r.get("score_pre_chase"),
+            r.get("chase_penalty"),
+            r.get("day_position"),
+            r.get("vwap_deviation"),
+            1 if r.get("selected") else 0,
+            r.get("reject_reason"),
+            uid,
+        )
+        for r in rows
+    ]
+    with get_db() as conn:
+        conn.executemany(
+            """
+            INSERT INTO scan_candidates(
+                created_at, mode, universe_policy, strategy_version, spot_source,
+                market_env_level, top_n, code, name, pct, amount, score,
+                score_pre_chase, chase_penalty, day_position, vwap_deviation,
+                selected, reject_reason, user_id
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            payload,
+        )
+        # 保留窗口按天裁：这张表是逐候选粒度，条数增长比 scan_quality 快一个量级
+        conn.execute(
+            "DELETE FROM scan_candidates WHERE user_id=? AND created_at < ?",
+            (uid, cutoff),
+        )
+    return len(payload)
+
+
+def list_scan_candidates(
+    limit: int = 500,
+    *,
+    since: str | None = None,
+    mode: str | None = None,
+) -> list[dict[str, Any]]:
+    uid = require_user_id()
+    sql = "SELECT * FROM scan_candidates WHERE user_id=?"
+    args: list[Any] = [uid]
+    if since:
+        sql += " AND created_at >= ?"
+        args.append(since)
     if mode:
         sql += " AND mode=?"
         args.append(mode)

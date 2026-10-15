@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Callable, Literal
 
 from config import settings
-from db import save_scan_snapshot, save_scan_quality
+from db import save_scan_candidates, save_scan_snapshot, save_scan_quality
 from providers import market as mkt
 from rules.fenshi import (
     apply_chase_penalty,
@@ -52,6 +52,49 @@ class ScanCancelled(Exception):
 def _is_st(name: str) -> bool:
     n = name.upper()
     return "ST" in n or "退" in name
+
+
+def _num(v: Any) -> float | None:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _reject_row(row: dict[str, Any], reason: str) -> dict[str, Any]:
+    """构造一条「打分阶段就被剔除」的候选记录。
+
+    这类票在旧口径里彻底消失：既没进 top-N，也没进任何统计，于是
+    「硬过滤挡掉了多少、挡的什么票」无从查证。它们和入选票一样是
+    对照面的一部分——消融回测必须先看得见它们。
+    """
+    return {
+        "code": str(row.get("code") or "").zfill(6),
+        "name": str(row.get("name") or ""),
+        "pct": _num(row.get("pct")),
+        "amount": _num(row.get("amount")),
+        "reject_reason": reason,
+        "_rejected": reason,
+    }
+
+
+def _candidate_row(row: dict[str, Any], fenshi: dict[str, Any], score_pre_chase: float | None) -> dict[str, Any]:
+    """把一个已完成打分的候选压缩成 scan_candidates 的一行。
+
+    score 是**未乘大盘折减系数**的口径。折减是全表统一乘数、不改变排序，
+    所以消融在同一口径内比较即可；混用两套口径才会出错。
+    """
+    return {
+        "code": str(row.get("code") or "").zfill(6),
+        "name": str(row.get("name") or ""),
+        "pct": _num(row.get("pct")),
+        "amount": _num(row.get("amount")),
+        "score": _num(fenshi.get("score")),
+        "score_pre_chase": score_pre_chase,
+        "chase_penalty": _num(fenshi.get("chase_penalty")),
+        "day_position": _num(fenshi.get("day_position")),
+        "vwap_deviation": _num(fenshi.get("vwap_deviation")),
+    }
 
 
 def _filter_spot(
@@ -529,6 +572,7 @@ def _enrich_one(
     minute = None
     daily = None
     minute_err = None
+    score_pre_chase: float | None = None
 
     try:
         if settings.demo_mode:
@@ -588,7 +632,7 @@ def _enrich_one(
             warn_by_1130=settings.day_vol_warn_by_1130,
         )
         if day_vol.get("level") == "block":
-            return None
+            return _reject_row(row, "day_vol_block")
         false_push = detect_false_push(
             minute,
             day_vol_ratio=day_vol.get("ratio"),
@@ -597,6 +641,10 @@ def _enrich_one(
         fenshi = apply_day_vol_and_false_push(fenshi, day_vol, false_push)
         # 追高惩罚：拉升中的票量能/斜率自然拉满，需补上"买入位置"维度
         if settings.chase_penalty_enabled:
+            # 折分前的分数：消融回测的对照口径。记在这里而不是事后
+            # 反推，是因为下游（选股层加分、封顶）会吃掉一部分扣分，
+            # 事后用「最终分 + 扣分」只能得到反事实的上界。
+            score_pre_chase = round(float(fenshi.get("score") or 0), 1)
             fenshi = apply_chase_penalty(
                 fenshi,
                 price=float(row.get("price") or 0),
@@ -649,7 +697,7 @@ def _enrich_one(
             bonus=float(so.get("bonus") if so.get("bonus") is not None else settings.softopt_bonus),
         )
         if filtered:
-            return None
+            return _reject_row(row, "softopt_rally_filter")
 
     risk = risk_flags(
         anom["pct_from_low"],
@@ -664,7 +712,7 @@ def _enrich_one(
         watch_days=settings.regulatory_watch_days,
     )
     if risk["level"] == "block":
-        return None
+        return _reject_row(row, "risk_block")
 
     reasons = list(fenshi.get("reasons") or [])
     tags = board_tags.get(code, [])
@@ -735,6 +783,9 @@ def _enrich_one(
         "turnover": round(float(row.get("turnover") or 0), 2),
         "volume_ratio": round(float(row.get("volume_ratio") or 0), 2),
         "score": fenshi.get("score") or 0,
+        # 私有键：由 run_scan 取走落库，不进接口响应（接口载荷不该因为
+        # 「内部要做消融」而变形）。
+        "_cand": _candidate_row(row, fenshi, score_pre_chase),
         "in_hot_board": in_hot,
         "board_tags": tags,
         "reasons": reasons,
@@ -1167,6 +1218,8 @@ def run_scan(
         )
 
         results: list[dict[str, Any]] = []
+        # 逐候选留痕：入选的、落选的、以及打分阶段就被剔除的，全部记下。
+        cand_log: list[dict[str, Any]] = []
         timed_out = 0
         total = max(len(rows), 1)
         done_n = 0
@@ -1187,6 +1240,8 @@ def run_scan(
             )
             for r in rows
         ]
+        # fut -> 原始行：超时/异常时要还能把「是谁没算出来」落到候选表里
+        fut_row = {f: r for f, r in zip(futs, rows)}
         enrich_budget = max(float(settings.enrich_timeout_seconds), 1.0)
         try:
             for fut in as_completed(futs, timeout=enrich_budget):
@@ -1196,8 +1251,16 @@ def run_scan(
                 except Exception:
                     timed_out += 1
                     item = None
+                    cand_log.append(_reject_row(fut_row[fut], "enrich_error"))
                 done_n += 1
+                if item is not None and "_rejected" in item:
+                    # 打分阶段被硬过滤剔除（日量/风险/软加权量能），未参与排名
+                    cand_log.append(item)
+                    item = None
                 if item is not None:
+                    cand = item.pop("_cand", None)
+                    if cand is not None:
+                        cand_log.append(cand)
                     results.append(item)
                 if done_n % 3 == 0 or done_n == total:
                     progress(
@@ -1210,6 +1273,7 @@ def run_scan(
             pending = [f for f in futs if not f.done()]
             for f in pending:
                 f.cancel()
+                cand_log.append(_reject_row(fut_row[f], "enrich_timeout"))
             timed_out += len(pending)
             done_n = len(rows)
             progress("enrich", 0.95, f"分时打分超时预算{enrich_budget:g}s，跳过 {len(pending)} 只")
@@ -1296,6 +1360,26 @@ def run_scan(
             "market_env": market_env,
         }
         progress("done", 1.0, f"完成，命中 {len(results)} 只")
+        # 逐候选留痕（含落选者与被打分阶段剔除者）：这是唯一能支撑参数消融的
+        # 对照面——scan_snapshots 只存入选后的 items，被惩罚挡在 top-N 外的票
+        # 在别处没有任何痕迹，于是「不罚它们会怎样」永远问不出来。
+        if settings.scan_candidate_log and cand_log:
+            try:
+                picked = {str(x.get("code") or "") for x in results}
+                meta = {
+                    "mode": mode,
+                    "universe_policy": universe_policy,
+                    "strategy_version": settings.strategy_version,
+                    "spot_source": spot_source,
+                    "market_env_level": market_env.get("level"),
+                    "top_n": top_n,
+                }
+                save_scan_candidates(
+                    [{**meta, **c, "selected": str(c.get("code") or "") in picked} for c in cand_log]
+                )
+            except Exception:
+                # 不静默：这一路失败正是「数据悄悄没了」的典型形态，必须留痕
+                logger.warning("scan_candidates 落库失败", exc_info=True)
         try:
             save_scan_snapshot(json.dumps(payload, ensure_ascii=False))
         except Exception:

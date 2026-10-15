@@ -231,6 +231,10 @@ class Settings(BaseSettings):
     prefer_isolated_timeout: bool = True
     scan_max_concurrent: int = 1  # 同时 running 的扫描数
     scan_snapshot_keep: int = 30  # scan_snapshots 保留条数
+    # 折分前候选分落库（消融回测的前置设施）。关掉它 = 关掉「能不能验证参数该不该改」，
+    # 因为被惩罚挡在 top-N 外的票不在任何别的地方留痕。
+    scan_candidate_log: bool = True
+    scan_candidate_keep_days: int = 180  # 逐候选表按天裁（条数增长比 scan_quality 快一个量级）
     spot_cache_ttl: float = 45.0
     universe_cache_ttl: float = 90.0
     enrich_timeout_seconds: float = 120.0  # enrich 阶段整体预算，超时未完成的候选直接跳过
