@@ -131,6 +131,16 @@ def welch(xs: list[float], ys: list[float]) -> tuple[float, float, float]:
     return m1 - m2, t, df
 
 
+def fmt(v: float, digits: int = 2) -> str:
+    """空样本格式化：nan → `—`。
+
+    空样本必须是「—」而不是 `0.00`：把「没拿到」印成 0 会被读成「没有效应」。
+    """
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "—"
+    return f"{v:.{digits}f}"
+
+
 def describe(vals: list[float]) -> tuple[int, float, float, float, float]:
     """返回 (n, mean, se, t, win_pct)。"""
     n = len(vals)
@@ -628,18 +638,23 @@ def main() -> int:
     # scan_candidates 就是为补上这个盲区而落库的（2026-10-15 起，逐候选一行）。
     #
     # 它现在能回答的是**排序**问题：不施加惩罚的话，谁进谁出。
-    # 它暂时**不能**回答「换进来的票赚得更多吗」——那要给这些没入池的票补
-    # T+3 收益，得另外拉日线。本节只说排序，不越界下收益结论。
+    # 收益问题要等 `scan_candidate_returns`（与候选池同批上线）给出未入池候选的
+    # T+N —— 那需要等样本日过去。本节的收益检验在数据未到位时会明说「尚未结算」，
+    # 不会退回成「没有效应」。
     print("\n=== 候选池消融：折分前候选分（scan_candidates）===")
+    ret_days = 3
+    ret_of: dict[int, float] = {}
+    ret_table_missing = False
     try:
         cand_rows = [
             {
+                "id": cid,
                 "at": at, "mode": md, "up": up, "top_n": tn, "code": code, "name": nm,
                 "pct": pc, "score": sc, "pre": pre, "pen": pen, "pos": ps, "dev": dv,
                 "sel": bool(sel), "reason": rsn,
             }
-            for at, md, up, tn, code, nm, pc, sc, pre, pen, ps, dv, sel, rsn in conn.execute(
-                "SELECT created_at, mode, universe_policy, top_n, code, name, pct, score,"
+            for cid, at, md, up, tn, code, nm, pc, sc, pre, pen, ps, dv, sel, rsn in conn.execute(
+                "SELECT id, created_at, mode, universe_policy, top_n, code, name, pct, score,"
                 " score_pre_chase, chase_penalty, day_position, vwap_deviation,"
                 " selected, reject_reason FROM scan_candidates"
             )
@@ -647,6 +662,20 @@ def main() -> int:
     except sqlite3.Error as e:
         cand_rows = []
         print(f"scan_candidates 读取失败（该表自 2026-10-15 才启用，老库没有）：{e}")
+
+    # 收益表单独兜：它是后加的，老库可能只有候选表没有它。
+    # 两者共用一个 try 会让「缺收益表」被报成「缺候选表」，把有数据说成没数据。
+    try:
+        ret_of = {
+            int(cid): float(ret)
+            for cid, ret in conn.execute(
+                "SELECT candidate_id, return_pct FROM scan_candidate_returns WHERE day_offset=?",
+                (ret_days,),
+            )
+            if ret is not None
+        }
+    except sqlite3.Error:
+        ret_table_missing = True
 
     if not cand_rows:
         print("尚无候选池记录。这张表随本轮改动才开始落库（每轮 40~80 条、约 9 轮/交易日），")
@@ -738,8 +767,68 @@ def main() -> int:
                   f"{sum(pens) / len(pens):>8.2f}"
                   f"{sum(r['score'] for r in sub) / len(sub):>9.1f}")
         print("（读法：落选者位置均值若明显更高，说明惩罚正在按位置筛人。"
-              "但它是否该筛人，要看被筛掉的票后续赚不赚——")
-        print("  那需要给未入池的票补 T+3 收益，本表还没有。所以本节的结论止于**排序**。）")
+              "但它是否该筛人，要看被筛掉的票后续赚不赚——见下一节。）")
+
+        # ---- 反事实的收益检验 ----
+        # 前面只回答了「谁进谁出」。要回答「换进来的票赚不赚」，必须给**未入池**的
+        # 候选也补上 T+N —— 那正是 scan_candidate_returns 的作用（与候选池同批上线）。
+        #
+        # 口径必须是**收盘对收盘**（入池日收盘 → T+N 收盘）：未入池的票从来没有盘中价，
+        # 只有收盘价两臂都取得到才可比。注意它与策略自己的 exit_return_pct 不同口径
+        # （后者是盘中入池价 → T+3 收盘），差额 = 入池日「盘中 → 收盘」的漂移。
+        settled = [r for r in scored if r["id"] in ret_of]
+        print(f"\n--- 反事实的收益检验（T+{ret_days}，收盘对收盘）---")
+        if not settled:
+            # 「没拿到」不是「没有」：这里必须说清楚是哪一种，否则会被读成「无差异」。
+            if ret_table_missing:
+                print("候选收益表不存在（老库）→ **尚未结算**。")
+            else:
+                print(f"已打分候选 {len(scored)} 条，其中已结算 T+{ret_days} 收益的：0 条"
+                      " → **尚未结算**。")
+                print(f"  收益表随候选池同批上线（2026-10-15），而 T+{ret_days} 要等 "
+                      f"{ret_days} 个交易日后才可能落库；")
+                print("  每日 15:30 的回填作业会逐日补 offset，攒够后本节自动开始出数。")
+            print("  ⇒ 本节现在**不支持任何**「惩罚该不该改」的收益结论。")
+        else:
+            act: list[float] = []
+            ent: list[float] = []
+            ext: list[float] = []
+            for (_, _mode, _up, top_n), rs in sorted(rounds_map.items()):
+                sc = [r for r in rs if r["score"] is not None]
+                if not sc or not top_n:
+                    continue
+                actual_top = {r["code"] for r in sc if r["sel"]}
+                order = sorted(
+                    sc,
+                    key=lambda r: ((r["score"] or 0) + (r["pen"] or 0), r["pct"] or 0),
+                    reverse=True,
+                )
+                cf_top = {r["code"] for r in order[:top_n]}
+                for r in sc:
+                    if r["id"] not in ret_of:
+                        continue
+                    v = ret_of[r["id"]]
+                    if r["code"] in actual_top:
+                        act.append(v)
+                    if r["code"] in cf_top and r["code"] not in actual_top:
+                        ent.append(v)
+                    if r["code"] in actual_top and r["code"] not in cf_top:
+                        ext.append(v)
+            print(f"已结算 {len(settled)}/{len(scored)} 条打分候选")
+            print(f"{'分组':<14}{'n':>6}{'T+3均值%':>10}{'胜率':>8}")
+            for name, vals in (("实际入选", act), ("反事实会进入", ent), ("反事实会挤出", ext)):
+                n, m, _se, _t, win = describe(vals)
+                print(f"{name:<14}{n:>6}{fmt(m, 2):>10}{fmt(win, 1):>7}")
+            if act and ent:
+                d, t, df = welch(ent, act)
+                print(f"（「反事实会进入」−「实际入选」= {fmt(d, 2)}pp，Welch t={fmt(t, 2)}，"
+                      f"df={fmt(df, 0)}）")
+            print("（口径提醒：这里是收盘对收盘。策略自己的 exit_return_pct 是"
+                  "盘中入池价 → T+3 收盘，")
+            print("  两者的差额就是「入池日盘中 → 收盘」的漂移，两个数字不能混着引用。）")
+            if len(ent) < 30 or len(act) < 30:
+                print(f"⚠ 样本过薄（进入 {len(ent)} / 入选 {len(act)} 条）："
+                      "本表只说明管道通了，不足以支撑调参。")
 
     return 0
 
