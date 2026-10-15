@@ -81,9 +81,16 @@ def _add_candidate(*, code="600001", when="2026-10-08T10:40:00+08:00", selected=
                 }
             ]
         )
+    # 必须按 id 定位刚插入的那一行：同一个 code 会被多次插入（多轮扫描），
+    # 按 code 更新会把先前几轮的入池日一并改掉，测的就不是原来那件事了。
     with get_db() as conn:
-        conn.execute("UPDATE scan_candidates SET created_at=? WHERE code=?", (when, code))
-        return int(conn.execute("SELECT id FROM scan_candidates WHERE code=?", (code,)).fetchone()["id"])
+        cid = int(
+            conn.execute(
+                "SELECT MAX(id) AS i FROM scan_candidates WHERE code=?", (code,)
+            ).fetchone()["i"]
+        )
+        conn.execute("UPDATE scan_candidates SET created_at=? WHERE id=?", (when, cid))
+    return cid
 
 
 # ---------- compute_candidate_returns 的口径 ----------
@@ -158,6 +165,7 @@ def test_bad_base_close_is_rejected(monkeypatch):
 # ---------- backfill_candidate_returns 的行为 ----------
 
 def test_backfill_writes_rows_and_groups_same_code_day(fake_daily, monkeypatch):
+    """同代码同基准日的多轮候选（09:45/10:40）共用一次日线和一组收益行。"""
     _fresh_db(monkeypatch)
     id1 = _add_candidate(code="600001", when="2026-10-08T09:45:00+08:00", selected=True)
     id2 = _add_candidate(code="600001", when="2026-10-08T10:40:00+08:00")
@@ -165,7 +173,7 @@ def test_backfill_writes_rows_and_groups_same_code_day(fake_daily, monkeypatch):
     s = track.backfill_candidate_returns(today="2026-10-15")
 
     assert s["pending"] == 2
-    assert s["groups"] == 1, "同代码同基准日的两轮候选应共用一次日线拉取"
+    assert s["codes"] == 1 and s["groups"] == 1
     assert len(fake_daily) == 1, f"日线被拉了 {len(fake_daily)} 次，应只拉一次"
     assert s["written"] == 2
     assert s["settled"] == 2
@@ -297,8 +305,52 @@ def test_truncation_is_reported(fake_daily, monkeypatch):
     monkeypatch.setattr(settings, "scan_candidate_return_max_codes", 2)
     s = track.backfill_candidate_returns(today="2026-10-15")
     assert s["truncated"] is True
-    assert s["groups"] == 2
-    assert s["codes"] == 3
+    assert s["processed_codes"] == 3, "被截断的规模要能看出来（总数）"
+    assert len(fake_daily) == 2, "截断后只处理 2 只"
+
+
+def test_same_code_multiple_base_dates_fetches_once(monkeypatch):
+    """同一代码的不同入池日共用同一条日线序列：按代码拉一次，两个基准日各算一遍。
+
+    按 (代码, 基准日) 去拉会把同一条序列重复拉 4~5 次 —— 一个候选要跨 4 个交易日
+    才补齐 offset，网络开销会翻几倍。
+    """
+    _fresh_db(monkeypatch)
+    calls: list[str] = []
+
+    def _fake(code, limit=60, *, no_cache=False):
+        calls.append(code)
+        return _bars()
+
+    monkeypatch.setattr(track, "_daily_bars", _fake)
+    a = _add_candidate(code="600001", when="2026-10-08T10:40:00+08:00")
+    b = _add_candidate(code="600001", when="2026-10-12T10:40:00+08:00")
+
+    s = track.backfill_candidate_returns(today="2026-10-15")
+
+    assert calls == ["600001"], f"应只拉一次日线，实际 {calls}"
+    assert s["codes"] == 1 and s["groups"] == 2
+    with get_db() as conn:
+        for cid, base in ((a, "2026-10-08"), (b, "2026-10-12")):
+            rows = conn.execute(
+                "SELECT trade_date, return_pct FROM scan_candidate_returns"
+                " WHERE candidate_id=? ORDER BY day_offset",
+                (cid,),
+            ).fetchall()
+            assert [r["trade_date"] for r in rows][0] == base
+            assert rows[0]["return_pct"] == 0.0
+
+
+def test_today_candidates_are_deferred_without_fetching(monkeypatch, fake_daily):
+    """今天入池的候选今天必然算不出来（今天的 bar 没定稿）→ 连拉都不该拉。"""
+    _fresh_db(monkeypatch)
+    _add_candidate(code="600001", when="2026-10-15T10:40:00+08:00")
+    s = track.backfill_candidate_returns(today="2026-10-15")
+    assert s["deferred_today"] == 1
+    assert fake_daily == [], "已知算不出来还去拉日线，是每天白烧一次网络"
+    assert s["written"] == 0
+    # 但它们仍留在待办里（第二天就能算出 offset 0）
+    assert s["pending"] == 1
 
 
 def test_disabled_switch_short_circuits(fake_daily, monkeypatch):
