@@ -553,6 +553,32 @@ def main() -> int:
         print(f"{'dev + entry_score':<24}{n2:>6}{b1:>12.3f}{t1:>10.2f}"
               f"{b2:>11.3f}{t2:>10.2f}")
 
+    # 稳健性：分策略各算一遍。
+    # 为什么必须做：entry_score 在三个策略间**不可比**（软加权与进攻型分时
+    # 的分表/封顶不同，soft 还会被 warn 档整体折分），把三个策略的样本混在一起
+    # 回归，score 的系数没有干净的解读。而 pos 是否稳定为正，直接分策略看最省事。
+    print("\n--- 稳健性：分策略的位置/乖离斜率 ---")
+    print(f"{'策略':<10}{'n':>6}{'pos斜率':>10}{'t':>8}{'dev斜率':>10}{'t':>8}"
+          f"{'score斜率':>11}{'t':>8}")
+    for st in ("soft", "fenshi", "soft_opt"):
+        sel_s = [r for r in rows if r["st"] == st and r["score"] is not None]
+        if len(sel_s) < 5:
+            print(f"{st:<10}{len(sel_s):>6}{'样本不足':>20}")
+            continue
+        yv = [r["r"] - r[b] for r in sel_s]
+        out = [f"{st:<10}{len(sel_s):>6}"]
+        for key in ("pos", "dev"):
+            sub = [(r[key], y) for r, y in zip(sel_s, yv) if r[key] is not None]
+            if len(sub) < 5:
+                out.append(f"{'-':>10}{'-':>8}")
+                continue
+            bb, tt, _, _ = ols([s[0] for s in sub], [s[1] for s in sub])
+            out.append(f"{bb:>10.3f}{tt:>8.2f}")
+        bs, ts, _, _ = ols([r["score"] for r in sel_s], yv)
+        out.append(f"{bs:>11.3f}{ts:>8.2f}")
+        print("".join(out))
+    print("（pos 斜率在三个策略里若同号且量级接近 → 不是某个策略的个例）")
+
     # ---- 组间差异检验 ----
     # 分桶均值看着有差别不等于差别显著。这里对想下结论的对比逐个做 Welch 检验。
     print("\n=== 组间差异检验（中证1000 基准，Welch t，|t|>1.96 约 p<0.05）===")
