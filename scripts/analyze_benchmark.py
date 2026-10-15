@@ -143,6 +143,16 @@ def describe(vals: list[float]) -> tuple[int, float, float, float, float]:
     return n, m, se, m / se, win
 
 
+def mean(vals: list[float]) -> float:
+    """空样本返回 nan 而不是抛 ZeroDivisionError。
+
+    为什么值得单独写：空库（新部署、或筛选条件过严）时整脚本会以
+    一句 `division by zero` 崩掉，看起来像脚本坏了，其实是没样本。
+    空样本必须表现为「nan + 一句说明」，因为「没拿到」和「没有」是两回事。
+    """
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", required=True)
@@ -229,6 +239,9 @@ def main() -> int:
     print(f"丢弃明细: {drop}")
     if sample_no_index:
         print(f"缺指数样本(前8): {sample_no_index}")
+    if not rows:
+        print("\n⚠ 没有任何有效样本。下面的各表都会是空/nan ——")
+        print("  那不是「没有效应」，是「没拿到数据」。先查上面的丢弃明细。")
 
     print("\n=== 全样本：各基准下的超额收益 ===")
     print(f"{'基准':<10}{'n':>6}{'个股':>9}{'指数':>9}{'超额':>9}{'se':>7}"
@@ -239,7 +252,7 @@ def main() -> int:
         ex = [r["r"] - r[b] for r in rows]
         n, m, se, t, win = describe(ex)
         lo, hi = m - 1.96 * se, m + 1.96 * se
-        print(f"{LABEL[b]:<10}{n:>6}{sum(stk)/n:>9.2f}{sum(iv)/n:>9.2f}"
+        print(f"{LABEL[b]:<10}{n:>6}{mean(stk):>9.2f}{mean(iv):>9.2f}"
               f"{m:>9.2f}{se:>7.3f}{t:>7.2f}{f'[{lo:.2f},{hi:.2f}]':>18}{win:>7.1f}%")
 
     print("\n=== 分策略：各基准下的超额 / 胜率 ===")
@@ -608,6 +621,116 @@ def main() -> int:
     cmp("warn档 - 正常档",
         lambda r: r["sp"] is not None and r["sp"] <= -1.5,
         lambda r: r["sp"] is not None and r["sp"] > -1.5)
+
+    # ================= 候选池消融（scan_candidates）=================
+    # 上面所有「追高惩罚」的结论都卡在同一个盲区：惩罚把票挡在了 top-N 之外，
+    # 而 watch_tracks / scan_snapshots 只看得见入选的票 → 真正的消融做不了。
+    # scan_candidates 就是为补上这个盲区而落库的（2026-10-15 起，逐候选一行）。
+    #
+    # 它现在能回答的是**排序**问题：不施加惩罚的话，谁进谁出。
+    # 它暂时**不能**回答「换进来的票赚得更多吗」——那要给这些没入池的票补
+    # T+3 收益，得另外拉日线。本节只说排序，不越界下收益结论。
+    print("\n=== 候选池消融：折分前候选分（scan_candidates）===")
+    try:
+        cand_rows = [
+            {
+                "at": at, "mode": md, "up": up, "top_n": tn, "code": code, "name": nm,
+                "pct": pc, "score": sc, "pre": pre, "pen": pen, "pos": ps, "dev": dv,
+                "sel": bool(sel), "reason": rsn,
+            }
+            for at, md, up, tn, code, nm, pc, sc, pre, pen, ps, dv, sel, rsn in conn.execute(
+                "SELECT created_at, mode, universe_policy, top_n, code, name, pct, score,"
+                " score_pre_chase, chase_penalty, day_position, vwap_deviation,"
+                " selected, reject_reason FROM scan_candidates"
+            )
+        ]
+    except sqlite3.Error as e:
+        cand_rows = []
+        print(f"scan_candidates 读取失败（该表自 2026-10-15 才启用，老库没有）：{e}")
+
+    if not cand_rows:
+        print("尚无候选池记录。这张表随本轮改动才开始落库（每轮 40~80 条、约 9 轮/交易日），")
+        print("消融要等它攒够样本。在它到位之前，本节不做任何结论——")
+        print("拿不到被惩罚挡掉的票，任何「惩罚方向对不对」的说法都只是推测。")
+    else:
+        rounds_map: dict[tuple[str, str, str, int | None], list[dict]] = {}
+        for r in cand_rows:
+            rounds_map.setdefault((r["at"], r["mode"], r["up"], r["top_n"]), []).append(r)
+        n_days = len({r["at"][:10] for r in cand_rows})
+        scored = [r for r in cand_rows if r["score"] is not None]
+        print(f"覆盖 {len(rounds_map)} 轮 / {n_days} 天 / 候选 {len(cand_rows)} 条"
+              f"（已打分 {len(scored)}，未打分 {len(cand_rows) - len(scored)}）")
+
+        # 数据完整性：折分前分是消融的支点，它断了整节就无意义
+        broken = [r for r in cand_rows if r["pen"] and r["pre"] is None]
+        if broken:
+            print(f"⚠ 数据异常：{len(broken)} 条有扣分却无折分前分（落库链路断了，本节结论不可信）")
+
+        # ---- 候选漏斗：挡在排名之外的那批，为什么被挡 ----
+        reasons: dict[str, int] = {}
+        for r in cand_rows:
+            if r["reason"]:
+                reasons[r["reason"]] = reasons.get(r["reason"], 0) + 1
+        if reasons:
+            print("--- 打分阶段就被剔除（未参与排名）---")
+            for k, v in sorted(reasons.items(), key=lambda kv: -kv[1]):
+                print(f"  · {k:<20}{v:>7} 条")
+
+        # ---- 反事实排序：把追高惩罚的扣分加回去，看谁进谁出 ----
+        # cf = score + chase_penalty。这是**上界**：下游（选股层加分/封顶）可能
+        # 吃掉一部分扣分，真实反事实分只会 ≤ 它。所以「进出」的规模是乐观估计。
+        n_cut = 0
+        changed_rounds = 0
+        entered_all: list[str] = []
+        exited_all: list[str] = []
+        for (_, mode, up, top_n), rs in sorted(rounds_map.items()):
+            sc = [r for r in rs if r["score"] is not None]
+            if not sc or not top_n:
+                continue
+            actual_top = {r["code"] for r in sc if r["sel"]}
+            n_cut += len(sc) - len(actual_top)
+            order = sorted(
+                sc,
+                key=lambda r: ((r["score"] or 0) + (r["pen"] or 0), r["pct"] or 0),
+                reverse=True,
+            )
+            cf_top = {r["code"] for r in order[:top_n]}
+            entered = cf_top - actual_top
+            exited = actual_top - cf_top
+            if entered or exited:
+                changed_rounds += 1
+            entered_all.extend(sorted(entered))
+            exited_all.extend(sorted(exited))
+
+        print("\n--- 反事实排序：不施加追高惩罚会怎样 ---")
+        print(f"被 top-N 截掉的打分候选：{n_cut} 条")
+        print(f"反事实下进出变化：进入 {len(entered_all)} 条 / 掉出 {len(exited_all)} 条"
+              f"（{changed_rounds}/{len(rounds_map)} 轮有变化）")
+        if entered_all:
+            print(f"  会被放进来（前12）：{entered_all[:12]}")
+        if exited_all:
+            print(f"  会被挤出去（前12）：{exited_all[:12]}")
+
+        # ---- 入选者与落选者的画像对比 ----
+        # 若落选者位置系统性更高，说明惩罚确实在按「位置」筛人；
+        # 至于这是好事还是坏事，取决于被筛掉的票后续赚不赚——本节答不了。
+        print("\n--- 入选 vs 落选：画像对比（仅已打分候选）---")
+        print(f"{'分组':<8}{'n':>6}{'位置':>9}{'乖离%':>9}{'扣分':>8}{'最终分':>9}")
+        for tag, is_sel in (("入选", True), ("落选", False)):
+            sub = [r for r in scored if r["sel"] is is_sel]
+            if not sub:
+                continue
+            with_pos = [r["pos"] for r in sub if r["pos"] is not None]
+            with_dev = [r["dev"] for r in sub if r["dev"] is not None]
+            pens = [r["pen"] or 0.0 for r in sub]
+            print(f"{tag:<8}{len(sub):>6}"
+                  f"{(sum(with_pos) / len(with_pos) if with_pos else float('nan')):>9.3f}"
+                  f"{(sum(with_dev) / len(with_dev) if with_dev else float('nan')):>9.2f}"
+                  f"{sum(pens) / len(pens):>8.2f}"
+                  f"{sum(r['score'] for r in sub) / len(sub):>9.1f}")
+        print("（读法：落选者位置均值若明显更高，说明惩罚正在按位置筛人。"
+              "但它是否该筛人，要看被筛掉的票后续赚不赚——")
+        print("  那需要给未入池的票补 T+3 收益，本表还没有。所以本节的结论止于**排序**。）")
 
     return 0
 
