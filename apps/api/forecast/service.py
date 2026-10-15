@@ -366,8 +366,16 @@ def generate_prediction(
     as_of: datetime,
     profile: dict,
     origin: str = "live",
+    now: datetime | None = None,
 ) -> dict | None:
-    """为指定目标日产出并落库一条预测。已存在同口径记录时返回 None（不覆盖）。"""
+    """为指定目标日产出并落库一条预测。已存在同口径记录时返回 None（不覆盖）。
+
+    `now` 是**记录时刻**（写进 `recorded_on`，也是引擎判「不能声明为 live」的依据）。
+    必须由调用方传入而不是在这里读墙钟：`run_daily_forecast(now=...)` 的语义就是
+    「假装此刻是那个时刻」，而作业顶层的 `now` 若传不到这里，那个参数就是假的——
+    表现是补跑/重演一律被判「记录时刻不早于目标日」。默认仍取真实时刻，
+    定时作业不传即保持既有行为。
+    """
     from db import has_live_prediction_for, insert_market_prediction
 
     if origin == "live":
@@ -382,7 +390,7 @@ def generate_prediction(
         minute=CAST_MINUTE,
         late_zi_hour=profile.get("lateZiHour", "nextDay"),
     )
-    now_iso = now_shanghai().isoformat()
+    now_iso = (now or now_shanghai()).isoformat()
     pred = divine(
         DivineRequest(
             symbol=symbol,
@@ -486,11 +494,15 @@ def run_daily_forecast(
             created = generate_prediction(
                 symbol,
                 target,
-                # 起卦时点 = 收盘时刻。它必须早于目标日，否则引擎会拒绝。
+                # 起卦材料时点 = 收盘时刻（as_of）。
                 as_of=datetime.combine(today, datetime.min.time(), tzinfo=SHANGHAI).replace(
                     hour=CAST_HOUR, minute=CAST_MINUTE
                 ),
                 profile=profile,
+                # 记录时刻必须跟着作业顶层的 now 走。引擎拦的是**记录时刻**是否
+                # 早于目标日（不是 as_of）——上面那句 as_of 再早也保不住它。
+                # 定时作业不传 now，于是拿真实时刻，行为与本改动前完全一致。
+                now=started,
             )
             if created is None:
                 result["notes"].append(

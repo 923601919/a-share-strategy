@@ -19,8 +19,9 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -400,9 +401,28 @@ def test_replay_records_are_never_settled_into_accuracy(no_network):
 
 # ─────────────────────── ③ 作业主体 ───────────────────────
 
+# 「模拟作业跑在 2026-09-17 盘后」——必须同时冻结 `now`，只给 `today` 是不够的。
+#
+# run_daily_forecast 取记录时刻用 `now or now_shanghai()`，漏掉 `now` 就会落回
+# **真实当前时间**。等真实日期越过目标交易日（2026-09-18）之后，引擎会以
+# 「记录时刻不早于目标交易日，不能声明为 live 预测」为由拒绝起卦——这恰恰是
+# 引擎**该做**的事（见 `engine.divine` 的未来函数拦截，以及记忆里的补跑口径：
+# 不许把未来的作业提前跑）。于是这些用例从绿变红，不是代码坏了，是时钟走过去了。
+# 所以日期与时刻必须一起钉住，用例才对时钟免疫。
+_D0917 = date(2026, 9, 17)  # 周四
+
+
+def _run_on(d: date, **kwargs):
+    """以 d 当天盘后 15:45（Asia/Shanghai）的时刻跑一次作业。"""
+    return svc.run_daily_forecast(
+        today=d,
+        now=datetime(d.year, d.month, d.day, 15, 45, tzinfo=ZoneInfo("Asia/Shanghai")),
+        **kwargs,
+    )
+
 
 def test_daily_run_creates_prediction_for_next_trade_date(no_network):
-    r = svc.run_daily_forecast(today=date(2026, 9, 17))  # 周四
+    r = _run_on(_D0917)
     assert r["trade_date"] is True
     assert r["status"] == "ok"
     assert r["target_date"] == "2026-09-18"
@@ -413,14 +433,44 @@ def test_daily_run_creates_prediction_for_next_trade_date(no_network):
     assert row["symbol"] == SYMBOL
 
 
+def test_recorded_clock_follows_the_now_argument(no_network):
+    """`now` 必须真的贯穿到记录时刻，而不是被就地读墙钟顶掉。
+
+    这是把上面那批用例「钉住时刻」的前提：如果 `generate_prediction` 内部直接
+    读墙钟（本轮修的那个 bug），传进来的 `now` 就只是个摆设，
+    用例照样会随真实日期推进而变红。
+    """
+    r = _run_on(_D0917)
+    assert r["status"] == "ok"
+    row = get_market_prediction(r["created"])
+    assert row["generated_at"].startswith("2026-09-17"), row["generated_at"]
+    assert row["created_at"].startswith("2026-09-17"), row["created_at"]
+
+
+def test_clock_later_than_target_is_refused(no_network):
+    """记录时刻晚于目标交易日 → 引擎必须拒绝起卦（作业报非 ok）。
+
+    这条是「不许把未来的作业提前跑」那口径的反面：不能靠事后把时钟报小
+    来伪造一条 live 预测。上一轮那 4 个红用例就是被这条拦下的——
+    现在把它写成显式断言，而不是让它以「测试过期」的形式偶然暴露。
+    """
+    r = svc.run_daily_forecast(
+        today=_D0917,
+        now=datetime(2026, 10, 15, 15, 45, tzinfo=ZoneInfo("Asia/Shanghai")),
+    )
+    assert r["created"] is None
+    assert r["status"] != "ok"
+    assert any("起卦失败" in n for n in r["notes"]), r["notes"]
+
+
 def test_daily_run_is_idempotent(no_network):
     """同一天重跑：不新增记录、状态仍为 ok（不是"失败"）。
 
     这条正是把出口判据从"本轮是否创建"改成"目标日是否有 live 记录"的理由：
     用事件式判据时，重跑会被误报成失败。
     """
-    first = svc.run_daily_forecast(today=date(2026, 9, 17))
-    second = svc.run_daily_forecast(today=date(2026, 9, 17))
+    first = _run_on(_D0917)
+    second = _run_on(_D0917)
     assert second["created"] is None
     assert second["status"] == "ok"
     assert first["target_date"] == second["target_date"] == "2026-09-18"
@@ -434,7 +484,7 @@ def test_daily_run_reports_failed_when_target_has_no_prediction(no_network, monk
     这能揪出所有该报警的情形——起卦抛错、日历越界、库写不进去。
     """
     monkeypatch.setattr(svc, "generate_prediction", lambda *a, **k: None)
-    r = svc.run_daily_forecast(today=date(2026, 9, 17))
+    r = _run_on(_D0917)
     assert r["status"] == "failed"
     assert r["target_date"] == "2026-09-18"
     assert any("仍无 live 预测记录" in n for n in r["notes"])
@@ -446,7 +496,7 @@ def test_daily_run_reports_failed_on_exception_in_divine(no_network, monkeypatch
         raise RuntimeError("模拟引擎故障")
 
     monkeypatch.setattr(svc, "generate_prediction", _boom)
-    r = svc.run_daily_forecast(today=date(2026, 9, 17))
+    r = _run_on(_D0917)
     assert r["status"] == "failed"
     assert any("起卦失败" in n for n in r["notes"])
 
@@ -457,7 +507,7 @@ def test_holiday_run_does_nothing(no_network):
     DEMO_MODE 下交易日历走"周一至周五"兜底，所以用周六来构造。
     """
     assert date(2026, 9, 19).weekday() == 5
-    r = svc.run_daily_forecast(today=date(2026, 9, 19))
+    r = _run_on(date(2026, 9, 19))
     assert r["status"] == "holiday"
     assert r["created"] is None
     assert list_market_predictions(symbol=SYMBOL, limit=10) == []
@@ -465,7 +515,7 @@ def test_holiday_run_does_nothing(no_network):
 
 def test_run_is_persisted_with_notes(no_network):
     """每次运行都留痕（漏跑检测的对照表）。"""
-    svc.run_daily_forecast(today=date(2026, 9, 17))
+    _run_on(_D0917)
     runs = list_market_forecast_runs(limit=10)
     assert len(runs) == 1
     assert runs[0]["run_date"] == "2026-09-17"
@@ -478,7 +528,7 @@ def test_sync_failure_marks_partial_but_still_predicts(no_network, monkeypatch):
         raise RuntimeError("行情源不可用")
 
     monkeypatch.setattr(svc, "sync_index_daily", _boom)
-    r = svc.run_daily_forecast(today=date(2026, 9, 17))
+    r = _run_on(_D0917)
     assert r["status"] == "partial"
     assert r["created"] is not None
     assert any("行情同步失败" in n for n in r["notes"])
