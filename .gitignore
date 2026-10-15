@@ -6,6 +6,9 @@ __pycache__/
 node_modules/
 .next/
 data/*.db
+# SQLite WAL/共享内存：随进程起停出现，永远不该入库（`data/*.db` 盖不住它们）
+data/*.db-shm
+data/*.db-wal
 data/cache/
 # 分析过程产出的中间文件（线上数据转储、基准指数快照），不进版本库
 data/_*.csv
