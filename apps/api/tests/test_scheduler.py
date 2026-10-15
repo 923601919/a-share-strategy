@@ -101,8 +101,9 @@ def test_scheduler_registers_soft_opt_jobs():
         except Exception:
             pass
     ids = list(jobs)
-    # 老三账户 3×2 时间点 + verify 3×1 时间点 + 15:30 收益回填 + 15:45 大盘预判 = 11
-    assert len(ids) == 11, f"job 数应为 11，实际 {len(ids)}: {sorted(ids)}"
+    # 老三账户 3×2 时间点 + verify 3×1 时间点 + 15:30 收益回填 + 15:45 大盘预判
+    # + 15:50 基准指数同步 = 12
+    assert len(ids) == 12, f"job 数应为 12，实际 {len(ids)}: {sorted(ids)}"
     assert len(set(ids)) == len(ids), f"job id 存在重复（发生覆盖）: {sorted(ids)}"
     assert "soft_opt-soft_opt-1040" in ids
     assert "soft_opt-soft_opt-1420" in ids
@@ -137,6 +138,52 @@ def test_scheduler_registers_market_forecast_at_1545():
     assert fields["hour"] == "15"
     assert fields["minute"] == "45"
     assert fields["day_of_week"] == "mon-fri"
+
+
+def test_scheduler_registers_benchmark_sync_at_1550():
+    """基准指数同步作业必须注册在 **15:50 周一至周五**，且独立于预判作业。
+
+    它兜住的是「静默腐坏」：分析口径的指数（中证1000 等）缺一根 bar 不会报错，
+    只会让分析脚本的 no_index 计数悄悄涨。因此它不能寄生在
+    market_forecast 里——预判可关，基准不该跟着关。
+    """
+    from apscheduler.triggers.cron import CronTrigger
+
+    s = _build_scheduler()
+    try:
+        job = next((j for j in s.get_jobs() if j.id == "benchmark-sync"), None)
+        all_ids = [j.id for j in s.get_jobs()]
+    finally:
+        try:
+            s.shutdown(wait=False)
+        except Exception:
+            pass
+    assert job is not None, f"缺少 benchmark-sync job，现有：{all_ids}"
+
+    assert isinstance(job.trigger, CronTrigger)
+    fields = {f.name: str(f) for f in job.trigger.fields}
+    assert fields["hour"] == "15"
+    assert fields["minute"] == "50"
+    assert fields["day_of_week"] == "mon-fri"
+
+    # 与预判作业是两把独立的锁：预判被跳过不该连带跳过基准（反之亦然）
+    assert sched._bench_sync_lock is not sched._forecast_lock
+
+
+def test_benchmark_symbols_parsed_nonempty():
+    """基准列表必须解析出非空标的。
+
+    配置里一个手滑（写成 '000852'、改成分号、多个逗号）就会让列表为空，
+    而空列表的同步作业是**静默成功**的——日志里只有一行 '(空)'，
+    库却慢慢过期。所以这里把「至少四个基准且在库内有意义」钉住。
+    """
+    syms = sched._benchmark_symbols()
+    assert syms, "基准指数列表解析为空——作业会静默什么都不做"
+    assert all(s.count(".") == 1 for s in syms), f"符号格式应为 CODE.EX: {syms}"
+    assert "000852.SH" in syms, f"缺少中证1000（策略选股的中小盘基准）：{syms}"
+    # 容忍空格 / 空项：' a , ,b ' -> ['a','b']；';;' 这类全空则解析为空列表
+    assert sched._benchmark_symbols(" a , ,b ") == ["a", "b"]
+    assert sched._benchmark_symbols("  ,  , ") == []
 
 
 def test_skip_on_non_trade_date(monkeypatch):

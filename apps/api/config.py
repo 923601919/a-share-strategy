@@ -247,6 +247,14 @@ class Settings(BaseSettings):
     # 预判要写库、要打行情网，不想让它跟着扫描一起上线时用这个开关。
     market_forecast_enabled: bool = True
     market_forecast_symbol: str = "000001.SH"      # 标的（当前只支持上证指数）
+
+    # ===== 基准指数日线同步（分析口径的基础设施）=====
+    # 多基准超额收益分析读的是 market_index_daily。缺一根 bar 不会报错——
+    # 只会让分析脚本的 no_index 计数悄悄涨，最终把「数据没了」伪装成「样本变少了」。
+    # 所以基准必须有自己的作业，不能寄生在预判作业里（预判可关，基准不该跟着关）。
+    benchmark_sync_enabled: bool = True
+    benchmark_sync_symbols: str = "000001.SH,000300.SH,000905.SH,000852.SH"
+    benchmark_sync_days: int = 90  # 回看窗口：作业停过几天也能自动补上
     market_forecast_label: str = "上证指数"         # 展示名（前端/接口原样透出）
     # 起卦盐值：同一天同一标的、改了它 → 卦象就不同。默认与 tianji 对齐，
     # 这样两边对同一日期能摇出同一卦（黄金向量就是靠这个对齐的）。

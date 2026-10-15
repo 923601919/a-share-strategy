@@ -22,7 +22,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -408,6 +408,66 @@ def _make_backfill_job() -> Callable[[], None]:
 # 而当天的记录就永久缺了一条（漏跑看得出来，但代价是样本少一天）。
 _forecast_lock = threading.Lock()
 
+# 基准指数同步锁：同样独立。
+# 与预判作业互不阻塞——两者取的是不同的指数端点，且各自带一段回看窗口，
+# 被跳过一轮不会留下永久空洞（下一轮自然补上）。
+_bench_sync_lock = threading.Lock()
+
+
+def _benchmark_symbols(raw: str | None = None) -> list[str]:
+    """解析基准指数列表（逗号分隔，容忍空格与空项）。
+
+    `raw` 可显式传入以便单测——否则「配置写错 → 列表为空 → 作业静默什么都不做」
+    这条路径没法被钉住。
+    """
+    if raw is None:
+        raw = str(getattr(settings, "benchmark_sync_symbols", "") or "")
+    return [s.strip() for s in str(raw).split(",") if s.strip()]
+
+
+def _make_bench_sync_job() -> Callable[[], None]:
+    """构造基准指数日线同步 job（收盘后，每个交易日一次）。
+
+    为什么单独一个 job，而不是并进 `market_forecast`：
+      · 预判只同步 `market_forecast_symbol` 一个标的。把基准塞进去，
+        会让「关掉预判」连带把基准一起关掉——而基准是**分析**的依赖，不是预判的。
+      · 重复同步 `000001.SH` 是**有意**的（预判作业也同步它）：两边都是 upsert，
+        重复的代价只是一次多余请求，换来的是「基准始终新鲜」不依赖预判是否开启。
+    """
+    def _job() -> None:
+        if not getattr(settings, "benchmark_sync_enabled", True):
+            logger.info("benchmark sync skipped: disabled by config")
+            return
+        if not is_trade_date(datetime.now().date()):
+            logger.info("benchmark sync skipped: not a trade date")
+            return
+        if not _bench_sync_lock.acquire(blocking=False):
+            logger.warning("benchmark sync SKIPPED: previous run still in progress")
+            return
+        try:
+            # 延迟导入：forecast.service 会拉起 db，放在模块顶层会加剧循环依赖
+            from forecast.service import sync_index_daily
+
+            today = datetime.now().date()
+            lookback = int(getattr(settings, "benchmark_sync_days", 90))
+            for sym in _benchmark_symbols():
+                try:
+                    res = sync_index_daily(sym, today - timedelta(days=lookback), today)
+                    logger.info(
+                        "benchmark sync %s: written=%s last=%s",
+                        sym, res.get("written"), res.get("last_date"),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    # 单个基准失败不影响其余：一个取不到不该拖垮全部
+                    logger.warning("benchmark sync FAILED %s: %s", sym, e)
+        except Exception:  # noqa: BLE001
+            logger.exception("benchmark sync FAILED")
+        finally:
+            _bench_sync_lock.release()
+
+    _job.__name__ = "benchmark_sync"
+    return _job
+
 
 def _make_forecast_job() -> Callable[[], None]:
     """构造 15:45 大盘预判作业（结算 + 为下一个交易日起卦）。
@@ -525,6 +585,29 @@ def _build_scheduler() -> BackgroundScheduler:
         logger.info("scheduled job registered: market-forecast @ 15:45 mon-fri")
     else:
         logger.info("market-forecast job NOT registered (MARKET_FORECAST_ENABLED=false)")
+
+    # 15:50 基准指数同步：让分析口径的 000001/000300/000905/000852 保持新鲜。
+    # 排在预判之后：预判是「少一天样本就补不回来」的作业，优先级更高；
+    # 而基准自带回看窗口，晚一轮/漏一轮都能自动补上。
+    if getattr(settings, "benchmark_sync_enabled", True):
+        sched.add_job(
+            _make_bench_sync_job(),
+            trigger=CronTrigger(
+                hour=15,
+                minute=50,
+                day_of_week="mon-fri",
+                timezone=str(settings.scheduler_timezone),
+            ),
+            id="benchmark-sync",
+            name="bench@15:50",
+            replace_existing=True,
+        )
+        logger.info(
+            "scheduled job registered: benchmark-sync @ 15:50 mon-fri (%s)",
+            ",".join(_benchmark_symbols()) or "(空)",
+        )
+    else:
+        logger.info("benchmark-sync job NOT registered (BENCHMARK_SYNC_ENABLED=false)")
 
     return sched
 
