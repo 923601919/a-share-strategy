@@ -164,56 +164,58 @@ export default function ReviewPage() {
 
           <section className="panel">
             <h3 style={{ marginTop: 0 }}>自选当日复盘</h3>
-            <table>
-              <thead>
-                <tr>
-                  <th>代码</th>
-                  <th>名称</th>
-                  <th>入池价</th>
-                  <th>现价</th>
-                  <th>当日相对入池</th>
-                  <th>分时</th>
-                  <th>MA5</th>
-                  <th>异动</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(data.watch_reviews || []).length === 0 ? (
+            <div className="table-scroll">
+              <table>
+                <thead>
                   <tr>
-                    <td colSpan={8} className="muted">
-                      暂无自选，复盘以板块与扫描参考为主。
-                    </td>
+                    <th>代码</th>
+                    <th>名称</th>
+                    <th>入池价</th>
+                    <th>现价</th>
+                    <th>当日相对入池</th>
+                    <th>分时</th>
+                    <th>MA5</th>
+                    <th>异动</th>
                   </tr>
-                ) : (
-                  data.watch_reviews.map((w) => (
-                    <tr key={w.code}>
-                      <td>{w.code}</td>
-                      <td>{w.name}</td>
-                      <td>{w.entry_price ?? "-"}</td>
-                      <td>{w.price ?? "-"}</td>
-                      <td>{fmtPct(w.day_return_pct)}</td>
-                      <td>
-                        {w.fenshi?.pullback && w.fenshi?.reattack
-                          ? "回踩再攻"
-                          : w.fenshi?.score != null
-                            ? `分${w.fenshi.score}`
-                            : "-"}
-                      </td>
-                      <td>{w.daily?.ma5 ?? "-"}</td>
-                      <td>
-                        <span className={`pill ${w.risk?.level || "ok"}`}>
-                          {w.risk?.anomaly_pct ?? w.daily?.pct_from_low ?? "-"}%
-                        </span>
-                        {w.risk?.days_to_regulatory_exit != null &&
-                        w.risk.days_to_regulatory_exit <= 5 ? (
-                          <div className="muted">出监管约{w.risk.days_to_regulatory_exit}日</div>
-                        ) : null}
+                </thead>
+                <tbody>
+                  {(data.watch_reviews || []).length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="muted">
+                        暂无自选，复盘以板块与扫描参考为主。
                       </td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+                  ) : (
+                    data.watch_reviews.map((w) => (
+                      <tr key={w.code}>
+                        <td>{w.code}</td>
+                        <td>{w.name}</td>
+                        <td>{w.entry_price ?? "-"}</td>
+                        <td>{w.price ?? "-"}</td>
+                        <td>{fmtPct(w.day_return_pct)}</td>
+                        <td>
+                          {w.fenshi?.pullback && w.fenshi?.reattack
+                            ? "回踩再攻"
+                            : w.fenshi?.score != null
+                              ? `分${w.fenshi.score}`
+                              : "-"}
+                        </td>
+                        <td>{w.daily?.ma5 ?? "-"}</td>
+                        <td>
+                          <span className={`pill ${w.risk?.level || "ok"}`}>
+                            {w.risk?.anomaly_pct ?? w.daily?.pct_from_low ?? "-"}%
+                          </span>
+                          {w.risk?.days_to_regulatory_exit != null &&
+                          w.risk.days_to_regulatory_exit <= 5 ? (
+                            <div className="muted">出监管约{w.risk.days_to_regulatory_exit}日</div>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
           </section>
 
           <section className="panel">
@@ -240,52 +242,54 @@ export default function ReviewPage() {
                 </button>
               </div>
             </div>
-            <table>
-              <thead>
-                <tr>
-                  <th>方向</th>
-                  <th>标的</th>
-                  <th>条件单</th>
-                  <th>触发条件</th>
-                  <th>参考价</th>
-                  <th>时段</th>
-                  <th>理由</th>
-                </tr>
-              </thead>
-              <tbody>
-                {orders.length === 0 ? (
+            <div className="table-scroll">
+              <table>
+                <thead>
                   <tr>
-                    <td colSpan={7} className="muted">
-                      暂无条件单。先加入自选或先扫描再复盘。
-                    </td>
+                    <th>方向</th>
+                    <th>标的</th>
+                    <th>条件单</th>
+                    <th>触发条件</th>
+                    <th>参考价</th>
+                    <th>时段</th>
+                    <th>理由</th>
                   </tr>
-                ) : (
-                  orders.map((o: ConditionOrder) => (
-                    <tr key={`${o.side}-${o.code}-${o.title}`}>
-                      <td>
-                        <span className={o.side === "buy" ? "good" : "bad"}>
-                          {o.side === "buy" ? "买" : "卖"}
-                        </span>
+                </thead>
+                <tbody>
+                  {orders.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="muted">
+                        暂无条件单。先加入自选或先扫描再复盘。
                       </td>
-                      <td>
-                        {o.name}
-                        <div className="muted">{o.code}</div>
-                      </td>
-                      <td>
-                        {o.title}
-                        {o.playbook === "limit_up_next_day" ? (
-                          <div className="muted">次日铁律</div>
-                        ) : null}
-                      </td>
-                      <td className="muted">{o.trigger}</td>
-                      <td>{o.price_hint ?? "-"}</td>
-                      <td>{o.window ?? "-"}</td>
-                      <td className="muted">{o.reason}</td>
                     </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+                  ) : (
+                    orders.map((o: ConditionOrder) => (
+                      <tr key={`${o.side}-${o.code}-${o.title}`}>
+                        <td>
+                          <span className={o.side === "buy" ? "good" : "bad"}>
+                            {o.side === "buy" ? "买" : "卖"}
+                          </span>
+                        </td>
+                        <td>
+                          {o.name}
+                          <div className="muted">{o.code}</div>
+                        </td>
+                        <td>
+                          {o.title}
+                          {o.playbook === "limit_up_next_day" ? (
+                            <div className="muted">次日铁律</div>
+                          ) : null}
+                        </td>
+                        <td className="muted">{o.trigger}</td>
+                        <td>{o.price_hint ?? "-"}</td>
+                        <td>{o.window ?? "-"}</td>
+                        <td className="muted">{o.reason}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
           </section>
         </>
       )}

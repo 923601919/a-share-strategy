@@ -73,40 +73,56 @@ export default function AppNav() {
     if (authRequired) router.replace("/login");
   }
 
-  return (
-    <nav className="nav">
-      <div className="brand">
-        <span className="brand-mark">分</span>
-        <span>分时雷达</span>
-      </div>
-      {LINKS.map((l) => (
-        <Link key={l.href} href={l.href} className={pathname === l.href ? "active" : undefined}>
-          {l.label}
-        </Link>
-      ))}
-      <div className="nav-right">
-        {user && (
-          <span className="muted" style={{ fontSize: 13 }}>
-            {user.username}
-            {user.role === "admin" ? " · 管理" : ""}
-          </span>
-        )}
-        {user?.role === "admin" && (
-          <button type="button" className="ghost" onClick={onInvite}>
-            邀请码
-          </button>
-        )}
-        {(user || authRequired) && (
-          <button type="button" className="ghost" onClick={onLogout}>
-            退出
-          </button>
-        )}
-      </div>
-      {(inviteCode || inviteErr) && (
-        <p className="muted" style={{ width: "100%", margin: "8px 0 0", fontSize: 13 }}>
-          {inviteCode ? `邀请码（发给朋友一次）：${inviteCode}` : inviteErr}
-        </p>
+  // 品牌与账号操作在手机上要被搬到顶部条、在桌面留在顶栏里，
+  // 所以提成变量渲染两次，避免同一份 JSX 抄两遍后各自跑偏。
+  const brandNode = (
+    <div className="brand">
+      <span className="brand-mark">分</span>
+      <span>分时雷达</span>
+    </div>
+  );
+
+  const navRightNode = (
+    <div className="nav-right">
+      {user && (
+        <span className="muted" style={{ fontSize: 13 }}>
+          {user.username}
+          {user.role === "admin" ? " · 管理" : ""}
+        </span>
       )}
-    </nav>
+      {user?.role === "admin" && (
+        <button type="button" className="ghost" onClick={onInvite}>
+          邀请码
+        </button>
+      )}
+      {(user || authRequired) && (
+        <button type="button" className="ghost" onClick={onLogout}>
+          退出
+        </button>
+      )}
+    </div>
+  );
+
+  return (
+    <>
+      <div className="mobile-topbar">
+        {brandNode}
+        {navRightNode}
+      </div>
+      <nav className="nav">
+        {brandNode}
+        {LINKS.map((l) => (
+          <Link key={l.href} href={l.href} className={pathname === l.href ? "active" : undefined}>
+            {l.label}
+          </Link>
+        ))}
+        {navRightNode}
+        {(inviteCode || inviteErr) && (
+          <p className="nav-note muted" style={{ width: "100%", margin: "8px 0 0", fontSize: 13 }}>
+            {inviteCode ? `邀请码（发给朋友一次）：${inviteCode}` : inviteErr}
+          </p>
+        )}
+      </nav>
+    </>
   );
 }

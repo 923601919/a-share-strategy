@@ -273,22 +273,24 @@ export default function MarketForecastPage() {
             <div className="grid-2" style={{ marginTop: 14 }}>
               <div>
                 <h4 style={{ margin: "0 0 6px" }}>相对「随机方向」的检验</h4>
-                <table>
-                  <tbody>
-                    <tr>
-                      <td className="muted">单尾二项检验 p 值</td>
-                      <td className="num">{acc.p_value.toFixed(4)}</td>
-                    </tr>
-                    <tr>
-                      <td className="muted">是否显著（p &lt; 0.05 且 ≥ 门槛）</td>
-                      <td>{acc.significant ? <span className="up">是</span> : <span className="muted">否</span>}</td>
-                    </tr>
-                    <tr>
-                      <td className="muted">「永远猜跌」基线</td>
-                      <td className="num">{ratio(acc.baselines.always_down)}</td>
-                    </tr>
-                  </tbody>
-                </table>
+                <div className="table-scroll">
+                  <table>
+                    <tbody>
+                      <tr>
+                        <td className="muted">单尾二项检验 p 值</td>
+                        <td className="num">{acc.p_value.toFixed(4)}</td>
+                      </tr>
+                      <tr>
+                        <td className="muted">是否显著（p &lt; 0.05 且 ≥ 门槛）</td>
+                        <td>{acc.significant ? <span className="up">是</span> : <span className="muted">否</span>}</td>
+                      </tr>
+                      <tr>
+                        <td className="muted">「永远猜跌」基线</td>
+                        <td className="num">{ratio(acc.baselines.always_down)}</td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
                 <p className="muted-sm" style={{ marginTop: 8 }}>
                   这里的零假设是「相对随机 50%」。指数长期有上行倾向，所以这个检验通过
                   <strong>不能</strong>说明有预测能力 —— 要看下面那个。
@@ -299,29 +301,31 @@ export default function MarketForecastPage() {
                 <h4 style={{ margin: "0 0 6px" }}>偏置匹配置换检验</h4>
                 {perm ? (
                   <>
-                    <table>
-                      <tbody>
-                        <tr>
-                          <td className="muted">观测命中率</td>
-                          <td className="num">{ratio(perm.observed_rate)}</td>
-                        </tr>
-                        <tr>
-                          <td className="muted">零分布均值（保持涨跌偏好随机重排）</td>
-                          <td className="num">{ratio(perm.null_mean)}</td>
-                        </tr>
-                        <tr>
-                          <td className="muted">超出零分布</td>
-                          <td className="num">{(perm.edge * 100).toFixed(1)} pp</td>
-                        </tr>
-                        <tr>
-                          <td className="muted">p 值（{perm.iterations} 次重排）</td>
-                          <td className="num">
-                            {perm.p_value.toFixed(4)}{" "}
-                            {perm.p_value < 0.05 ? <span className="up">显著</span> : <span className="muted">不显著</span>}
-                          </td>
-                        </tr>
-                      </tbody>
-                    </table>
+                    <div className="table-scroll">
+                      <table>
+                        <tbody>
+                          <tr>
+                            <td className="muted">观测命中率</td>
+                            <td className="num">{ratio(perm.observed_rate)}</td>
+                          </tr>
+                          <tr>
+                            <td className="muted">零分布均值（保持涨跌偏好随机重排）</td>
+                            <td className="num">{ratio(perm.null_mean)}</td>
+                          </tr>
+                          <tr>
+                            <td className="muted">超出零分布</td>
+                            <td className="num">{(perm.edge * 100).toFixed(1)} pp</td>
+                          </tr>
+                          <tr>
+                            <td className="muted">p 值（{perm.iterations} 次重排）</td>
+                            <td className="num">
+                              {perm.p_value.toFixed(4)}{" "}
+                              {perm.p_value < 0.05 ? <span className="up">显著</span> : <span className="muted">不显著</span>}
+                            </td>
+                          </tr>
+                        </tbody>
+                      </table>
+                    </div>
                     <p className="muted-sm" style={{ marginTop: 8 }}>
                       这个检验的零假设是「预测与结果相互独立，但模型保持自己的涨跌偏好」。
                       只有观测命中率明显超出零分布，才能说明预测本身带了信息。

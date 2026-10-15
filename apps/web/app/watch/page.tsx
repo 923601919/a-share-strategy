@@ -270,119 +270,123 @@ export default function WatchPage() {
 
       {tab === "active" ? (
         <section className="panel">
-          <table>
-            <thead>
-              <tr>
-                <th>代码</th>
-                <th>名称</th>
-                <th>入池价</th>
-                <th>现价</th>
-                <th>入池分</th>
-                <th>T+0</th>
-                <th>T+1</th>
-                <th>T+2</th>
-                <th>T+3</th>
-                <th>异动</th>
-                <th>备注</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              {items.length === 0 ? (
+          <div className="table-scroll">
+            <table>
+              <thead>
                 <tr>
-                  <td colSpan={12} className="muted">
-                    {loading ? "加载中…" : "暂无自选。去选股页扫描后加入。"}
-                  </td>
+                  <th>代码</th>
+                  <th>名称</th>
+                  <th>入池价</th>
+                  <th>现价</th>
+                  <th>入池分</th>
+                  <th>T+0</th>
+                  <th>T+1</th>
+                  <th>T+2</th>
+                  <th>T+3</th>
+                  <th>异动</th>
+                  <th>备注</th>
+                  <th></th>
                 </tr>
-              ) : (
-                items.map((it) => {
-                  const risk = it.quote?.risk;
-                  const tr = it.track;
-                  return (
-                    <tr key={it.code}>
-                      <td>{it.code}</td>
-                      <td>{it.name}</td>
-                      <td>{tr?.entry_price ?? it.entry_price ?? "-"}</td>
-                      <td>{it.quote?.price ? it.quote.price : "-"}</td>
-                      <td>{tr?.entry_score ?? it.entry_score ?? "-"}</td>
-                      <td>{fmtRet(tr?.t0?.return_pct)}</td>
-                      <td>{fmtRet(tr?.t1?.return_pct)}</td>
-                      <td>{fmtRet(tr?.t2?.return_pct)}</td>
-                      <td>{fmtRet(tr?.t3?.return_pct)}</td>
-                      <td>
-                        <span className={`pill ${risk?.level || "ok"}`}>
-                          {risk?.anomaly_pct ?? "-"}%
-                        </span>
-                      </td>
-                      <td className="muted" style={{ maxWidth: 200 }}>
-                        {it.note || "-"}
-                        <div className="muted" style={{ fontSize: 12 }}>
-                          {fmtTime(it.created_at)}
-                        </div>
-                      </td>
-                      <td>
-                        <button className="secondary" onClick={() => onRemove(it.code)} disabled={busy}>
-                          移除
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {items.length === 0 ? (
+                  <tr>
+                    <td colSpan={12} className="muted">
+                      {loading ? "加载中…" : "暂无自选。去选股页扫描后加入。"}
+                    </td>
+                  </tr>
+                ) : (
+                  items.map((it) => {
+                    const risk = it.quote?.risk;
+                    const tr = it.track;
+                    return (
+                      <tr key={it.code}>
+                        <td>{it.code}</td>
+                        <td>{it.name}</td>
+                        <td>{tr?.entry_price ?? it.entry_price ?? "-"}</td>
+                        <td>{it.quote?.price ? it.quote.price : "-"}</td>
+                        <td>{tr?.entry_score ?? it.entry_score ?? "-"}</td>
+                        <td>{fmtRet(tr?.t0?.return_pct)}</td>
+                        <td>{fmtRet(tr?.t1?.return_pct)}</td>
+                        <td>{fmtRet(tr?.t2?.return_pct)}</td>
+                        <td>{fmtRet(tr?.t3?.return_pct)}</td>
+                        <td>
+                          <span className={`pill ${risk?.level || "ok"}`}>
+                            {risk?.anomaly_pct ?? "-"}%
+                          </span>
+                        </td>
+                        <td className="muted" style={{ maxWidth: 200 }}>
+                          {it.note || "-"}
+                          <div className="muted" style={{ fontSize: 12 }}>
+                            {fmtTime(it.created_at)}
+                          </div>
+                        </td>
+                        <td>
+                          <button className="secondary" onClick={() => onRemove(it.code)} disabled={busy}>
+                            移除
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
         </section>
       ) : (
         <section className="panel">
-          <table>
-            <thead>
-              <tr>
-                <th>代码</th>
-                <th>名称</th>
-                <th>来源</th>
-                <th>入池价</th>
-                <th>入池分</th>
-                <th>T+0</th>
-                <th>T+1</th>
-                <th>T+2</th>
-                <th>T+3</th>
-                <th>退出收益</th>
-                <th>结束原因</th>
-                <th>入池/归档</th>
-              </tr>
-            </thead>
-            <tbody>
-              {archived.length === 0 ? (
+          <div className="table-scroll">
+            <table>
+              <thead>
                 <tr>
-                  <td colSpan={12} className="muted">
-                    {historyLoading
-                      ? "加载履历中…"
-                      : "暂无履历。手动移除或超过 T+3 自动归档后会出现在这里。"}
-                  </td>
+                  <th>代码</th>
+                  <th>名称</th>
+                  <th>来源</th>
+                  <th>入池价</th>
+                  <th>入池分</th>
+                  <th>T+0</th>
+                  <th>T+1</th>
+                  <th>T+2</th>
+                  <th>T+3</th>
+                  <th>退出收益</th>
+                  <th>结束原因</th>
+                  <th>入池/归档</th>
                 </tr>
-              ) : (
-                archived.map((it) => (
-                  <tr key={it.id}>
-                    <td>{it.code}</td>
-                    <td>{it.name}</td>
-                    <td className="muted">{sourceLabel(it.source)}</td>
-                    <td>{it.entry_price ?? "-"}</td>
-                    <td>{it.entry_score ?? "-"}</td>
-                    <td>{fmtRet(retAt(it, 0))}</td>
-                    <td>{fmtRet(retAt(it, 1))}</td>
-                    <td>{fmtRet(retAt(it, 2))}</td>
-                    <td>{fmtRet(it.t3_return_pct ?? retAt(it, 3))}</td>
-                    <td>{fmtRet(it.exit_return_pct)}</td>
-                    <td>{reasonLabel(it.completion_reason)}</td>
-                    <td className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>
-                      <div>{fmtTime(it.created_at)}</div>
-                      <div>→ {fmtTime(it.removed_at)}</div>
+              </thead>
+              <tbody>
+                {archived.length === 0 ? (
+                  <tr>
+                    <td colSpan={12} className="muted">
+                      {historyLoading
+                        ? "加载履历中…"
+                        : "暂无履历。手动移除或超过 T+3 自动归档后会出现在这里。"}
                     </td>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+                ) : (
+                  archived.map((it) => (
+                    <tr key={it.id}>
+                      <td>{it.code}</td>
+                      <td>{it.name}</td>
+                      <td className="muted">{sourceLabel(it.source)}</td>
+                      <td>{it.entry_price ?? "-"}</td>
+                      <td>{it.entry_score ?? "-"}</td>
+                      <td>{fmtRet(retAt(it, 0))}</td>
+                      <td>{fmtRet(retAt(it, 1))}</td>
+                      <td>{fmtRet(retAt(it, 2))}</td>
+                      <td>{fmtRet(it.t3_return_pct ?? retAt(it, 3))}</td>
+                      <td>{fmtRet(it.exit_return_pct)}</td>
+                      <td>{reasonLabel(it.completion_reason)}</td>
+                      <td className="muted" style={{ fontSize: 12, whiteSpace: "nowrap" }}>
+                        <div>{fmtTime(it.created_at)}</div>
+                        <div>→ {fmtTime(it.removed_at)}</div>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </section>
       )}
     </>

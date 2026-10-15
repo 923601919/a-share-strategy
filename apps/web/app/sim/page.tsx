@@ -154,161 +154,167 @@ export default function SimPage() {
 
       <section className="panel">
         <h2 style={{ marginTop: 0, fontSize: 16 }}>持仓</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>代码</th>
-              <th>名称</th>
-              <th>来源</th>
-              <th>股数</th>
-              <th>成本</th>
-              <th>现价</th>
-              <th>浮盈</th>
-              <th>止盈价</th>
-              <th>止损价</th>
-              <th>市值</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {(data?.positions || []).length === 0 ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
               <tr>
-                <td colSpan={11} className="muted">
-                  暂无持仓。在选股页点「自选」会自动按约 20% 仓位开仓。
-                </td>
+                <th>代码</th>
+                <th>名称</th>
+                <th>来源</th>
+                <th>股数</th>
+                <th>成本</th>
+                <th>现价</th>
+                <th>浮盈</th>
+                <th>止盈价</th>
+                <th>止损价</th>
+                <th>市值</th>
+                <th></th>
               </tr>
-            ) : (
-              (data?.positions || []).map((p) => (
-                <tr key={p.id}>
-                  <td>{p.code}</td>
-                  <td>{p.name}</td>
-                  <td className="muted">
-                    {sourceLabel(p.source)}
-                    {p.take_profit_pct != null ? ` +${p.take_profit_pct}%` : ""}
-                  </td>
-                  <td>{p.shares}</td>
-                  <td>{p.cost_price}</td>
-                  <td>{p.quote_price ?? "-"}</td>
-                  <td>
-                    {fmtPnl(p.unrealized_pnl)} {fmtPct(p.unrealized_pct)}
-                  </td>
-                  <td className="up">{p.take_profit_price ?? "-"}</td>
-                  <td className="down">{p.stop_loss_price ?? "-"}</td>
-                  <td>{fmtMoney(p.market_value)}</td>
-                  <td>
-                    {p.t1_sellable === false ? (
-                      <span className="muted" title={p.t1_lock_reason || "T+1"}>
-                        T+1锁定
-                      </span>
-                    ) : (
-                      <button className="secondary" onClick={() => onSell(p.id)}>
-                        卖出
-                      </button>
-                    )}
+            </thead>
+            <tbody>
+              {(data?.positions || []).length === 0 ? (
+                <tr>
+                  <td colSpan={11} className="muted">
+                    暂无持仓。在选股页点「自选」会自动按约 20% 仓位开仓。
                   </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ) : (
+                (data?.positions || []).map((p) => (
+                  <tr key={p.id}>
+                    <td>{p.code}</td>
+                    <td>{p.name}</td>
+                    <td className="muted">
+                      {sourceLabel(p.source)}
+                      {p.take_profit_pct != null ? ` +${p.take_profit_pct}%` : ""}
+                    </td>
+                    <td>{p.shares}</td>
+                    <td>{p.cost_price}</td>
+                    <td>{p.quote_price ?? "-"}</td>
+                    <td>
+                      {fmtPnl(p.unrealized_pnl)} {fmtPct(p.unrealized_pct)}
+                    </td>
+                    <td className="up">{p.take_profit_price ?? "-"}</td>
+                    <td className="down">{p.stop_loss_price ?? "-"}</td>
+                    <td>{fmtMoney(p.market_value)}</td>
+                    <td>
+                      {p.t1_sellable === false ? (
+                        <span className="muted" title={p.t1_lock_reason || "T+1"}>
+                          T+1锁定
+                        </span>
+                      ) : (
+                        <button className="secondary" onClick={() => onSell(p.id)}>
+                          卖出
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="panel">
         <h2 style={{ marginTop: 0, fontSize: 16 }}>活跃条件单</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>类型</th>
-              <th>代码</th>
-              <th>触发价</th>
-              <th>幅度</th>
-              <th>说明</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(data?.orders || []).length === 0 ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
               <tr>
-                <td colSpan={5} className="muted">
-                  暂无活跃条件单
-                </td>
+                <th>类型</th>
+                <th>代码</th>
+                <th>触发价</th>
+                <th>幅度</th>
+                <th>说明</th>
               </tr>
-            ) : (
-              (data?.orders || []).map((o) => (
-                <tr key={o.id}>
-                  <td>
-                    <span className={o.order_type === "take_profit" ? "up" : "down"}>
-                      {o.order_type === "take_profit" ? "止盈" : "止损"}
-                    </span>
+            </thead>
+            <tbody>
+              {(data?.orders || []).length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="muted">
+                    暂无活跃条件单
                   </td>
-                  <td>
-                    {o.name}
-                    <div className="muted">{o.code}</div>
-                  </td>
-                  <td>{o.trigger_price}</td>
-                  <td>
-                    {o.trigger_pct != null
-                      ? `${o.order_type === "take_profit" ? "+" : "-"}${Math.abs(Number(o.trigger_pct))}%`
-                      : "-"}
-                  </td>
-                  <td className="muted">{o.reason}</td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ) : (
+                (data?.orders || []).map((o) => (
+                  <tr key={o.id}>
+                    <td>
+                      <span className={o.order_type === "take_profit" ? "up" : "down"}>
+                        {o.order_type === "take_profit" ? "止盈" : "止损"}
+                      </span>
+                    </td>
+                    <td>
+                      {o.name}
+                      <div className="muted">{o.code}</div>
+                    </td>
+                    <td>{o.trigger_price}</td>
+                    <td>
+                      {o.trigger_pct != null
+                        ? `${o.order_type === "take_profit" ? "+" : "-"}${Math.abs(Number(o.trigger_pct))}%`
+                        : "-"}
+                    </td>
+                    <td className="muted">{o.reason}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
 
       <section className="panel">
         <h2 style={{ marginTop: 0, fontSize: 16 }}>交易记录</h2>
-        <table>
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>方向</th>
-              <th>代码</th>
-              <th>股数</th>
-              <th>价格</th>
-              <th>金额</th>
-              <th>盈亏</th>
-              <th>原因</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(data?.trades || []).length === 0 ? (
+        <div className="table-scroll">
+          <table>
+            <thead>
               <tr>
-                <td colSpan={8} className="muted">
-                  暂无成交
-                </td>
+                <th>时间</th>
+                <th>方向</th>
+                <th>代码</th>
+                <th>股数</th>
+                <th>价格</th>
+                <th>金额</th>
+                <th>盈亏</th>
+                <th>原因</th>
               </tr>
-            ) : (
-              (data?.trades || []).map((t) => (
-                <tr key={t.id}>
-                  <td className="muted">{String(t.traded_at).replace("T", " ").slice(0, 19)}</td>
-                  <td className={t.side === "buy" ? "up" : "down"}>
-                    {t.side === "buy" ? "买" : "卖"}
+            </thead>
+            <tbody>
+              {(data?.trades || []).length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="muted">
+                    暂无成交
                   </td>
-                  <td>
-                    {t.name}
-                    <div className="muted">{t.code}</div>
-                  </td>
-                  <td>{t.shares}</td>
-                  <td>{t.price}</td>
-                  <td>{fmtMoney(t.amount)}</td>
-                  <td>
-                    {t.side === "sell" ? (
-                      <>
-                        {fmtPnl(t.pnl)} {fmtPct(t.pnl_pct)}
-                      </>
-                    ) : (
-                      "-"
-                    )}
-                  </td>
-                  <td className="muted">{t.reason}</td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              ) : (
+                (data?.trades || []).map((t) => (
+                  <tr key={t.id}>
+                    <td className="muted">{String(t.traded_at).replace("T", " ").slice(0, 19)}</td>
+                    <td className={t.side === "buy" ? "up" : "down"}>
+                      {t.side === "buy" ? "买" : "卖"}
+                    </td>
+                    <td>
+                      {t.name}
+                      <div className="muted">{t.code}</div>
+                    </td>
+                    <td>{t.shares}</td>
+                    <td>{t.price}</td>
+                    <td>{fmtMoney(t.amount)}</td>
+                    <td>
+                      {t.side === "sell" ? (
+                        <>
+                          {fmtPnl(t.pnl)} {fmtPct(t.pnl_pct)}
+                        </>
+                      ) : (
+                        "-"
+                      )}
+                    </td>
+                    <td className="muted">{t.reason}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </section>
     </>
   );

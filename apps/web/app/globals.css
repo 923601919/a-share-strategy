@@ -162,7 +162,9 @@ main {
 .panel-head .panel-sub { margin: 2px 0 0; }
 
 /* ============== 通用行/网格 ============== */
-.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+/* align-items 用 flex-end 而不是 end：后者 Safari 15.4 之前的移动端不认，
+   会退化成 stretch（按钮被拉高对不齐）——手机适配场景必须用老写法 */
+.row { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
 
 .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
 .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
@@ -170,6 +172,8 @@ main {
 @media (max-width: 900px) {
   .grid-4 { grid-template-columns: repeat(2, 1fr); }
   .grid-3, .grid-2 { grid-template-columns: 1fr; }
+  /* 标题与右侧操作分栏时改上下堆叠，否则窄屏下互挤 */
+  .panel-head { flex-direction: column; align-items: flex-start; gap: 4px; }
 }
 
 label {
@@ -265,11 +269,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .tabs > button:disabled { opacity: 0.5; }
 
 /* ============== 表格 ============== */
+/* 窄屏靠横向滚动兜底：任何列数都不许把页面撑破。
+   .table-wrap 带外框（原有约定，勿改桌面视觉）；.table-scroll 只是滚动壳，
+   给那些本来就直接躺在 .panel 里的裸表格用，避免多出一层边框。 */
 .table-wrap {
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: #fff;
-  overflow: hidden;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-variant-numeric: tabular-nums; }
@@ -502,3 +514,130 @@ tbody tr.row-top { background: transparent; }                /* 取消整行高�
 .mb-8 { margin-bottom: 8px; }
 .mb-12 { margin-bottom: 12px; }
 .mb-16 { margin-bottom: 16px; }
+
+/* =========================================================
+   手机端（≤ 640px）
+   三件事：顶栏改底部 tab / 表格横向滚动 / 触控与输入尺寸
+   桌面端完全不进入这一区，视觉零变化
+   ========================================================= */
+
+/* 顶部精简条 —— 只在手机显示，承载品牌与账号操作（底部栏放不下） */
+.mobile-topbar { display: none; }
+
+@media (max-width: 640px) {
+  html, body {
+    font-size: 14px;        /* 13px 在手机屏上偏小 */
+    overflow-x: hidden;     /* 兜底：漏网元素不许把整页左右晃 */
+  }
+
+  main {
+    padding: 10px 12px calc(56px + env(safe-area-inset-bottom));
+  }
+
+  /* ---------- 顶栏 → 底部 tab ---------- */
+  .nav {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: auto;
+    margin: 0;
+    border: none;
+    border-top: 1px solid var(--line);
+    border-radius: 0;
+    padding: 4px 4px calc(4px + env(safe-area-inset-bottom));
+    z-index: 50;
+  }
+  .nav .brand,
+  .nav .nav-right { display: none; }
+  .nav a {
+    flex: 1 1 0;
+    min-width: 0;
+    text-align: center;
+    padding: 8px 2px;
+    font-size: 12px;
+    line-height: 1.25;
+    white-space: nowrap;
+  }
+  /* 邀请码这类临时信息改浮在底部栏上方 */
+  .nav-note {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    bottom: calc(58px + env(safe-area-inset-bottom));
+    margin: 0;
+    padding: 8px 10px;
+    background: var(--bg-elev);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    z-index: 51;
+    word-break: break-all;
+  }
+
+  /* ---------- 顶部精简条 ---------- */
+  .mobile-topbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: -10px -12px 10px;
+    padding: 8px 12px;
+    background: var(--bg-elev);
+    border-bottom: 1px solid var(--line);
+  }
+  .mobile-topbar .brand { padding: 0; margin-right: auto; }
+  .mobile-topbar .nav-right .muted {
+    max-width: 84px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* ---------- 卡片与留白 ---------- */
+  .panel { padding: 12px; margin-bottom: 10px; }
+  .row { gap: 8px; }
+
+  /* ---------- 表格兜底 ----------
+     720px 是按最宽那张表（跟踪页 13 列）估的可读下限。
+     列少的表内容撑不到 720 会被填满，也不算坏；压到 375 才是灾难。 */
+  .table-wrap,
+  .table-scroll { max-width: 100%; }
+  .table-wrap > table,
+  .table-scroll > table { min-width: 720px; }
+  th, td { padding: 0 8px; }
+
+  /* ---------- 触控目标不小于 ~38px ---------- */
+  button { padding: 9px 14px; }
+  button.ghost { padding: 8px 10px; }
+  .tabs > button { padding: 7px 12px; }
+
+  /* ---------- 输入框若小于 16px，iOS 会放大整页 ---------- */
+  input, select {
+    font-size: 16px;
+    padding: 8px 10px;
+    min-width: 0;
+    max-width: 100%;
+  }
+  label { font-size: 13px; }
+  /* .row 里的 label 会拿输入控件的固有宽度当最小尺寸，一行放不下两个控件
+     （CDP 实测溢出到 467px）—— 放开收缩并给一个换行基准 */
+  .row > label { min-width: 0; flex: 1 1 44%; }
+
+  /* ---------- 分段控件超屏宽时横向滚动 ---------- */
+  .tabs {
+    display: flex;
+    width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  .tabs > button { flex: 0 0 auto; }
+
+  /* grid 的 1fr 轨道下限是 min-content，会被 input 固有宽（约 216px）撑爆
+     （CDP 实测首页溢出到 467px）—— 手机上必须把下限压到 0 */
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-3, .grid-2 { grid-template-columns: minmax(0, 1fr); }
+
+  /* ---------- 数字卡分档 ---------- */
+  .kpi-value { font-size: 18px; }
+  .bar { min-width: 48px; }
+  .footer-note { margin-top: 12px; }
+}
