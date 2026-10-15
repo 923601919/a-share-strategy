@@ -132,6 +132,27 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_scan_candidates_created
                 ON scan_candidates(user_id, created_at);
 
+            -- 候选的 T+N 收益：消融回测的另一半。
+            -- scan_candidates 只记「当时看到了什么」，不记「那票后来涨没涨」；
+            -- 没有这张表，反事实重排只能回答「谁进谁出」，答不了「换进来的票赚不赚」。
+            -- 基准刻意用**入池日收盘**（close-to-close），不是盘中入池价：
+            -- 未入池的候选从来没有盘中价，只有收盘价两边都能取到，
+            -- 入选/落选两臂才可比。（入选臂的盘中价→T+3 另有 exit_return_pct）
+            CREATE TABLE IF NOT EXISTS scan_candidate_returns (
+                candidate_id INTEGER NOT NULL,
+                day_offset INTEGER NOT NULL,
+                trade_date TEXT NOT NULL,
+                base_date TEXT NOT NULL,
+                base_close REAL,
+                close_price REAL,
+                return_pct REAL,
+                recorded_at TEXT NOT NULL,
+                PRIMARY KEY (candidate_id, day_offset)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_scan_candidate_returns_cand
+                ON scan_candidate_returns(candidate_id);
+
             CREATE TABLE IF NOT EXISTS watch_tracks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code TEXT NOT NULL,
@@ -1112,6 +1133,130 @@ def list_scan_candidates(
     with get_db() as conn:
         rows = conn.execute(sql, args).fetchall()
     return [dict(r) for r in rows]
+
+
+def list_pending_candidate_returns(
+    *,
+    today: str,
+    lookback_days: int = 10,
+    offset: int = 3,
+    limit: int = 5000,
+) -> list[dict[str, Any]]:
+    """还没结清的候选（跨用户，供收盘后作业用）。
+
+    「结清」的判据不是「有没有 offset 行」，而是 **offset 行有没有落在已收盘的交易日上**
+    （`trade_date < today`）。15:30 跑时当天的 bar 还没定稿，写进去的收盘价是临时的；
+    只认严格早于今天的 bar，才能保证落库的值是终值、不需要事后修订。
+    """
+    cutoff = (
+        datetime.now(timezone.utc).astimezone() - timedelta(days=max(1, int(lookback_days)))
+    ).isoformat()
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT c.id, c.code, c.user_id, c.created_at, date(c.created_at) AS base_date
+            FROM scan_candidates c
+            WHERE c.created_at >= ?
+              AND c.code IS NOT NULL AND c.code <> ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM scan_candidate_returns r
+                  WHERE r.candidate_id = c.id
+                    AND r.day_offset = ?
+                    AND r.trade_date < ?
+              )
+            ORDER BY c.id
+            LIMIT ?
+            """,
+            (cutoff, int(offset), today, int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def upsert_candidate_returns(candidate_id: int, rows: list[dict[str, Any]]) -> None:
+    """写候选收益（同 (candidate, offset) 覆盖写）。
+
+    这里**允许覆盖**，与 `scan_candidates` 的只增不改不同：覆盖写是对的，
+    因为我们只写「已收盘交易日的收盘价」——同一个 offset 多次写入应当在写同一个值；
+    若不同，说明当日 bar 修正过，跟着改才是对的。
+    """
+    if not rows:
+        return
+    now = datetime.now(timezone.utc).astimezone().isoformat()
+    with get_db() as conn:
+        for r in rows:
+            conn.execute(
+                """
+                INSERT INTO scan_candidate_returns(
+                    candidate_id, day_offset, trade_date, base_date,
+                    base_close, close_price, return_pct, recorded_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(candidate_id, day_offset) DO UPDATE SET
+                    trade_date=excluded.trade_date,
+                    base_date=excluded.base_date,
+                    base_close=excluded.base_close,
+                    close_price=excluded.close_price,
+                    return_pct=excluded.return_pct,
+                    recorded_at=excluded.recorded_at
+                """,
+                (
+                    int(candidate_id),
+                    int(r["day_offset"]),
+                    str(r["trade_date"]),
+                    str(r["base_date"]),
+                    float(r.get("base_close") or 0),
+                    float(r.get("close_price") or 0),
+                    float(r.get("return_pct") or 0),
+                    now,
+                ),
+            )
+
+
+def get_candidate_returns(candidate_id: int) -> list[dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT day_offset, trade_date, base_date, base_close, close_price,
+                   return_pct, recorded_at
+            FROM scan_candidate_returns WHERE candidate_id=? ORDER BY day_offset
+            """,
+            (int(candidate_id),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_candidate_returns_map(ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+    """批量读取（分析脚本用，避免逐候选开连接）。"""
+    if not ids:
+        return {}
+    uniq = sorted({int(i) for i in ids if i})
+    out: dict[int, list[dict[str, Any]]] = {i: [] for i in uniq}
+    placeholders = ",".join("?" for _ in uniq)
+    with get_db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT candidate_id, day_offset, trade_date, base_date, base_close,
+                   close_price, return_pct, recorded_at
+            FROM scan_candidate_returns
+            WHERE candidate_id IN ({placeholders})
+            ORDER BY candidate_id, day_offset
+            """,
+            uniq,
+        ).fetchall()
+    for r in rows:
+        out[int(r["candidate_id"])].append(dict(r))
+    return out
+
+
+def purge_orphan_candidate_returns() -> int:
+    """清掉候选已被保留窗口裁掉、只剩孤儿的收益行（返回删除条数）。"""
+    with get_db() as conn:
+        cur = conn.execute(
+            """
+            DELETE FROM scan_candidate_returns
+            WHERE candidate_id NOT IN (SELECT id FROM scan_candidates)
+            """
+        )
+        return int(cur.rowcount or 0)
 
 
 def save_daily_review(trade_date: str, payload_json: str) -> dict[str, Any]:

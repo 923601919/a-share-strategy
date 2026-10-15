@@ -235,6 +235,12 @@ class Settings(BaseSettings):
     # 因为被惩罚挡在 top-N 外的票不在任何别的地方留痕。
     scan_candidate_log: bool = True
     scan_candidate_keep_days: int = 180  # 逐候选表按天裁（条数增长比 scan_quality 快一个量级）
+    # 候选收益回填（消融回测的另一半：谁来都答不了「换进来的票赚不赚」，
+    # 除非给未入池的候选也补上 T+N）。
+    scan_candidate_returns: bool = True
+    scan_candidate_return_days: int = 3   # 算到 T+N（与 watch_tracks 的 auto_t3 对齐）
+    scan_candidate_return_lookback_days: int = 10  # 只回看这么久内的候选，避免每天重拉全历史
+    scan_candidate_return_max_codes: int = 600     # 单轮回填的 (code, 基准日) 组数上限，防打爆网络
     spot_cache_ttl: float = 45.0
     universe_cache_ttl: float = 90.0
     enrich_timeout_seconds: float = 120.0  # enrich 阶段整体预算，超时未完成的候选直接跳过

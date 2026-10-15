@@ -389,10 +389,18 @@ def _make_backfill_job() -> Callable[[], None]:
             return
         try:
             # 延迟导入避免循环依赖
-            from services.track import backfill_all_watchlist_returns
+            from services.track import backfill_all_watchlist_returns, backfill_candidate_returns
 
             result = backfill_all_watchlist_returns()
             logger.info("returns backfill done: %s", result)
+
+            # 候选收益与自选收益是两件事，但共用同一次收盘后窗口（都要拉日线）。
+            # 刻意分成两个 try：候选表坏了不该让自选收益回填跟着失败（反之亦然）。
+            try:
+                cand = backfill_candidate_returns()
+                logger.info("candidate returns backfill done: %s", cand)
+            except Exception:  # noqa: BLE001
+                logger.exception("candidate returns backfill FAILED")
         except Exception:  # noqa: BLE001
             logger.exception("returns backfill FAILED")
         finally:

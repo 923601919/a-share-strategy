@@ -185,6 +185,161 @@ def compute_short_term_returns(
     return rows
 
 
+def compute_candidate_returns(
+    *,
+    code: str,
+    base_date: str,
+    max_days: int = 3,
+    today: str | None = None,
+    no_cache: bool = True,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """候选的 T+0..T+N 收益（**收盘对收盘**），返回 (rows, skip_reason)。
+
+    与 `compute_short_term_returns` 的区别是我要把「入池价」换成「入池日收盘价」：
+    未入池的候选根本没有盘中价，只有收盘价两边都取得到，入选/落选两臂才可比。
+
+    两条刻意的限定 —— 它们是为「落库的值必须是终值」服务的：
+
+    1. **只用严格早于 `today` 的 bar。** 15:30 跑时当天的日线还没定稿
+       （实测新浪到 16:49 才发），把当天的收盘价写进库就是把临时值当终值。
+       于是每个 offset 都只在其对应交易日**收盘之后**才首次落库。
+    2. **基准日必须精确命中。** 若入池日的 bar 还没出现，绝不能退而用
+       「第一个 ≥ base_date 的 bar」——那会把基准整体后移一天，静默算成另一个东西。
+       命中不了就返回 `base_missing`，是「没拿到」不是「没有」。
+
+    `skip_reason`：`None`（算出来了）/ `no_daily`（根本没拿到日线）/
+    `no_base_bar`（入池日 bar 未定稿或缺失）/ `bad_base`（基准收盘价非正）。
+    """
+    today = today or _today_iso()
+    daily = _daily_bars(str(code).zfill(6), limit=60, no_cache=no_cache)
+    if daily.empty:
+        return [], "no_daily"
+
+    bars = daily[daily["date"] < today]
+    dates = bars["date"].tolist()
+    if base_date not in dates:
+        return [], "no_base_bar"
+
+    i = dates.index(base_date)
+    base_close = float(bars.iloc[i].get("close") or 0)
+    if base_close <= 0:
+        return [], "bad_base"
+
+    rows: list[dict[str, Any]] = []
+    for offset in range(max(int(max_days), 0) + 1):
+        j = i + offset
+        if j >= len(dates):
+            break
+        bar = bars.iloc[j]
+        close = float(bar.get("close") or 0)
+        trade_date = str(bar.get("date") or "")
+        if close <= 0 or not trade_date:
+            continue
+        # offset 0 的收益按构造恒等于 0（同一个值相除）。这不是巧合而是口径自检点：
+        # 一旦不为 0，说明基准和后移/取错了 bar。
+        ret = (close / base_close - 1.0) * 100
+        rows.append(
+            {
+                "day_offset": offset,
+                "trade_date": trade_date,
+                "base_date": base_date,
+                "base_close": round(base_close, 3),
+                "close_price": round(close, 3),
+                "return_pct": round(ret, 2),
+            }
+        )
+    return rows, None
+
+
+def backfill_candidate_returns(
+    *,
+    max_days: int | None = None,
+    today: str | None = None,
+    on_progress: ProgressCb | None = None,
+) -> dict[str, Any]:
+    """收盘后回填候选收益：给 `scan_candidates` 里的票补 T+0..T+N（close-to-close）。
+
+    这是消融回测的另一半。`scan_candidates` 记下了「当时看到了什么」，
+    但没记「那票后来涨没涨」——没有这一半，反事实重排只能回答「谁进谁出」，
+    答不了唯一要紧的问题：**换进来的票赚不赚**。
+
+    为什么按 (code, 基准日) 归组：同一代码同一天会有多轮候选（09:45/10:40/…），
+    它们共用同一条日线与同一个基准，不该拉 N 次。
+    """
+    from db import (
+        list_pending_candidate_returns,
+        purge_orphan_candidate_returns,
+        upsert_candidate_returns,
+    )
+
+    summary: dict[str, Any] = {
+        "pending": 0, "groups": 0, "codes": 0, "written": 0,
+        "settled": 0, "partial": 0, "skipped_no_daily": 0,
+        "skipped_no_base_bar": 0, "skipped_bad_base": 0, "failed": 0,
+        "truncated": False, "purged": 0,
+    }
+    if not settings.scan_candidate_returns:
+        summary["disabled"] = True
+        return summary
+
+    days = int(max_days if max_days is not None else settings.scan_candidate_return_days)
+    today = today or _today_iso()
+    pending = list_pending_candidate_returns(
+        today=today,
+        lookback_days=int(settings.scan_candidate_return_lookback_days),
+        offset=days,
+    )
+    summary["pending"] = len(pending)
+    if not pending:
+        return summary
+
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for p in pending:
+        groups.setdefault((str(p["code"]).zfill(6), str(p["base_date"])), []).append(p)
+
+    max_codes = max(1, int(settings.scan_candidate_return_max_codes))
+    picked = list(groups.items())
+    if len(picked) > max_codes:
+        # 截断要显式记下来：剩下的下一轮会接着补（判据是「offset 行没落在已收盘交易日上」）
+        picked = picked[:max_codes]
+        summary["truncated"] = True
+    summary["groups"] = len(picked)
+    summary["codes"] = len(groups)
+
+    for n, ((code, base_date), items) in enumerate(picked, start=1):
+        try:
+            rows, why = compute_candidate_returns(
+                code=code, base_date=base_date, max_days=days, today=today
+            )
+        except Exception:  # noqa: BLE001
+            summary["failed"] += 1
+            continue
+        if why == "no_daily":
+            summary["skipped_no_daily"] += 1
+            continue
+        if why == "bad_base":
+            summary["skipped_bad_base"] += 1
+            continue
+        if why is not None or not rows:
+            # no_base_bar：入池日的 bar 还没定稿/缺失。是「没拿到」，不是「没有」——
+            # 下一轮仍在回看窗口内就会自动重试。
+            summary["skipped_no_base_bar"] += 1
+            continue
+        for it in items:
+            upsert_candidate_returns(int(it["id"]), rows)
+        summary["written"] += len(items)
+        # 结清 = 算到了最后一个 offset；否则是「还没到那天」，下一轮继续
+        if rows[-1]["day_offset"] >= days:
+            summary["settled"] += len(items)
+        else:
+            summary["partial"] += len(items)
+        if on_progress:
+            on_progress("candidate-returns", n, f"候选收益 {n}/{len(picked)}")
+
+    summary["purged"] = purge_orphan_candidate_returns()
+    return summary
+
+
 def _merge_track_returns(
     existing: list[dict[str, Any]],
     new: list[dict[str, Any]],
