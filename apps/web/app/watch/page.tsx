@@ -301,7 +301,15 @@ export default function WatchPage() {
                     const tr = it.track;
                     return (
                       <tr key={it.code}>
-                        <td>{it.code}</td>
+                        <td className="num">
+                          <a
+                            href={`https://quote.eastmoney.com/${it.code.startsWith("6") ? "sh" : "sz"}${it.code}.html`}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
+                            {it.code}
+                          </a>
+                        </td>
                         <td>{it.name}</td>
                         <td>{tr?.entry_price ?? it.entry_price ?? "-"}</td>
                         <td>{it.quote?.price ? it.quote.price : "-"}</td>
@@ -366,7 +374,15 @@ export default function WatchPage() {
                 ) : (
                   archived.map((it) => (
                     <tr key={it.id}>
-                      <td>{it.code}</td>
+                      <td className="num">
+                        <a
+                          href={`https://quote.eastmoney.com/${it.code.startsWith("6") ? "sh" : "sz"}${it.code}.html`}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          {it.code}
+                        </a>
+                      </td>
                       <td>{it.name}</td>
                       <td className="muted">{sourceLabel(it.source)}</td>
                       <td>{it.entry_price ?? "-"}</td>
